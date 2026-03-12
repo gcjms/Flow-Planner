@@ -19,7 +19,7 @@ use_wandb: false
 pin_mem: true
 
 train:
-  batch_size: 2048
+  batch_size: 32
   epoch: 400
   save_utd: 20
 

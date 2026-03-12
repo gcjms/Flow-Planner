@@ -5,31 +5,31 @@ export HYDRA_FULL_ERROR=1
 # User Configuration Section
 ###################################
 # Set environment variables
-export NUPLAN_DEVKIT_ROOT= # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
-export NUPLAN_DATA_ROOT= # nuplan dataset absolute path (e.g. "/data")
-export NUPLAN_MAPS_ROOT= # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
-export NUPLAN_EXP_ROOT= # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
+export NUPLAN_DEVKIT_ROOT=/home/gcjms/nuplan-devkit # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
+export NUPLAN_DATA_ROOT=/home/gcjms/nuplan/dataset # nuplan dataset absolute path (e.g. "/data")
+export NUPLAN_MAPS_ROOT=/home/gcjms/nuplan/dataset/maps # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
+export NUPLAN_EXP_ROOT=/home/gcjms/Flow-Planner/testing_output # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
 # Dataset split to use
 # Options: 
 #   - "test14-random"
 #   - "test14-hard"
 #   - "val14"
-SPLIT=  # e.g., "val14"
+SPLIT=one_continuous_log
 
 # Challenge type
 # Options: 
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE= # e.g., "closed_loop_nonreactive_agents"
+CHALLENGE=closed_loop_nonreactive_agents # e.g., "closed_loop_nonreactive_agents"
 ###################################
 
 
 BRANCH_NAME=flow_planner_release
-CONFIG_FILE= # path of .hydra/config in ckpt folder
-CKPT_FILE= # path to the .pth of checkpoint
+CONFIG_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-11_21-40-45/.hydra/config.yaml # path of .hydra/config in ckpt folder
+CKPT_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-11_21-40-45/latest.pth # path to the .pth of checkpoint
 
-if [ "$SPLIT" == "val14" ]; then
+if [ "$SPLIT" == "val14" ] || [ "$SPLIT" == "one_continuous_log" ]; then
     SCENARIO_BUILDER="nuplan"
 else
     SCENARIO_BUILDER="nuplan_challenge"
