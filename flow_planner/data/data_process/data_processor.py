@@ -270,7 +270,7 @@ class DataProcessor(object):
             map_api, self._map_features, ego_coords, self._radius, traffic_light_data
         )
         vector_map = map_process(map_api, route_roadblock_ids, ego_state.rear_axle, coords, traffic_light_data, speed_limit, lane_route, self._map_features, 
-                                    self._max_elements, self._max_points, None)
+                                    self._max_elements, self._max_points, self._interpolation_method)
 
         ego_agent_past = ego_agent_past[-21:]
         ego_agent_past, ego_current_state = self.calculate_additional_ego_states(ego_agent_past, time_stamps_past)
