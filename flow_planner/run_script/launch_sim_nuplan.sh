@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0
 export HYDRA_FULL_ERROR=1
 
 ###################################
@@ -15,7 +15,7 @@ export NUPLAN_EXP_ROOT=/home/gcjms/Flow-Planner/testing_output # nuplan experime
 #   - "test14-random"
 #   - "test14-hard"
 #   - "val14"
-SPLIT=one_continuous_log
+SPLIT=debug_2
 
 # Challenge type
 # Options: 
@@ -40,18 +40,19 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}"
 
 PLANNER=flow_planner
 
-python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
+/home/gcjms/miniconda3/envs/flow_planner/bin/python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     planner=$PLANNER \
     planner.flow_planner.config_path=$CONFIG_FILE \
     planner.flow_planner.ckpt_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
+    scenario_builder.data_root=$NUPLAN_DATA_ROOT/nuplan-v1.1/splits/mini \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
     verbose=true \
     worker=ray_distributed \
-    worker.threads_per_node=64 \
+    worker.threads_per_node=4 \
     distributed_mode='SINGLE_NODE' \
-    number_of_gpus_allocated_per_simulation=0.15 \
+    number_of_gpus_allocated_per_simulation=1.0 \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://flow_planner.nuplan_simulation.scenario_filter, pkg://flow_planner.nuplan_simulation, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments]"
