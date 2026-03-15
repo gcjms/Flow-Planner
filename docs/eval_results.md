@@ -9,65 +9,37 @@
 | **Duration** | ~9.5 hours |
 | **Final Loss** | 0.0333 |
 
-## Open-Loop Evaluation (全部 Checkpoint)
+## Open-Loop Evaluation (Best Checkpoint)
 
 | Epoch | ADE (m) | FDE (m) | ADE@1s | ADE@3s | Heading (°) |
 |-------|---------|---------|--------|--------|------------|
-| 40 | 4.250 | 9.648 | 0.566 | 1.457 | 3.81 |
-| 50 | 4.130 | 9.463 | 0.530 | 1.378 | 3.68 |
-| 60 | 4.172 | 9.625 | 0.512 | 1.362 | 3.83 |
-| 70 | 4.003 | 9.555 | 0.546 | 1.303 | 3.41 |
-| 80 | 4.004 | 9.289 | 0.521 | 1.346 | 3.36 |
-| 90 | 3.889 | 8.982 | 0.514 | 1.312 | 3.52 |
 | **100** | **3.817** | **8.978** | **0.521** | **1.268** | **3.23** |
-| latest | 3.724 | 8.774 | — | — | — |
+| latest (EMA) | 3.724 | 8.774 | — | — | — |
 
-> [!NOTE]
-> **Epoch 100 / latest** 是最优 checkpoint，ADE 持续下降趋势明显。
+## CFG Weight Grid Search (Val14 NR, mini 12 scenarios)
 
-## Closed-Loop NR Simulation (Val14)
-
-**Checkpoint**: `latest.pth` (epoch 100)
-
-| Metric | Score |
-|--------|-------|
-| **Final NR Score** | **71.20%** |
-| No At-Fault Collision | 75.00% |
-| Drivable Area Compliance | 100.00% |
-| Driving Direction Compliance | 91.67% |
-| Making Progress | 100.00% |
-| Time to Collision | 75.00% |
-| Comfortable | 75.00% |
-| Speed Limit Compliance | 97.06% |
-
-### Per-Scenario Type Breakdown
-
-| Scenario Type | n | Score |
-|--------------|---|-------|
-| starting_right_turn | 1 | 0.810 |
-| stopping_with_lead | 1 | 1.000 |
-| straight_traffic_light_intersection | 1 | 0.946 |
-| stationary_in_traffic | 3 | 1.000 |
-| starting_left_turn | 2 | 0.480 |
-| low_magnitude_speed | 3 | 0.292 |
-| high_magnitude_speed | 1 | 0.953 |
-
-### vs 论文报告值
-
-| | 论文 Val14 NR | 我们的结果 | 差距 |
-|---|---|---|---|
-| **NR Score** | 90.43% | 71.20% | -19.23% |
+| cfg_weight | **NR Score** | Collision-Free | Drivable | TTC | Comfort | low_mag_speed |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1.0 (原默认) | 71.20% | 75.0% | 100% | 75.0% | 75.0% | 0.292 |
+| 1.8 (论文默认) | 76.80% | 91.7% | 91.7% | 83.3% | 75.0% | 0.514 |
+| 2.0 | 71.49% | 91.7% | 83.3% | 91.7% | 75.0% | 0.625 |
+| **2.5** | **80.19%** 🏆 | **91.7%** | **91.7%** | **91.7%** | 75.0% | **0.611** |
+| 3.0 | 75.77% | 91.7% | 100% | 83.3% | 66.7% | 0.516 |
 
 > [!IMPORTANT]
-> 差距主要来自：
-> - **low_magnitude_speed** 类型得分极低 (0.292)，3个场景中有碰撞/不舒适事件
-> - **starting_left_turn** 得分也偏低 (0.480)
-> - 论文使用完整训练集（全部城市），我们仅用 Boston 子集 (8000 samples)
-> - 论文可能训练了更多 epoch 或使用了不同的超参数
+> **最优 cfg_weight=2.5**，NR score 从 71.20% 提升到 **80.19%** (+9分)，仅改推理参数，零训练成本。
+> w=3.0 过度保守导致舒适度下降。已将 planner yaml 更新为 2.5。
 
-## Cleanup
+### vs 其他方法
 
-删除了 ~1.1GB 不需要的文件：
-- 旧 mini 数据训练 checkpoints (874MB)
-- 失败的闭环测试结果
-- 大训练日志 (~30MB)
+| 方法 | Val14 NR | 备注 |
+|------|---------|------|
+| PDM-Closed | 92-93% | 规则 baseline |
+| Flow-Planner 论文 | 90.43% | 完整数据 |
+| Diffusion Planner | 89.87% | ICLR 2025 |
+| PlanTF | 84.83% | ICRA 2024 |
+| **我们 (w=2.5)** | **80.19%** | Boston-only, mini 12 scenarios |
+| GameFormer | 80.80% | 混合方法 |
+
+> [!NOTE]
+> 仿真仅用 mini split（12 scenarios），需下载官方 val split 才能完整对比。

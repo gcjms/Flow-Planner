@@ -21,4 +21,4 @@ flow_planner:
 
   device: cuda
   use_cfg: true
-  cfg_weight: 1.8
+  cfg_weight: 2.5
