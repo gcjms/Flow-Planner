@@ -15,7 +15,7 @@ export NUPLAN_EXP_ROOT=/home/gcjms/Flow-Planner/testing_output # nuplan experime
 #   - "test14-random"
 #   - "test14-hard"
 #   - "val14"
-SPLIT=debug_2
+SPLIT=val14
 
 # Challenge type
 # Options: 
@@ -26,8 +26,8 @@ CHALLENGE=closed_loop_nonreactive_agents # e.g., "closed_loop_nonreactive_agents
 
 
 BRANCH_NAME=flow_planner_release
-CONFIG_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-11_21-40-45/.hydra/config.yaml # path of .hydra/config in ckpt folder
-CKPT_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-11_21-40-45/latest.pth # path to the .pth of checkpoint
+CONFIG_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-14_23-17-53/.hydra/config.yaml # path of .hydra/config in ckpt folder
+CKPT_FILE=/home/gcjms/Flow-Planner/training_output/outputs/FlowPlannerTraining/flow_planner_standard/2026-03-14_23-17-53/latest.pth # path to the .pth of checkpoint
 
 if [ "$SPLIT" == "val14" ] || [ "$SPLIT" == "one_continuous_log" ]; then
     SCENARIO_BUILDER="nuplan"

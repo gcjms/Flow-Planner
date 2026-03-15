@@ -7,7 +7,7 @@ FlowPlanner Decoder 模块
   加噪轨迹 x_t → preproj → 与 encoder 输出拼接 → DiT blocks → PostFusion → FinalLayer → 预测轨迹
 
 关键概念:
-  - action token: 将 80 帧未来轨迹切分为多个重叠的 token（例如 7 个 16 帧 token，重叠 4 帧）
+  - action token: 将 80 帧未来轨迹切分为多个重叠的 token（例如 7 个 20 帧 token，重叠 10 帧）
   - 多模态: agents(邻居+静态)、lanes(车道线)、trajectory(轨迹 token) 三个模态
   - 条件: 时间步 t、路由条件 routes_cond、action 位置编码、CFG 嵌入
 """
@@ -27,7 +27,7 @@ class FlowPlannerDecoder(nn.Module):
 
     输入:
         x:  加噪的轨迹 tokens, shape (B, action_num, action_len, state_dim)
-            例如 (32, 7, 16, 4) — 7 个 action token, 每个 16 帧, 4 维(x,y,cos_h,sin_h)
+            例如 (32, 7, 20, 4) — 7 个 action token, 每个 20 帧, 4 维(x,y,cos_h,sin_h)
         t:  flow matching 时间步, shape (B,), 范围 [0, 1]
         model_extra: encoder 输出的字典, 包含:
             - encodings: (agents_encoding, lanes_encoding) — 编码后的场景 token
@@ -57,11 +57,11 @@ class FlowPlannerDecoder(nn.Module):
         
         self.hidden_dim = hidden_dim
         # output_dim = 每个 action token 展平后的维度 = action_len * state_dim
-        # 例如 16 * 4 = 64
+        # 例如 20 * 4 = 80
         self.output_dim = planner_params['action_len'] * planner_params['state_dim']
         
         # 计算 action token 数量
-        # 例如: future_len=80, action_len=16, overlap=4 → action_num = (80-4)/(16-4) ≈ 6.3 → 6 或 7
+        # 例如: future_len=80, action_len=20, overlap=10 → action_num = (80-10)/(20-10) = 7
         action_num = (planner_params['future_len'] - planner_params['action_overlap']) // (planner_params['action_len'] - planner_params['action_overlap'])
         self.action_num = int(action_num)
         
@@ -170,7 +170,7 @@ class FlowPlannerDecoder(nn.Module):
         
         Args:
             x: (B, P, action_len, state_dim) — 加噪轨迹 tokens
-               例如 (32, 7, 16, 4), 其中 P=action_num
+               例如 (32, 7, 20, 4), 其中 P=action_num
             t: (B,) — flow matching 时间步
             model_extra: encoder 输出, 包含 encodings, masks, routes_cond, token_dist, cfg_flags
         
@@ -193,7 +193,7 @@ class FlowPlannerDecoder(nn.Module):
         # (B, P, action_len, state_dim) → (B, P, action_len*state_dim)
         x = x.reshape(B, P, -1)
         # (B, P, action_len*state_dim) → (B, P, hidden_dim)
-        # 例如 (32, 7, 64) → (32, 7, 256)
+        # 例如 (32, 7, 80) → (32, 7, 256)
         
         # 取出 encoder 输出
         encodings = list(model_extra['encodings'])  # [agents_enc, lanes_enc]
@@ -263,7 +263,7 @@ class FlowPlannerDecoder(nn.Module):
 
         # reshape 回轨迹维度
         prediction = prediction.reshape(B, P, -1, self.planner_params['state_dim'])
-        # → (B, P, action_len, state_dim), 例如 (32, 7, 16, 4)
+        # → (B, P, action_len, state_dim), 例如 (32, 7, 20, 4)
 
         return prediction
 
