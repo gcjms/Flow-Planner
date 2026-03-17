@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>BCSC Innovation Idea Profile - FlowPlanner</title>
+<style>
+body { font-family: "Microsoft YaHei", sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+h1 { color: #1a1a2e; text-align: center; }
+.meta { color: #666; margin-bottom: 30px; text-align: center; }
+.section { background: white; border-radius: 12px; padding: 24px; margin: 16px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+.section-num { display: inline-block; background: #1a1a2e; color: white; width: 32px; height: 32px; border-radius: 50%; text-align: center; line-height: 32px; font-weight: bold; margin-right: 12px; }
+.section-title { font-size: 16px; font-weight: bold; color: #1a1a2e; margin-bottom: 16px; }
+.section-content { white-space: pre-wrap; line-height: 1.8; color: #333; font-size: 14px; padding: 16px; background: #f8f9ff; border-radius: 8px; border-left: 4px solid #7b2ff7; }
+.flowchart { text-align: center; margin: 30px 0; }
+.flowchart img { max-width: 100%; border: 1px solid #ddd; border-radius: 8px; }
+</style></head><body>
+<h1>BCSC Innovation Idea Profile - Flow Planner</h1><div class="meta"><strong>Flow Planner: 基于Flow Matching的自动驾驶交互行为建模与轨迹规划</strong><br>Owner: Gao Chao (GOH2SGH)<br>Input date: 2026/03/16</div><div class="section">
+<div class="section-title"><span class="section-num">1</span>创新项目的概念和描述</div>
+<div class="section-content">Flow Planner（NeurIPS 2025）是一种基于Flow Matching的自动驾驶轨迹规划框架，通过Flow ODE仅需4步即可生成高质量轨迹，在nuPlan Val14达到90.43分（纯学习方法SOTA）。模型仅14.28M参数，推理频率约12Hz。
+
+本项目在Flow Planner基础上，提出三大创新改进并最终落地实车验证：
+
+创新点1：场景自适应CFG权重
+原论文使用固定CFG引导权重w=1.8，但不同场景复杂度差异巨大。我们提出训练一个轻量级场景复杂度估计器，根据邻居数量、速度差、碰撞风险等特征动态输出CFG权重——空旷直道用小权重（高效），密集路口用大权重（安全），实现推理时的自适应交互增强。
+
+创新点2：安全约束引导生成（Safety-Guided Flow Matching）
+原模型是纯模仿学习，无显式安全保证。我们在ODE采样过程中注入碰撞检测梯度和可行域约束，类似Classifier Guidance但用安全函数替代分类器，使生成的轨迹在满足学习分布的同时强制满足安全约束。这对实车部署至关重要。
+
+创新点3：跨域迁移学习（nuPlan → 公司数据）
+nuPlan数据与公司实际数据存在传感器配置、坐标系定义、场景分布等domain gap。我们采用两阶段训练策略（nuPlan预训练→公司数据微调），结合Domain-Adaptive Normalization技术，确保模型在公司实际场景中保持性能。</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">2</span>创新最终的目标交付物</div>
+<div class="section-content">1. 改进版Flow Planner算法库
+   包含自适应CFG、安全约束引导、跨域迁移三大创新模块，支持nuPlan和公司内部数据的训练与推理。
+
+2. 预训练模型权重
+   nuPlan基线权重 + 公司数据微调权重，可直接用于推理部署。
+
+3. 实车验证报告
+   包含公司数据集上的闭环仿真评测结果，以及实车路口场景调试验证报告。
+
+4. 轻量化部署方案
+   TensorRT FP16量化模型，适配NVIDIA Orin车端平台，推理延迟&lt;50ms。
+
+5. 技术论文 1-2篇
+   重点发表自适应CFG和安全约束引导的创新工作。</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">3</span>创新的聚焦点和体现性</div>
+<div class="section-content">聚焦点一：场景自适应CFG权重（创新点1）
+当前所有CFG方法均使用固定引导权重，忽视了场景复杂度的巨大差异。我们的方案通过轻量估计器实时判断场景复杂度，输出最优CFG权重。
+  - 空旷直道：w≈1.0，减少不必要的交互计算
+  - 拥堵路口：w≈2.5-3.0，强化对关键agent的响应
+  - 切入/超车：w根据来车TTC动态调整
+预期效果：在不增加推理成本的前提下，提升复杂场景安全性。
+
+聚焦点二：安全约束引导生成（创新点2）
+将安全约束从'事后检查'前移到'生成过程中'。在Flow ODE求解的每一步，计算当前轨迹与障碍物的碰撞梯度，引导轨迹远离碰撞区域。这是Safety-Guided Flow Matching的首次提出，填补了Flow Matching在安全约束领域的空白。
+
+聚焦点三：跨域迁移落地（创新点3）
+解决从开源数据集到公司实际场景的domain gap，最终在实车上验证规划效果。这是从学术研究到工程落地的关键一步。</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">4</span>创新的出发点和需求来源</div>
+<div class="section-content">1. 复杂交互场景的规划难题
+自动驾驶规划的最大挑战来自多车交互行为的多模态性。传统规则方法泛化性差，学习方法此前从未在nuPlan Val14上突破90分。
+
+2. 固定超参数的局限性
+当前Flow Planner的CFG权重w=1.8是全局固定值，无法适应从空旷高速到拥堵路口的场景差异，导致简单场景过度保守、复杂场景引导不足。
+
+3. 纯模仿学习缺乏安全保证
+模仿学习方法仅学习专家行为分布，无法保证不会生成碰撞轨迹。实车部署要求必须有显式的安全约束机制。
+
+4. 学术数据与实际场景的gap
+nuPlan数据采集于美国和新加坡，与公司实际运营场景存在显著差异。必须解决跨域迁移问题才能真正落地。
+
+5. 实车部署的工程需求
+工业级自动驾驶要求推理频率&gt;=10Hz、推理延时&lt;50ms，且需要在NVIDIA Orin等车端平台上稳定运行。</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">5</span>创新所提供的收益和利好</div>
+<div class="section-content">1. 自适应CFG提升场景适应性
+无需人工针对不同场景调参，系统自动选择最优引导强度，预期在复杂场景安全性和简单场景效率之间取得最佳平衡。
+
+2. 安全约束引导降低碰撞率
+在Flow ODE生成过程中直接避碰，相比事后裁剪轨迹更高效可靠，预期碰撞率显著降低，满足实车安全要求。
+
+3. 跨域迁移实现工程落地
+两阶段训练策略使模型既能利用nuPlan海量数据学习通用驾驶知识，又能通过公司数据微调适配实际场景，大幅降低数据需求。
+
+4. nuPlan基准SOTA性能
+基线已达Val14 NR=90.43，创新改进后预期突破91+。
+InterPlan交互基准61.82分（较Diffusion Planner +16.9%）。
+
+5. 实车验证的工程价值
+最终在实车路口场景中完成验证，形成可复用的从研究到部署完整链路，为后续规划算法的落地提供范式参考。</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">6</span>创新的独特性 (内外部是否有类似的解决方案， 和在行业的领先性）</div>
+<div class="section-content">内部对标：
+与团队Causal-Aware MTR项目相比：
+  - 从预测转向联合规划，直接输出ego可执行轨迹
+  - 从扩散模型转向Flow Matching，推理效率提升5-10倍
+  - 新增安全约束引导机制，MTR不具备
+  - 全链路落地：nuPlan→公司数据→实车验证
+
+外部对标（学术界）：
+  - 自适应CFG权重：当前所有CFG工作均使用固定权重，本项目首次提出场景自适应方案
+  - Safety-Guided Flow Matching：首次将安全约束引导引入Flow Matching生成过程
+  - Diffusion Planner (ICLR 2025): 推理20步，InterPlan落后8.92分
+  - PLUTO: 依赖规则后处理，非端到端
+
+行业领先性：
+  - 三个创新点均为首次提出的方案或首次应用于Flow Matching
+  - 完整的研究→工程→实车落地链路
+  - 论文级创新+工程级交付的双重目标</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">7</span>整体方案的时间</div>
+<div class="section-content">第一部分（基础与基线）: 第1-3月
+  - nuPlan全量数据预处理 + Flow Planner基线复现
+  - 目标: Val14 NR &gt;= 90
+
+第二部分（创新研发）: 第4-6月
+  - 自适应CFG权重模块开发与消融实验
+  - 安全约束引导生成方案设计与实现
+  - 目标: Val14 NR &gt; 91, InterPlan &gt; 65
+
+第三部分（跨域迁移与优化）: 第7-8月
+  - 公司数据预处理与适配
+  - nuPlan→公司数据迁移训练
+  - TensorRT量化与模型轻量化
+  - 目标: 公司数据闭环仿真通过, 推理延迟&lt;50ms
+
+第四部分（实车验证与总结）: 第9-10月
+  - NVIDIA Orin平台部署与集成
+  - 实车路口场景调试验证
+  - 论文撰写 + 项目结题
+  - 目标: 实车验证通过, 投稿顶会论文</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">8</span>第一阶段的所需的资源</div>
+<div class="section-content">算力支持（High Priority）：
+a. 训练服务器：4-8x NVIDIA A100 (80GB) GPU
+   论文配置：8x A6000, batch_size=2048, 200+ epochs
+b. 开发工作站：1-2x NVIDIA RTX 4090 (24GB)
+c. 高速存储：NVMe SSD 4TB+
+
+数据资源：
+  - nuPlan数据集 (1500h, 4城市, 开源免费)
+  - InterPlan数据集 (335场景, 开源免费)
+
+软件环境：
+  Python 3.9 / PyTorch 2.0+ / CUDA 11.8+ / nuplan-devkit / flow-matching / Hydra 1.3
+
+人力资源（约10人月）：
+  - 算法研发 1-2人（全职）
+  - 指导教师 1人（兼职）</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">9</span>第一阶段的可期待交付物</div>
+<div class="section-content">1. Flow Planner基线复现（Val14 NR &gt;= 90）
+
+2. 自适应CFG权重模块
+   场景复杂度估计器 + 动态CFG权重输出，消融实验报告
+
+3. 安全约束引导生成模块
+   Safety-Guided Flow Matching原型，碰撞率对比实验
+
+4. 消融实验报告
+   CFG自适应/安全约束/ODE步数等维度的详细消融分析</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">10</span>第二阶段的所需的资源</div>
+<div class="section-content">算力支持：
+a. 持续使用GPU集群进行改进模型训练
+b. NVIDIA Orin车端平台用于部署测试
+
+数据资源：
+  - 公司内部驾驶数据集（需协调数据团队提供）
+  - 实车测试场地和车辆资源
+
+软件环境：
+  TensorRT / ONNX Runtime / 车端SDK
+
+人力资源（约15人月）：
+  - 算法继续投入，重点转向跨域迁移和工程化
+  - 增加1名工程支持（部署/实车调试）
+  - 协调数据团队支持数据适配</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">11</span>第二阶段的可期待交付物</div>
+<div class="section-content">1. 跨域迁移模型
+   nuPlan预训练→公司数据微调后的完整模型，公司场景闭环仿真验证通过
+
+2. 车端部署模型
+   TensorRT FP16量化，推理延迟&lt;50ms，适配NVIDIA Orin
+
+3. 实车验证报告
+   实车路口场景测试数据，包含规划轨迹质量、响应延时、安全性评估
+
+4. 学术论文 1-2篇
+   主论文：自适应CFG + 安全约束引导Flow Matching
+
+5. 项目结题报告
+   完整的研究→工程→实车落地全链路文档</div>
+</div>
+<div class="section">
+<div class="section-title"><span class="section-num">★</span>项目流程图</div>
+<div class="flowchart"><img src="FlowPlanner_项目流程图.png" alt="Flow Planner项目流程图"></div>
+</div>
+</body></html>
