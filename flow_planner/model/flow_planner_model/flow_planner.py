@@ -1,7 +1,7 @@
 import re
 import os
 import sys
-from typing import Literal, Callable, Any, Union, List
+from typing import Literal, Callable, Any, Union, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +47,10 @@ class FlowPlanner(DiffusionADPlanner):
         self.assemble_method = assemble_method
         
         self.data_processor = data_processor
+
+        # Risk-Aware Adaptive CFG
+        self.risk_network = None
+        self.adaptive_ode_steps = None
 
         self.planner_params = planner_params # including the action_len, future_len etc.
         self.action_num = (self.planner_params['future_len'] - self.planner_params['action_overlap']) // (self.planner_params['action_len'] - self.planner_params['action_overlap'])
@@ -166,28 +170,140 @@ class FlowPlanner(DiffusionADPlanner):
         
         return prediction, loss_dict
     
-    def forward_inference(self, data: NuPlanDataSample, use_cfg=True, cfg_weight=None):
+    def forward_inference(self, data: NuPlanDataSample, use_cfg=True, cfg_weight=None,
+                          num_candidates: int = 1, return_all_candidates: bool = False):
+        """
+        Forward inference with optional Best-of-N trajectory selection.
+
+        Args:
+            data: input data sample
+            use_cfg: whether to use classifier-free guidance
+            cfg_weight: CFG weight (None = use default)
+            num_candidates: number of candidate trajectories to generate (Best-of-N)
+            return_all_candidates: if True, return all N candidates instead of best one
+
+        Returns:
+            sample: (B, T, D) best trajectory, or (B, N, T, D) if return_all_candidates
+        """
         B = data.ego_current.shape[0]
+        _ode_steps_modified = False
+
+        # ---- Adaptive ODE Steps (scene complexity) ----
+        if self.adaptive_ode_steps is not None:
+            n_neighbors = data.neighbor_past.shape[1] if data.neighbor_past is not None else 0
+            # Simple complexity: more neighbors → more steps
+            if n_neighbors <= 5:
+                adaptive_steps = 2
+            elif n_neighbors <= 15:
+                adaptive_steps = 4
+            else:
+                adaptive_steps = 6
+            self._original_steps = self.flow_ode.sample_params.get('sample_steps', 4)
+            self.flow_ode.sample_params['sample_steps'] = adaptive_steps
+            _ode_steps_modified = True
+
+        # ---- Legacy Risk Network CFG (kept for backward compat) ----
+        if cfg_weight is None and self.risk_network is not None:
+            from flow_planner.risk.risk_features import extract_risk_features_from_sample
+            import numpy as np
+            risk_features = extract_risk_features_from_sample(
+                ego_current=data.ego_current,
+                ego_past=data.ego_past,
+                neighbor_past=data.neighbor_past,
+            )
+            risk_features_tensor = torch.from_numpy(risk_features).float().to(self.device)
+            if risk_features_tensor.ndim == 1:
+                risk_features_tensor = risk_features_tensor.unsqueeze(0)
+            with torch.no_grad():
+                risk_output = self.risk_network(risk_features_tensor)
+                cfg_weight = risk_output['w'].mean().item()
+
+        # ---- Encoder (run once, shared across all candidates) ----
         if use_cfg:
             cfg_flags = torch.cat([torch.ones((B,), device=self.device), torch.zeros((B,), device=self.device)], dim=0).to(torch.int32)
         else:
             cfg_flags = torch.ones((B,), device=self.device).to(torch.int32)
-        
+
         model_inputs, _ = self.prepare_model_input(cfg_flags, data, use_cfg, is_training=False)
-        
         encoder_inputs = self.extract_encoder_inputs(model_inputs)
         encoder_outputs = self.encoder(**encoder_inputs)
-        
         decoder_model_extra = self.extract_decoder_inputs(encoder_outputs, model_inputs)
+
+        # ---- Generate N candidate trajectories ----
+        all_candidates = []
+        for _ in range(num_candidates):
+            x_init = torch.randn(
+                (B, self.action_num, self.planner_params['action_len'],
+                 self.planner_params['state_dim']),
+                device=self.device
+            )
+            sample = self.flow_ode.generate(
+                x_init, self.decoder, self._model_type,
+                use_cfg=use_cfg, cfg_weight=cfg_weight,
+                **decoder_model_extra
+            )
+            sample = assemble_actions(
+                sample, self.planner_params['future_len'],
+                self.planner_params['action_len'],
+                self.planner_params['action_overlap'],
+                self.planner_params['state_dim'],
+                self.assemble_method
+            )
+            sample = self.data_processor.state_postprocess(sample)
+            all_candidates.append(sample)
+
+        # Restore original ODE steps
+        if _ode_steps_modified:
+            self.flow_ode.sample_params['sample_steps'] = self._original_steps
+
+        # ---- Single candidate: return directly ----
+        if num_candidates == 1:
+            return all_candidates[0]
+
+        # ---- Best-of-N: score and select ----
+        # Stack candidates: (N, B, T, D) → for each batch, pick best among N
+        candidates = torch.stack(all_candidates, dim=0)  # (N, B, T, D)
+
+        if return_all_candidates:
+            return candidates.permute(1, 0, 2, 3)  # (B, N, T, D)
+
+        # Score each candidate using safety scorer
+        from flow_planner.risk.trajectory_scorer import TrajectoryScorer
+        scorer = TrajectoryScorer()
+
+        best_trajs = []
+        for b in range(B):
+            # Get N candidates for this batch element
+            batch_candidates = candidates[:, b, :, :]  # (N, T, D)
+
+            # Get neighbor trajectories for scoring (if available)
+            neighbors = None
+            if hasattr(data, 'neighbor_future') and data.neighbor_future is not None:
+                neighbors = data.neighbor_future[b]  # (M, T_n, D_n)
+            elif hasattr(data, 'neighbor_past') and data.neighbor_past is not None:
+                # Use past neighbor positions as proxy
+                neighbors = data.neighbor_past[b]  # (M, T_p, D_p)
+
+            scores = scorer.score_trajectories(
+                batch_candidates, neighbors=neighbors
+            )
+            best_idx = scores.argmax().item()
+            best_trajs.append(batch_candidates[best_idx:best_idx+1])
+
+        result = torch.cat(best_trajs, dim=0)  # (B, T, D)
+        return result
+    
+    def load_risk_network(self, checkpoint_path: str):
+        """加载训练好的 Risk Network 用于自适应 CFG 推理"""
+        from flow_planner.risk.risk_network import load_risk_network, AdaptiveODESteps
         
-        x_init = torch.randn((B, self.action_num, self.planner_params['action_len'], self.planner_params['state_dim']), device=self.device)
-        sample = self.flow_ode.generate(x_init, self.decoder, self._model_type, use_cfg=use_cfg, cfg_weight=cfg_weight, **decoder_model_extra)
+        self.risk_network = load_risk_network(checkpoint_path, device=self.device)
+        self.adaptive_ode_steps = AdaptiveODESteps(min_steps=2, max_steps=6)
         
-        sample = assemble_actions(sample, self.planner_params['future_len'], self.planner_params['action_len'], self.planner_params['action_overlap'], self.planner_params['state_dim'], self.assemble_method)
-        
-        sample = self.data_processor.state_postprocess(sample)
-        
-        return sample
+        print(f"Risk Network loaded from {checkpoint_path}")
+        print(f"  Parameters: {self.risk_network.num_parameters}")
+        print(f"  w range: [{self.risk_network.w_min}, {self.risk_network.w_max}]")
+        print(f"  Adaptive ODE steps: [{self.adaptive_ode_steps.min_steps}, {self.adaptive_ode_steps.max_steps}]")
     
     @property
     def model_type(self,):
