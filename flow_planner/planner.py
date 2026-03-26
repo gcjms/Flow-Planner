@@ -96,8 +96,11 @@ class FlowPlanner(AbstractPlanner):
             else:
                 if "model" in state_dict.keys():
                     state_dict = state_dict['model']
-            # use for ddp
-            model_state_dict = {k[len("module."):]: v for k, v in state_dict.items() if k.startswith("module.")}
+            # Handle both DDP (module. prefix) and non-DDP checkpoints
+            if any(k.startswith("module.") for k in state_dict.keys()):
+                model_state_dict = {k[len("module."):]: v for k, v in state_dict.items() if k.startswith("module.")}
+            else:
+                model_state_dict = state_dict
             self._planner.load_state_dict(model_state_dict)
         else:
             print("load random model")

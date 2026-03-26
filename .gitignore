@@ -34,3 +34,9 @@ venv.bak/
 .idea/
 .vscode/
 *.swp
+# Outputs and checkpoints
+risk_outputs/
+checkpoints/
+*.npz
+*.log
+__pycache__/
