@@ -19,12 +19,11 @@ CONFIG_PATH="$PROJECT_ROOT/checkpoints/model_config.yaml"
 OUTPUT_DIR="$PROJECT_ROOT/simulation_outputs"
 RESULTS_DIR="$PROJECT_ROOT/cfg_validation_results"
 
-# === CFG 权重列表 ===
-W_VALUES="1.0 1.5 1.8 2.0 2.5 3.0"
+# === CFG 权重列表（8 个值，精细扫描） ===
+W_VALUES="0.5 1.0 1.5 1.8 2.0 2.5 3.0 4.0"
 
 # === 仿真参数 ===
-SCENARIO_FILTER="val14_split"    # 完整验证集
-# SCENARIO_FILTER="val14_split"  # 用这个跑 mini 快速验证
+SCENARIO_FILTER="val14_split"    # 完整验证集（~1115 场景）
 DEVICE="cuda"
 
 # ============================================================
@@ -96,6 +95,33 @@ export NUPLAN_DATA_ROOT
 export NUPLAN_MAPS_ROOT
 export PROJECT_ROOT
 
+# === 先跑 no-CFG baseline ===
+log ""
+log "============================================================"
+log "Running BASELINE (no CFG, use_cfg=false)"
+log "============================================================"
+
+RESULT_FILE="$RESULTS_DIR/cfg_no_cfg_results.txt"
+START_TIME=$(date +%s)
+
+python "$NUPLAN_DEVKIT/nuplan/planning/script/run_simulation.py" \
+    +simulation=closed_loop_nonreactive_agents \
+    planner=flow_planner \
+    planner.flow_planner.config_path="$CONFIG_PATH" \
+    planner.flow_planner.ckpt_path="$CKPT_PATH" \
+    planner.flow_planner.use_cfg=false \
+    planner.flow_planner.cfg_weight=1.0 \
+    planner.flow_planner.device="$DEVICE" \
+    scenario_builder=nuplan \
+    scenario_filter="$SCENARIO_FILTER" \
+    experiment_name="cfg_no_cfg" \
+    output_dir="$OUTPUT_DIR" \
+    2>&1 | tee "$RESULT_FILE"
+
+END_TIME=$(date +%s)
+DURATION=$(( (END_TIME - START_TIME) / 60 ))
+log "no_cfg done in ${DURATION} minutes"
+
 # === 依次运行每个 w 值 ===
 for W in $W_VALUES; do
     EXPERIMENT_NAME="cfg_w${W}"
@@ -133,35 +159,75 @@ for W in $W_VALUES; do
     fi
 done
 
-# === 汇总结果 ===
+# ============================================================
+# 汇总结果
+# ============================================================
 log ""
 log "============================================================"
 log "ALL VALIDATIONS COMPLETE - SUMMARY"
 log "============================================================"
 
-echo ""
-echo "cfg_weight | Overall NR Score | Collision-Free | Drivable | Detail Line"
-echo "---------- | ---------------- | -------------- | -------- | -----------"
+SUMMARY_FILE="$RESULTS_DIR/summary.md"
+echo "# CFG Weight Closed-Loop Validation Results" > "$SUMMARY_FILE"
+echo "" >> "$SUMMARY_FILE"
+echo "| cfg_weight | Overall NR | Collision-Free | Drivable Area | TTC/Comfort |" >> "$SUMMARY_FILE"
+echo "|:---:|:---:|:---:|:---:|:---:|" >> "$SUMMARY_FILE"
 
-for W in $W_VALUES; do
+ALL_CONFIGS="no_cfg $W_VALUES"
+for W in $ALL_CONFIGS; do
     RESULT_FILE="$RESULTS_DIR/cfg_${W}_results.txt"
     if [ -f "$RESULT_FILE" ]; then
         FINAL=$(grep "final_score" "$RESULT_FILE" | tail -1)
         if [ -n "$FINAL" ]; then
-            # 解析: final_score|1115.0|0.8119|0.9381|0.9345|0.8565
             IFS='|' read -ra PARTS <<< "$FINAL"
             SCORE=${PARTS[2]:-"N/A"}
             COLLISION=${PARTS[3]:-"N/A"}
             DRIVABLE=${PARTS[4]:-"N/A"}
-            echo "w=$W      | $SCORE             | $COLLISION       | $DRIVABLE | $FINAL"
-        else
-            echo "w=$W      | PARSE ERROR | - | - | (check $RESULT_FILE)"
+            TTC=${PARTS[5]:-"N/A"}
+            echo "| w=$W | $SCORE | $COLLISION | $DRIVABLE | $TTC |" >> "$SUMMARY_FILE"
+            echo "w=$W | NR=$SCORE | Collision=$COLLISION | Drivable=$DRIVABLE | TTC=$TTC"
         fi
-    else
-        echo "w=$W      | NOT RUN | - | - | -"
     fi
 done | tee -a "$LOG_FILE"
 
+# === 场景类型细分分析 ===
+echo "" >> "$SUMMARY_FILE"
+echo "## Per-Scenario-Type Breakdown" >> "$SUMMARY_FILE"
+echo "" >> "$SUMMARY_FILE"
+
+SCENARIO_TYPES="changing_lane starting_left_turn starting_right_turn high_lateral_acceleration near_multiple_vehicles stopping_with_lead stationary_in_traffic high_magnitude_speed"
+
+for TYPE in $SCENARIO_TYPES; do
+    echo "" >> "$SUMMARY_FILE"
+    echo "### $TYPE" >> "$SUMMARY_FILE"
+    echo "| cfg_weight | NR Score | Count |" >> "$SUMMARY_FILE"
+    echo "|:---:|:---:|:---:|" >> "$SUMMARY_FILE"
+
+    for W in $ALL_CONFIGS; do
+        RESULT_FILE="$RESULTS_DIR/cfg_${W}_results.txt"
+        if [ -f "$RESULT_FILE" ]; then
+            TYPE_LINE=$(grep "^${TYPE}|" "$RESULT_FILE" | tail -1)
+            if [ -n "$TYPE_LINE" ]; then
+                IFS='|' read -ra PARTS <<< "$TYPE_LINE"
+                COUNT=${PARTS[1]:-"?"}
+                SCORE=${PARTS[2]:-"?"}
+                echo "| w=$W | $SCORE | $COUNT |" >> "$SUMMARY_FILE"
+            fi
+        fi
+    done
+done
+
+echo "" >> "$SUMMARY_FILE"
+echo "## Conclusion" >> "$SUMMARY_FILE"
+echo "" >> "$SUMMARY_FILE"
+echo "If the NR scores across different w values differ by < 1%, then adaptive CFG is NOT worthwhile." >> "$SUMMARY_FILE"
+echo "If specific scenario types (e.g., left turns, lane changes) show > 2% difference, then scenario-specific w could be valuable." >> "$SUMMARY_FILE"
+
 log ""
-log "Results saved to: $RESULTS_DIR/"
-log "Done!"
+log "Summary saved to: $SUMMARY_FILE"
+log "Full results in: $RESULTS_DIR/"
+log ""
+log "============================================================"
+log "DONE! Total configs tested: $(echo $ALL_CONFIGS | wc -w)"
+log "============================================================"
+
