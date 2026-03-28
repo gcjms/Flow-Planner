@@ -1,0 +1,28 @@
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+_convert_: 'all'
+
+# 6 个场景用于快速验证脚本（每种场景类型选 1 个）
+scenario_types:
+  - starting_left_turn
+  - starting_right_turn
+  - changing_lane
+  - high_magnitude_speed
+  - stopping_with_lead
+  - stationary_in_traffic
+
+scenario_tokens: null
+
+log_names: null
+map_names: null
+
+num_scenarios_per_type: 1
+limit_total_scenarios: null
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null
+ego_start_speed_threshold: null
+ego_stop_speed_threshold: null
+speed_noise_tolerance: null
+
+expand_scenarios: false
+remove_invalid_goals: true
+shuffle: false

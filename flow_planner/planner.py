@@ -40,6 +40,7 @@ class FlowPlanner(AbstractPlanner):
             device: str = "cpu",
             use_cfg: bool = True,
             cfg_weight: float = 1.0,
+            num_candidates: int = 1,
         ):
 
         assert device in ["cpu", "cuda"], f"device {device} not supported"
@@ -69,6 +70,8 @@ class FlowPlanner(AbstractPlanner):
 
         self.cfg_weight = cfg_weight
         
+        self.num_candidates = num_candidates
+        
     def name(self) -> str:
         """
         Inherited.
@@ -91,11 +94,15 @@ class FlowPlanner(AbstractPlanner):
         if self._ckpt_path is not None:
             state_dict = torch.load(self._ckpt_path, weights_only=True, map_location=self._device)
             
-            if self._ema_enabled:
-                state_dict = state_dict['ema_state_dict']
-            else:
-                if "model" in state_dict.keys():
+            # Support multiple checkpoint formats:
+            # 1. Training ckpt: {'ema_state_dict': {...}, 'model': {...}}
+            # 2. Official HuggingFace ckpt: flat state_dict with 'module.' prefix
+            if isinstance(state_dict, dict):
+                if self._ema_enabled and 'ema_state_dict' in state_dict:
+                    state_dict = state_dict['ema_state_dict']
+                elif 'model' in state_dict and isinstance(state_dict['model'], dict):
                     state_dict = state_dict['model']
+                # else: assume it's already a flat state_dict
             # Handle both DDP (module. prefix) and non-DDP checkpoints
             if any(k.startswith("module.") for k in state_dict.keys()):
                 model_state_dict = {k[len("module."):]: v for k, v in state_dict.items() if k.startswith("module.")}
@@ -145,7 +152,12 @@ class FlowPlanner(AbstractPlanner):
         """
         inputs = self.planner_input_to_model_inputs(current_input)
 
-        outputs = self.core.inference(self._planner, inputs, use_cfg=self.use_cfg, cfg_weight=self.cfg_weight)
+        outputs = self.core.inference(
+            self._planner, inputs, 
+            use_cfg=self.use_cfg, 
+            cfg_weight=self.cfg_weight,
+            num_candidates=self.num_candidates
+        )
 
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)

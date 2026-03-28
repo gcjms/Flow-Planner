@@ -120,7 +120,10 @@ class FlowPlanner(DiffusionADPlanner):
         if mode == 'train':
             return self.forward_train(data)
         elif mode == 'inference':
-            return self.forward_inference(data, params['use_cfg'], params['cfg_weight'])
+            return self.forward_inference(
+                data, params['use_cfg'], params['cfg_weight'],
+                num_candidates=params.get('num_candidates', 1)
+            )
     
     def forward_train(self, data: NuPlanDataSample):
         '''
