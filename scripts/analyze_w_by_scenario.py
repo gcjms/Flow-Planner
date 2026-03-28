@@ -76,96 +76,55 @@ def extract_score_from_metric(data):
     """
     从 nuPlan metric pickle 数据中提取场景得分。
 
-    nuPlan 的 metric pickle 文件包含 MetricStatisticsDataFrame 或类似对象。
-    这里尝试多种方式解析：
-    1. 如果是包含 metric_statistics 的对象列表
-    2. 如果是 pandas DataFrame
-    3. 如果是嵌套的 dict/list 结构
+    nuPlan pickle 格式: list[dict]，每个 dict 是一个 metric 条目，包含:
+    - metric_computator: str (metric 名称)
+    - metric_score: float|None (分数, 0-1)
+    - scenario_type: str
+    - metric_category: str (Planning/Dynamics/Violations)
+
+    NR Score = 8 个有分数的 metric 的乘积（nuPlan 官方规则）
     """
+    # nuPlan NR Score 的 8 个子 metric
+    NR_METRICS = {
+        'no_ego_at_fault_collisions',
+        'drivable_area_compliance',
+        'driving_direction_compliance',
+        'ego_is_comfortable',
+        'ego_is_making_progress',
+        'ego_progress_along_expert_route',
+        'speed_limit_compliance',
+        'time_to_collision_within_bound',
+    }
+
     try:
-        # 方式 1: nuPlan MetricFileResult 列表
-        # 每个元素有 metric_statistics 属性，里面是 MetricStatistics 列表
-        if isinstance(data, list):
-            all_scores = []
-            for metric_result in data:
-                # MetricFileResult → metric_statistics: List[MetricStatistics]
-                stats = None
-                if hasattr(metric_result, 'metric_statistics'):
-                    stats = metric_result.metric_statistics
-                elif hasattr(metric_result, 'statistics'):
-                    stats = metric_result.statistics
+        if not isinstance(data, list):
+            return None
 
-                if stats is not None:
-                    for stat in (stats if isinstance(stats, list) else [stats]):
-                        # MetricStatistics → metric_score / value
-                        score = None
-                        if hasattr(stat, 'metric_score'):
-                            score = stat.metric_score
-                        elif hasattr(stat, 'value'):
-                            score = stat.value
-                        elif hasattr(stat, 'score'):
-                            score = stat.score
+        scores = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            metric_name = entry.get('metric_computator', '')
+            metric_score = entry.get('metric_score')
 
-                        if score is not None and isinstance(score, (int, float)):
-                            all_scores.append(float(score))
+            if metric_name in NR_METRICS and metric_score is not None:
+                try:
+                    scores[metric_name] = float(metric_score)
+                except (ValueError, TypeError):
+                    continue
 
-            if all_scores:
-                return np.mean(all_scores)
+        if not scores:
+            return None
 
-        # 方式 2: 单个 MetricFileResult
-        if hasattr(data, 'metric_statistics'):
-            scores = []
-            for stat in data.metric_statistics:
-                if hasattr(stat, 'metric_score'):
-                    scores.append(stat.metric_score)
-            if scores:
-                return np.mean(scores)
+        # NR Score = 所有子 metric 分数的乘积（nuPlan 官方公式）
+        nr_score = 1.0
+        for s in scores.values():
+            nr_score *= s
 
-        # 方式 3: DataFrame
-        if hasattr(data, 'to_dict') or hasattr(data, 'values'):
-            try:
-                import pandas as pd
-                if isinstance(data, pd.DataFrame):
-                    if 'score' in data.columns:
-                        return data['score'].mean()
-                    elif 'metric_score' in data.columns:
-                        return data['metric_score'].mean()
-            except ImportError:
-                pass
+        return nr_score
 
-        # 方式 4: 递归搜索 score 字段
-        score = _recursive_score_search(data, depth=0)
-        if score is not None:
-            return score
-
-    except Exception as e:
-        pass
-
-    return None
-
-
-def _recursive_score_search(obj, depth=0):
-    """递归搜索对象中的 score/metric_score 字段"""
-    if depth > 5:
+    except Exception:
         return None
-
-    if isinstance(obj, (int, float)):
-        return None
-
-    # 检查常见的 score 属性
-    for attr in ['metric_score', 'score', 'value', 'result']:
-        if hasattr(obj, attr):
-            val = getattr(obj, attr)
-            if isinstance(val, (int, float)) and 0 <= val <= 1:
-                return float(val)
-
-    # 检查 dict
-    if isinstance(obj, dict):
-        for key in ['metric_score', 'score', 'value']:
-            if key in obj and isinstance(obj[key], (int, float)):
-                return float(obj[key])
-
-    return None
 
 
 def load_metrics(metrics_dir):
