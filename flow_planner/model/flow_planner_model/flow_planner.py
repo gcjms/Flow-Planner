@@ -278,26 +278,21 @@ class FlowPlanner(DiffusionADPlanner):
         for b in range(B):
             # Get N candidates for this batch element
             batch_candidates = candidates[:, b, :, :]  # (N, T, D)
-            T_traj = batch_candidates.shape[1]
 
-            # --- Neighbor future prediction ---
-            # 推理时 neighbor_future 不可用，用 neighbor_past 线性外推
+            # Get neighbor trajectories for scoring (if available)
+            # NOTE: 推理时只有 neighbor_past，没有 neighbor_future
             neighbors = None
             if hasattr(data, 'neighbor_future') and data.neighbor_future is not None and data.neighbor_future.numel() > 0:
                 neighbors = data.neighbor_future[b]  # (M, T_n, D_n)
             elif hasattr(data, 'neighbor_past') and data.neighbor_past is not None and data.neighbor_past.numel() > 0:
-                # 线性外推邻居未来位置 (从过去轨迹的末端速度推断)
-                neighbors = TrajectoryScorer.extrapolate_neighbors(
-                    data.neighbor_past[b], T=T_traj, dt=0.1
-                )
+                neighbors = data.neighbor_past[b]  # (M, T_p, D_p)
 
-            # --- Route reference points ---
-            # data.routes: (B, R, T_r, D_r) 路线车道点, 用于路线一致性评分
+            # Route reference points for route consistency scoring
+            # data.routes: (B, R, T_r, D_r) 路线车道点
             route = None
             if hasattr(data, 'routes') and data.routes is not None and data.routes.numel() > 0:
                 route_data = data.routes[b]  # (R, T_r, D_r)
-                # 展平所有路线车道的点为 (N_points, 2)
-                route = route_data[:, :, :2].reshape(-1, 2)
+                route = route_data[:, :, :2].reshape(-1, 2)  # flatten to (N_points, 2)
 
             scores = scorer.score_trajectories(
                 batch_candidates, neighbors=neighbors, route=route
