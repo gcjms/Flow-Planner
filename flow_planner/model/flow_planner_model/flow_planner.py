@@ -282,9 +282,10 @@ class FlowPlanner(DiffusionADPlanner):
             # Get neighbor trajectories for scoring (if available)
             # NOTE: 推理时只有 neighbor_past，没有 neighbor_future
             neighbors = None
-            if hasattr(data, 'neighbor_future') and data.neighbor_future is not None and data.neighbor_future.numel() > 0:
+            if hasattr(data, 'neighbor_future') and data.neighbor_future is not None and data.neighbor_future.shape[0] > b:
                 neighbors = data.neighbor_future[b]  # (M, T_n, D_n)
-            elif hasattr(data, 'neighbor_past') and data.neighbor_past is not None and data.neighbor_past.numel() > 0:
+            elif hasattr(data, 'neighbor_past') and data.neighbor_past is not None and data.neighbor_past.shape[0] > b:
+                # Use past neighbor positions as proxy 
                 neighbors = data.neighbor_past[b]  # (M, T_p, D_p)
 
             # Route reference points for route consistency scoring

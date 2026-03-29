@@ -49,13 +49,13 @@ class TrajectoryScorer:
         对 N 条候选轨迹打分。
 
         Args:
-            trajectories: (N, T, D) N 条候选轨迹, D >= 2 (x, y, ...)
-            neighbors: (M, T_n, D_n) 邻居轨迹（如有），用于碰撞/TTC 计算
-            route: (T_r, 2) 规划路线参考点（如有）
-
-        Returns:
-            scores: (N,) 每条轨迹的综合评分，越高越好
+            trajectories: (N, T, D) 或者是 (N, 1, T, D)
+            neighbors: (M, T_n, D_n) 邻居轨迹
+            route: (T_r, 2) 规划路线参考点
         """
+        if trajectories.dim() == 4 and trajectories.shape[1] == 1:
+            trajectories = trajectories.squeeze(1)
+            
         N = trajectories.shape[0]
         device = trajectories.device
         scores = torch.zeros(N, device=device)
