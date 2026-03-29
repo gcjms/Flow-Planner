@@ -4,11 +4,14 @@ Trajectory Scorer: 安全评分函数
 对候选轨迹进行多维度安全评分，用于 Best-of-N 轨迹筛选。
 
 评分维度：
-  1. 碰撞检测：轨迹是否与邻居碰撞
-  2. TTC（碰撞时间）：越大越安全
-  3. 路线一致性：轨迹终点与 GT 路线的偏差
-  4. 舒适度：加速度/曲率变化率
-  5. 进度：沿路线方向的前进距离
+  1. 碰撞检测：轨迹是否与邻居碰撞（权重 50）
+  2. TTC（碰撞时间）：越大越安全（权重 20）
+  3. 路线一致性：轨迹终点与参考路线的偏差（权重 15）
+  4. 舒适度：加速度/曲率变化率（权重 5）
+  5. 进度：沿路线方向的前进距离（权重 10）
+
+注意：推理时 neighbor_future 不可用，需用 extrapolate_neighbors()
+从 neighbor_past 线性外推得到邻居预测未来位置。
 """
 
 import torch
@@ -21,12 +24,12 @@ class TrajectoryScorer:
 
     def __init__(
         self,
-        collision_weight: float = 40.0,
+        collision_weight: float = 50.0,
         ttc_weight: float = 20.0,
         route_weight: float = 15.0,
-        comfort_weight: float = 10.0,
-        progress_weight: float = 15.0,
-        collision_threshold: float = 2.0,     # 碰撞距离阈值 (m)
+        comfort_weight: float = 5.0,
+        progress_weight: float = 10.0,
+        collision_threshold: float = 2.0,     # 碰撞距离阈值 (m), 车宽约2m
         ttc_threshold: float = 3.0,            # TTC 安全阈值 (s)
         dt: float = 0.1,                       # 时间步长 (s)
     ):
@@ -38,6 +41,49 @@ class TrajectoryScorer:
         self.collision_threshold = collision_threshold
         self.ttc_threshold = ttc_threshold
         self.dt = dt
+
+    @staticmethod
+    def extrapolate_neighbors(
+        neighbor_past: torch.Tensor,
+        T: int,
+        dt: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        从邻居历史轨迹线性外推未来位置。
+        
+        推理时 neighbor_future 不可用，用 neighbor_past 最后两帧的
+        速度做恒速线性外推，预测未来 T 步的位置。
+
+        Args:
+            neighbor_past: (M, T_past, D) 邻居历史轨迹，D >= 2 (x, y, ...)
+            T: int 需要外推的未来步数
+            dt: float 时间步长
+
+        Returns:
+            neighbor_future: (M, T, 2) 外推的邻居未来 xy 位置
+        """
+        if neighbor_past is None or neighbor_past.numel() == 0:
+            return None
+        
+        M = neighbor_past.shape[0]
+        device = neighbor_past.device
+        
+        if neighbor_past.shape[1] < 2:
+            # 只有一帧，假设静止
+            last_pos = neighbor_past[:, -1, :2]  # (M, 2)
+            return last_pos.unsqueeze(1).expand(M, T, 2).clone()
+        
+        # 用最后两帧计算速度
+        last_pos = neighbor_past[:, -1, :2]    # (M, 2)
+        prev_pos = neighbor_past[:, -2, :2]    # (M, 2)
+        velocity = (last_pos - prev_pos) / dt  # (M, 2) m/s
+        
+        # 线性外推 T 步
+        steps = torch.arange(1, T + 1, device=device, dtype=torch.float32)  # (T,)
+        # (M, 1, 2) + (1, T, 1) * (M, 1, 2) * dt
+        future_pos = last_pos.unsqueeze(1) + steps.unsqueeze(0).unsqueeze(-1) * velocity.unsqueeze(1) * dt
+        
+        return future_pos  # (M, T, 2)
 
     def score_trajectories(
         self,
