@@ -1,0 +1,44 @@
+# DPO Training Configuration
+# ===========================
+
+# Gemini API
+gemini_api_key: "${GEMINI_API_KEY}"  # Set via environment variable
+
+# Phase 1: Trajectory Sampling
+sampling:
+  num_scenarios: 1118            # val14 full set
+  num_candidates: 10             # K candidates per scenario
+  output_dir: "dpo_data/trajectories"
+  batch_size: 1
+
+# Phase 1: BEV Rendering
+rendering:
+  output_dir: "dpo_data/bev_images"
+  image_size: [800, 800]
+  plot_neighbors: true
+  plot_lanes: true
+  max_neighbors: 20
+
+# Phase 1: VLM Evaluation
+vlm:
+  model: "gemini-1.5-pro"
+  output_dir: "dpo_data/preferences"
+  max_retries: 3
+  concurrent_requests: 5
+
+# Phase 2: DPO Training
+dpo:
+  beta: 0.1                     # DPO temperature
+  learning_rate: 1.0e-5
+  epochs: 5
+  batch_size: 8
+  lora_rank: 4
+  lora_alpha: 16
+  lora_target_modules: ["linear"]  # Decoder linear layers
+  ref_model_path: "checkpoints/model.pth"
+  output_dir: "checkpoints/dpo"
+
+# Phase 3: Evaluation
+eval:
+  num_candidates: 1              # N=1 single-pass inference
+  cfg_weight: 1.8
