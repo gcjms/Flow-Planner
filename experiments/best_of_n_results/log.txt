@@ -1,0 +1,41 @@
+2026-03-30 21:06:59,107 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/worker_pool_builder.py:19}  Building WorkerPool...
+2026-03-30 21:06:59,180 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/utils/multithreading/worker_ray.py:78}  Starting ray local!
+2026-03-30 21:07:05,260 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/utils/multithreading/worker_pool.py:101}  Worker: RayDistributed
+2026-03-30 21:07:05,260 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/utils/multithreading/worker_pool.py:102}  Number of nodes: 1
+Number of CPUs per node: 4
+Number of GPUs per node: 1
+Number of threads across all nodes: 4
+2026-03-30 21:07:05,260 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/worker_pool_builder.py:27}  Building WorkerPool...DONE!
+2026-03-30 21:07:05,261 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/folder_builder.py:32}  Building experiment folders...
+2026-03-30 21:07:05,261 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/folder_builder.py:35}  
+
+	Folder where all results are stored: /root/autodl-tmp/best_of_n_output
+
+2026-03-30 21:07:05,264 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/folder_builder.py:70}  Building experiment folders...DONE!
+2026-03-30 21:07:05,265 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_callback_builder.py:52}  Building AbstractCallback...
+2026-03-30 21:07:05,265 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_callback_builder.py:68}  Building AbstractCallback: 0...DONE!
+2026-03-30 21:07:05,265 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:47}  Building simulations...
+2026-03-30 21:07:05,265 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:53}  Extracting scenarios...
+2026-03-30 21:07:05,266 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/common/utils/distributed_scenario_filter.py:83}  Building Scenarios in mode DistributedMode.SINGLE_NODE
+2026-03-30 21:07:05,266 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/scenario_building_builder.py:18}  Building AbstractScenarioBuilder...
+2026-03-30 21:07:05,300 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/scenario_building_builder.py:21}  Building AbstractScenarioBuilder...DONE!
+2026-03-30 21:07:05,301 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/scenario_filter_builder.py:35}  Building ScenarioFilter...
+2026-03-30 21:07:05,469 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/scenario_filter_builder.py:44}  Building ScenarioFilter...DONE!
+2026-03-30 21:07:08,176 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:74}  Building metric engines...
+2026-03-30 21:07:08,511 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:76}  Building metric engines...DONE
+2026-03-30 21:07:08,511 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:80}  Building simulations from 1118 scenarios...
+2026-03-30 21:21:42,969 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/builders/simulation_builder.py:133}  Building simulations...DONE!
+2026-03-30 21:21:42,969 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/run_simulation.py:78}  Running simulation...
+2026-03-30 21:21:42,969 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/utils.py:138}  Executing runners...
+2026-03-30 21:21:42,969 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/runner/executor.py:82}  Starting 1118 simulations using RayDistributed!
+2026-03-30 21:21:42,970 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/utils/multithreading/worker_pool.py:116}  Submitting 1118 tasks!
+2026-03-31 06:30:59,183 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/runner/executor.py:127}  Number of successful simulations: 1118
+2026-03-31 06:30:59,184 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/runner/executor.py:128}  Number of failed simulations: 0
+2026-03-31 06:30:59,184 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/utils.py:147}  Finished executing runners!
+2026-03-31 06:31:00,893 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/utils.py:74}  Saved runner reports to /root/autodl-tmp/best_of_n_output/runner_report.parquet
+2026-03-31 06:31:00,894 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/main_callback/time_callback.py:27}  Simulation duration: 09:24:02 [HH:MM:SS]
+2026-03-31 06:31:21,941 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/main_callback/metric_file_callback.py:79}  Metric files integration: 00:00:21 [HH:MM:SS]
+2026-03-31 06:31:22,219 WARNING {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/main_callback/metric_aggregator_callback.py:61}  closed_loop_nonreactive_agents_weighted_average: No metric files found for aggregation!
+2026-03-31 06:31:22,219 WARNING {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/main_callback/metric_aggregator_callback.py:62}  If you didn't expect this, ensure that the challenge name is part of your submitted job name.
+2026-03-31 06:31:22,219 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/simulation/main_callback/metric_aggregator_callback.py:69}  Metric aggregator: 00:00:00 [HH:MM:SS]
+2026-03-31 06:31:22,221 INFO {/root/miniconda3/envs/flow_planner/lib/python3.9/site-packages/nuplan/planning/script/run_simulation.py:80}  Finished running simulation!
