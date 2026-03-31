@@ -109,37 +109,112 @@ $$\mathcal{L}_{DPO} = -\log \sigma\left(\beta \cdot \left[\log \frac{\pi_\theta(
   - 直接提供了 LoRA 插入自动驾驶模型的工程参考
   - 我们的 DPO 训练就是在 LoRA 层上做的
 
+### 2.7 Plan-R1 — 2025 ⭐⭐⭐
+**nuPlan 上的 GRPO 后训练，和我们最像的实验设置**
+
+- **论文**：Plan-R1: Safe and Feasible Trajectory Planning as Language Modeling (arXiv:2505.17659)
+- **核心思路**：
+  1. 阶段一：把轨迹坐标量化成 token，用自回归方式预训练
+  2. 阶段二：用 **GRPO (Group Relative Policy Optimization)** 做 RL 后微调
+  3. 提出 **VD-GRPO**（Variance-Decoupled GRPO）：修改标准化方式，保留安全奖励的绝对量级
+- **结果**：nuPlan 闭环 SOTA
+- **对我们的启发**：
+  - **直接竞争对手！** 它也在 nuPlan 上做后训练对齐，但用的是 GRPO 而非 DPO
+  - 它用规则奖励（碰撞/超速/车道偏离），和我们的 `TrajectoryScorer` 异曲同工
+  - 我们可以对标它的实验设计：用相同的 nuPlan 场景集，证明 DPO + Flow Matching 更优
+
+### 2.8 DIVER — 2025 ⭐⭐
+**扩散模型 + RL 指导生成多样化轨迹**
+
+- **论文**：DIVER: Reinforced Diffusion Breaks Imitation Bottlenecks in End-to-End Autonomous Driving
+- **核心思路**：
+  1. **Policy-Aware Diffusion Generator (PADG)**：条件化扩散模型，感知地图和邻居交互
+  2. 用 GRPO 将扩散模型当作随机策略来优化
+  3. 解决模仿学习的模式坍缩问题（mode collapse）
+- **对我们的启发**：
+  - 它直接在 Diffusion 上做 GRPO，我们在 Flow Matching 上做 DPO，技术路线极其相近
+  - 它的多样性生成机制（PADG）可以参考
+  - 我们可以论证 DPO 比 GRPO 更简洁（不需要 group 采样）
+
+### 2.9 DiffusionDriveV2 — 2025
+**扩散驾驶模型的 RL 后训练迭代**
+
+- **论文**：DiffusionDriveV2 (2025.12)
+- **核心思路**：
+  1. 在 DiffusionDrive（CVPR 2025 Highlight）基础上
+  2. 引入 intra-anchor 和 inter-anchor GRPO
+  3. 解决"多样性-质量困境"（diversity-quality dilemma）
+- **对我们的启发**：
+  - 进一步佐证"Diffusion/Flow + RL 后训练"是 2025~2026 主流路线
+  - 它的 anchor 机制和我们的 CFG guided 采样有异曲同工之处
+
+### 2.10 SafeDPO — 2025
+**带安全约束的 DPO 变体**
+
+- **论文**：SafeDPO: A Simple Approach to Direct Preference Optimization with Enhanced Safety
+- **核心思路**：
+  1. 在标准 DPO Loss 中加入二元安全指示器（binary safety indicator）
+  2. 通过重新排序偏好对实现安全约束
+  3. 单阶段优化，不需要额外的 Reward 或 Cost Model
+- **对我们的启发**：
+  - 虽然原论文是给 LLM 设计的，但其"安全约束 DPO"的思想可以直接迁移
+  - 我们可以把 collision=0 的场景标记为"绝对不安全"，在 Loss 中给予更高权重
+
 ---
 
-## 三、我们的定位：Flow-Planner + DPO
+## 三、全景对比表
 
-### 3.1 我们的独特优势
+| 论文 | 会议 | 生成模型 | 对齐方法 | 评测基准 | 核心创新 |
+|------|------|---------|---------|---------|---------|
+| DriveDPO | NeurIPS 2025 | Transformer | DPO | NAVSIM | 统一蒸馏 + 迭代 DPO |
+| TrajHF | 2025 | Diffusion | RLHF | NAVSIM | 个性化驾驶风格对齐 |
+| Plan-R1 | arXiv 2025 | Autoregressive | **VD-GRPO** | **nuPlan** | 方差解耦 GRPO |
+| DIVER | 2025 | Diffusion | GRPO | NAVSIM | Policy-Aware 扩散 + RL |
+| DiffusionDriveV2 | 2025 | Diffusion | GRPO | NAVSIM | Anchor-based GRPO |
+| READ | ICLR 2026 | Diffusion | PPO | nuPlan | RL 微调预训练扩散 |
+| CuriousVLA | CVPR 2026 | VLM 自回归 | RL | NAVSIM | Narrow Policy 诊断 |
+| Gen-Drive | ICRA 2025 | Diffusion | RL | NAVSIM | 生成-评估范式 |
+| SafeDPO | arXiv 2025 | LLM | DPO | - | 安全约束 DPO |
+| LoRD | ICRA 2025 | 通用 | 域适应 | nuPlan | LoRA 插入驾驶策略 |
+| **Ours (Flow-DPO)** | - | **Flow Matching** | **DPO** | **nuPlan** | **FM + DPO + LoRA** |
 
-| 对比维度 | DriveDPO | READ | CuriousVLA | **Ours (Flow-DPO)** |
-|---------|---------|------|------------|---------------------|
-| 生成模型 | Transformer | Diffusion | VLM (自回归) | **Flow Matching** |
-| 对齐方法 | DPO | PPO (RL) | RL + Reward | **DPO** |
-| 参数效率 | 全量微调 | 全量微调 | 全量微调 | **LoRA (1~2%)** |
-| 多样性来源 | 多次采样 | 噪声扰动 | FTE 扩展 | **高斯噪声天然多样** |
-| 似然计算 | 自回归分解 | ELBO 近似 | 自回归分解 | **直接 MSE** |
+---
 
-### 3.2 论文故事线（如果要写论文）
+## 四、我们的定位：Flow-Planner + DPO
 
-1. **问题**：引用 CuriousVLA 的 Narrow Policy 概念，指出现有模型存在均值回归
-2. **观察**：展示 Best-of-N 实验中 collision=0（5 条全撞）的案例，证明推理时选择无法自救
-3. **方法**：提出 Flow-DPO —— 在 Flow Matching 生成器上直接做 DPO 偏好对齐
+### 4.1 我们的独特性
+
+在上面所有相关工作中，**没有任何一篇**同时做到：
+1. 用 **Flow Matching**（而非 Diffusion 或自回归）做轨迹生成
+2. 用 **DPO**（而非 PPO/GRPO）做偏好对齐
+3. 用 **LoRA**（而非全量微调）做参数高效训练
+
+这三个组合在一起就是我们的差异化卖点。
+
+### 4.2 论文故事线
+
+1. **问题**：引用 CuriousVLA 的 Narrow Policy + Best-of-N 在 collision=0 场景失效
+2. **观察**：展示 TrajectoryScorer 分析结果，量化 Best-of-N 的瓶颈
+3. **方法**：提出 Flow-DPO —— Flow Matching + DPO + LoRA 的轻量对齐方案
 4. **优势**：
-   - 比 READ (PPO) 更简洁稳定
+   - 比 Plan-R1/DIVER (GRPO) 不需要 group 采样，更简洁
+   - 比 READ (PPO) 不需要 Reward Model 和在线仿真，更稳定
    - 比 DriveDPO (Transformer) 在连续空间生成更平滑
    - 比 Best-of-N 推理时快 5 倍（N=1 vs N=5）
-5. **实验**：nuPlan val14 闭环 NR-CLS 对比
+5. **实验**：nuPlan val14 闭环 NR-CLS 量化对比
 
 ---
 
-## 四、推荐阅读顺序
+## 五、推荐阅读顺序
 
-1. **DPO 原论文**（必读）：Rafailov et al., "Direct Preference Optimization", NeurIPS 2023
-2. **DriveDPO**（核心参考）：最贴近我们方案的 AD-specific DPO 实现
-3. **READ**（技术对标）：Diffusion + RL，可对比证明 DPO 更优
-4. **CuriousVLA**（问题定义）：Narrow Policy 概念可以直接引用
-5. **LoRD**（工程参考）：LoRA 在 AD 中的具体实现细节
+| 优先级 | 论文 | 理由 |
+|-------|------|------|
+| ⭐⭐⭐ | DPO 原论文 (NeurIPS 2023) | 必读，理解 DPO 数学基础 |
+| ⭐⭐⭐ | DriveDPO | 最贴近我们的 DPO + AD 实现 |
+| ⭐⭐⭐ | Plan-R1 | 同样在 nuPlan 上做后训练对齐，直接竞争对手 |
+| ⭐⭐ | DIVER | Diffusion + GRPO，技术最相近 |
+| ⭐⭐ | READ | Diffusion + PPO，可对标证明 DPO 更优 |
+| ⭐⭐ | CuriousVLA | Narrow Policy 问题定义 |
+| ⭐ | DiffusionDriveV2 | GRPO 在 Diffusion 上的更多细节 |
+| ⭐ | SafeDPO | 安全约束 DPO Loss 设计参考 |
+| ⭐ | LoRD | LoRA 工程参考 |
