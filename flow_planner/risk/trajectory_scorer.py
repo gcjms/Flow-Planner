@@ -159,6 +159,8 @@ class TrajectoryScorer:
         neigh_xy = neighbors[:, :, :2]  # (M, T_n, 2)
         T_n = neigh_xy.shape[1]
         min_T = min(T, T_n)
+        if min_T <= 0:
+            return torch.ones(N, device=device)
 
         # 计算每条轨迹与每个邻居的最近距离
         # traj_xy: (N, min_T, 2) → (N, 1, min_T, 2)
@@ -197,6 +199,8 @@ class TrajectoryScorer:
         T = traj_xy.shape[1]
         T_n = neigh_xy.shape[1]
         min_T = min(T, T_n)
+        if min_T <= 1:
+            return torch.ones(N, device=device)
 
         # 计算速度
         traj_vel = (traj_xy[:, 1:min_T, :] - traj_xy[:, :min_T-1, :]) / self.dt  # (N, min_T-1, 2)
@@ -255,6 +259,10 @@ class TrajectoryScorer:
     ) -> torch.Tensor:
         """舒适度：加速度/曲率变化平滑"""
         N = trajectories.shape[0]
+        T = trajectories.shape[1]
+        device = trajectories.device
+        if T <= 3:
+            return torch.ones(N, device=device)
         traj_xy = trajectories[:, :, :2]  # (N, T, 2)
 
         # 速度
