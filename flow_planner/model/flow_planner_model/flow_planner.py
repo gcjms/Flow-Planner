@@ -122,7 +122,8 @@ class FlowPlanner(DiffusionADPlanner):
         elif mode == 'inference':
             return self.forward_inference(
                 data, params['use_cfg'], params['cfg_weight'],
-                num_candidates=params.get('num_candidates', 1)
+                num_candidates=params.get('num_candidates', 1),
+                bon_seed=params.get('bon_seed', -1)
             )
     
     def forward_train(self, data: NuPlanDataSample):
@@ -174,7 +175,8 @@ class FlowPlanner(DiffusionADPlanner):
         return prediction, loss_dict
     
     def forward_inference(self, data: NuPlanDataSample, use_cfg=True, cfg_weight=None,
-                          num_candidates: int = 1, return_all_candidates: bool = False):
+                          num_candidates: int = 1, return_all_candidates: bool = False,
+                          bon_seed: int = -1):
         """
         Forward inference with optional Best-of-N trajectory selection.
 
@@ -184,6 +186,8 @@ class FlowPlanner(DiffusionADPlanner):
             cfg_weight: CFG weight (None = use default)
             num_candidates: number of candidate trajectories to generate (Best-of-N)
             return_all_candidates: if True, return all N candidates instead of best one
+            bon_seed: if >= 0, use deterministic seeds for candidate generation
+                      (seed + i for candidate i). Set to -1 for random.
 
         Returns:
             sample: (B, T, D) best trajectory, or (B, N, T, D) if return_all_candidates
@@ -234,7 +238,11 @@ class FlowPlanner(DiffusionADPlanner):
 
         # ---- Generate N candidate trajectories ----
         all_candidates = []
-        for _ in range(num_candidates):
+        for i in range(num_candidates):
+            # Deterministic seed for reproducible candidate generation
+            if bon_seed >= 0:
+                torch.manual_seed(bon_seed + i)
+
             x_init = torch.randn(
                 (B, self.action_num, self.planner_params['action_len'],
                  self.planner_params['state_dim']),
@@ -272,21 +280,27 @@ class FlowPlanner(DiffusionADPlanner):
 
         # Score each candidate using safety scorer
         from flow_planner.risk.trajectory_scorer import TrajectoryScorer
-        scorer = TrajectoryScorer()
+        scorer = TrajectoryScorer(verbose=(num_candidates > 1))
 
         best_trajs = []
         for b in range(B):
             # Get N candidates for this batch element
             batch_candidates = candidates[:, b, :, :]  # (N, T, D)
 
-            # Get neighbor trajectories for scoring (if available)
-            # NOTE: 推理时只有 neighbor_past，没有 neighbor_future
-            neighbors = None
-            if hasattr(data, 'neighbor_future') and data.neighbor_future is not None and data.neighbor_future.shape[0] > b:
-                neighbors = data.neighbor_future[b]  # (M, T_n, D_n)
-            elif hasattr(data, 'neighbor_past') and data.neighbor_past is not None and data.neighbor_past.shape[0] > b:
-                # Use past neighbor positions as proxy 
-                neighbors = data.neighbor_past[b]  # (M, T_p, D_p)
+            # ---- Extrapolate neighbor future using constant-velocity model ----
+            # neighbor_past shape: (B, M, T_p, 11) or (M, T_p, 11)
+            # 维度: [x, y, cos_h, sin_h, vx, vy, width, length, type×3]
+            neighbors_future = None
+            if hasattr(data, 'neighbor_past') and data.neighbor_past is not None and data.neighbor_past.numel() > 0:
+                if data.neighbor_past.dim() == 3:
+                    nb_past = data.neighbor_past  # (M, T_p, D)
+                else:
+                    nb_past = data.neighbor_past[b]  # (M, T_p, D)
+
+                T_ego = batch_candidates.shape[1]  # ego 轨迹的时间步数
+                neighbors_future = TrajectoryScorer.extrapolate_neighbor_future(
+                    nb_past, future_steps=T_ego, dt=0.1
+                )
 
             # Route reference points for route consistency scoring
             # data.routes: (B, R, T_r, D_r) 路线车道点
@@ -296,7 +310,7 @@ class FlowPlanner(DiffusionADPlanner):
                 route = route_data[:, :, :2].reshape(-1, 2)  # flatten to (N_points, 2)
 
             scores = scorer.score_trajectories(
-                batch_candidates, neighbors=neighbors, route=route
+                batch_candidates, neighbors=neighbors_future, route=route
             )
             best_idx = scores.argmax().item()
             best_trajs.append(batch_candidates[best_idx:best_idx+1])

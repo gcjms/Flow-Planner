@@ -41,6 +41,7 @@ class FlowPlanner(AbstractPlanner):
             use_cfg: bool = True,
             cfg_weight: float = 1.0,
             num_candidates: int = 1,
+            bon_seed: int = -1,
         ):
 
         assert device in ["cpu", "cuda"], f"device {device} not supported"
@@ -71,6 +72,7 @@ class FlowPlanner(AbstractPlanner):
         self.cfg_weight = cfg_weight
         
         self.num_candidates = num_candidates
+        self.bon_seed = bon_seed
         
     def name(self) -> str:
         """
@@ -156,7 +158,8 @@ class FlowPlanner(AbstractPlanner):
             self._planner, inputs, 
             use_cfg=self.use_cfg, 
             cfg_weight=self.cfg_weight,
-            num_candidates=self.num_candidates
+            num_candidates=self.num_candidates,
+            bon_seed=self.bon_seed
         )
 
         trajectory = InterpolatedTrajectory(

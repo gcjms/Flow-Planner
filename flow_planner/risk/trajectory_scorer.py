@@ -11,9 +11,12 @@ Trajectory Scorer: 安全评分函数
   5. 进度：沿路线方向的前进距离
 """
 
+import logging
 import torch
 import numpy as np
-from typing import Optional
+from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
 
 
 class TrajectoryScorer:
@@ -29,6 +32,7 @@ class TrajectoryScorer:
         collision_threshold: float = 2.0,     # 碰撞距离阈值 (m)
         ttc_threshold: float = 3.0,            # TTC 安全阈值 (s)
         dt: float = 0.1,                       # 时间步长 (s)
+        verbose: bool = False,                 # 是否输出详细打分日志
     ):
         self.collision_weight = collision_weight
         self.ttc_weight = ttc_weight
@@ -38,6 +42,48 @@ class TrajectoryScorer:
         self.collision_threshold = collision_threshold
         self.ttc_threshold = ttc_threshold
         self.dt = dt
+        self.verbose = verbose
+
+    @staticmethod
+    def extrapolate_neighbor_future(
+        neighbor_past: torch.Tensor,
+        future_steps: int,
+        dt: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        用邻居最后一帧的速度做匀速直线外推，生成未来轨迹。
+
+        Args:
+            neighbor_past: (M, T_p, D) 邻居历史轨迹
+                D 维度: [x, y, cos_h, sin_h, vx, vy, width, length, type×3]
+            future_steps: 外推的未来时间步数
+            dt: 每步时间间隔 (秒)
+
+        Returns:
+            neighbor_future: (M, future_steps, 2) 外推的未来 xy 位置
+        """
+        if neighbor_past is None or neighbor_past.numel() == 0:
+            return None
+
+        M = neighbor_past.shape[0]
+        device = neighbor_past.device
+
+        # 提取最后一帧的位置和速度
+        last_pos = neighbor_past[:, -1, :2]   # (M, 2) x, y
+        last_vel = neighbor_past[:, -1, 4:6]  # (M, 2) vx, vy
+
+        # 检查是否有全零的无效邻居（padding），保留 mask
+        valid_mask = (neighbor_past[:, -1, :6].abs().sum(dim=-1) > 0)  # (M,)
+
+        # 匀速外推: pos_t = pos_0 + v * dt * t
+        time_offsets = torch.arange(1, future_steps + 1, device=device, dtype=last_pos.dtype)  # (T,)
+        # (M, 1, 2) + (M, 1, 2) * (1, T, 1) -> (M, T, 2)
+        future_pos = last_pos.unsqueeze(1) + last_vel.unsqueeze(1) * (time_offsets.unsqueeze(0).unsqueeze(-1) * dt)
+
+        # 把无效邻居的外推结果清零
+        future_pos = future_pos * valid_mask.unsqueeze(-1).unsqueeze(-1).float()
+
+        return future_pos  # (M, future_steps, 2)
 
     def score_trajectories(
         self,
@@ -50,7 +96,7 @@ class TrajectoryScorer:
 
         Args:
             trajectories: (N, T, D) 或者是 (N, 1, T, D)
-            neighbors: (M, T_n, D_n) 邻居轨迹
+            neighbors: (M, T_n, 2) 邻居未来轨迹 (外推后的 xy 坐标)
             route: (T_r, 2) 规划路线参考点
         """
         if trajectories.dim() == 4 and trajectories.shape[1] == 1:
@@ -79,6 +125,17 @@ class TrajectoryScorer:
         # 5. 前进进度评分
         progress_scores = self._progress_score(trajectories)
         scores += self.progress_weight * progress_scores
+
+        if self.verbose:
+            logger.info(
+                f"Scorer [N={N}] "
+                f"collision={collision_scores.cpu().numpy().round(4)} "
+                f"ttc={ttc_scores.cpu().numpy().round(4)} "
+                f"route={route_scores.cpu().numpy().round(4)} "
+                f"comfort={comfort_scores.cpu().numpy().round(4)} "
+                f"progress={progress_scores.cpu().numpy().round(4)} "
+                f"total={scores.cpu().numpy().round(4)}"
+            )
 
         return scores
 

@@ -23,3 +23,4 @@ flow_planner:
   use_cfg: true
   cfg_weight: 1.8
   num_candidates: 1
+  bon_seed: -1  # -1=random, >=0=deterministic seed for Best-of-N candidates

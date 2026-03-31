@@ -31,11 +31,12 @@ class FlowMatchingCore(Core):
 
         return total_loss_dict
         
-    def inference(self, model, data, use_cfg=False, cfg_weight=None, num_candidates=1):
+    def inference(self, model, data, use_cfg=False, cfg_weight=None, num_candidates=1, bon_seed=-1):
         model = model.to(self.device)
         model.eval()
         
-        prediction = model(data, mode='inference', use_cfg=use_cfg, cfg_weight=cfg_weight, num_candidates=num_candidates)
+        prediction = model(data, mode='inference', use_cfg=use_cfg, cfg_weight=cfg_weight,
+                          num_candidates=num_candidates, bon_seed=bon_seed)
         
         return prediction
     
