@@ -1,7 +1,7 @@
 """
 DPO Loss for Flow Matching
 ==========================
-实现 Direct Preference Optimization 损失函数，适配 Flow Matching 的连续速度场生成。
+实现 Direct Preference Optimization 损失函数，适配 Flow-Planner 的连续速度场生成。
 
 核心思想：
   - 给定 (chosen, rejected) 偏好对
@@ -11,12 +11,29 @@ DPO Loss for Flow Matching
 参考：
   - Rafailov et al., "Direct Preference Optimization" (NeurIPS 2023)
   - Lipman et al., "Flow Matching for Generative Modeling" (ICLR 2023)
+
+适配说明：
+  Flow-Planner 的 decoder 接口:
+    decoder(x, t, **model_extra)
+      x: (B, P, action_len, state_dim) — action tokens
+      t: (B,) — flow matching 时间步
+      model_extra: encoder 输出 (encodings, masks, routes_cond, token_dist, cfg_flags)
+    → prediction: (B, P, action_len, state_dim)
+
+  对数似然计算:
+    给定目标轨迹 y, 随机噪声 x0, 时间步 t:
+    1. 中间状态: x_t = (1-t)*x0 + t*y   (线性插值路径)
+    2. 真实速度: v_true = y - x0         (直线路径的斜率)
+    3. 模型预测: v_pred = decoder(x_t, t, cond)
+    4. log P(y|cond) ≈ -||v_pred - v_true||²
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, Optional
+
+from flow_planner.model.model_utils.traj_tool import traj_chunking
 
 
 class FlowMatchingDPOLoss(nn.Module):
@@ -36,43 +53,56 @@ class FlowMatchingDPOLoss(nn.Module):
         self,
         model: nn.Module,
         trajectory: torch.Tensor,
-        condition: dict,
+        encoder_outputs: dict,
         t: torch.Tensor,
         x0: torch.Tensor,
+        action_len: int,
+        action_overlap: int,
     ) -> torch.Tensor:
         """
         计算模型对给定轨迹的对数似然近似。
 
-        原理：
-          1. 给定目标轨迹 y 和随机噪声 x0
-          2. 计算中间状态: x_t = (1-t)*x0 + t*y
-          3. 模型预测速度: v_pred = model(x_t, t, condition)
-          4. 真实速度: v_true = y - x0
+        流程：
+          1. 将轨迹分块为 action tokens (与训练一致)
+          2. 对噪声也做相同分块
+          3. 计算中间状态和真实速度（在 token 空间）
+          4. 用 decoder 预测速度
           5. log P(y|x) ≈ -||v_pred - v_true||²
 
         Args:
-            model: Flow-Planner 模型（带或不带 LoRA）
-            trajectory: (B, T, 2) 轨迹坐标
-            condition: dict, 场景条件（包含 neighbor, lane 等编码后的特征）
-            t: (B, 1, 1) 采样的时间步
-            x0: (B, T, 2) 采样的噪声
+            model: FlowPlanner 模型 (调用 model.decoder)
+            trajectory: (B, T, D) 轨迹坐标, D=state_dim
+            encoder_outputs: decoder 所需的条件信息 (来自 model.extract_decoder_inputs)
+            t: (B,) 采样的时间步, 范围 [0, 1]
+            x0: (B, T, D) 采样的高斯噪声
+            action_len: action token 长度 (如 20)
+            action_overlap: action token 重叠量 (如 10)
 
         Returns:
             log_prob: (B,) 每个样本的对数似然
         """
         B = trajectory.shape[0]
 
-        # 中间状态：线性插值
-        x_t = (1 - t) * x0 + t * trajectory  # (B, T, 2)
+        # 将轨迹和噪声分块为 action tokens
+        # traj_chunking: (B, T, D) → list of (B, 1, action_len, D)
+        traj_tokens = traj_chunking(trajectory, action_len, action_overlap)
+        traj_tokens = torch.cat(traj_tokens, dim=1)   # (B, P, action_len, D)
 
-        # 真实速度场：直线的斜率
-        v_true = trajectory - x0  # (B, T, 2)
+        noise_tokens = traj_chunking(x0, action_len, action_overlap)
+        noise_tokens = torch.cat(noise_tokens, dim=1)  # (B, P, action_len, D)
+
+        # 中间状态 x_t = (1-t)*x0 + t*y (在 token 空间)
+        t_expand = t.view(B, 1, 1, 1)  # 广播到 (B, P, action_len, D)
+        x_t = (1 - t_expand) * noise_tokens + t_expand * traj_tokens
+
+        # 真实速度场 v_true = y - x0
+        v_true = traj_tokens - noise_tokens
 
         # 模型预测速度场
-        v_pred = model.predict_velocity(x_t, t.squeeze(-1).squeeze(-1), condition)  # (B, T, 2)
+        v_pred = model.decoder(x_t, t, **encoder_outputs)  # (B, P, action_len, D)
 
-        # 对数似然 ≈ 负 MSE（逐样本求和）
-        mse = (v_pred - v_true).pow(2).sum(dim=(-1, -2))  # (B,)
+        # 对数似然 ≈ -MSE (逐样本求和)
+        mse = (v_pred - v_true).pow(2).sum(dim=(-1, -2, -3))  # (B,)
         log_prob = -mse
 
         return log_prob
@@ -83,17 +113,21 @@ class FlowMatchingDPOLoss(nn.Module):
         ref_model: nn.Module,
         chosen: torch.Tensor,
         rejected: torch.Tensor,
-        condition: dict,
+        encoder_outputs: dict,
+        action_len: int,
+        action_overlap: int,
     ) -> Tuple[torch.Tensor, dict]:
         """
         计算 DPO Loss。
 
         Args:
-            model: 正在训练的 Flow-Planner（带 LoRA）
+            model: 正在训练的 Flow-Planner（带 LoRA 的 decoder）
             ref_model: 冻结的参考 Flow-Planner（原始权重）
-            chosen: (B, T, 2) 好轨迹
-            rejected: (B, T, 2) 坏轨迹
-            condition: dict, 编码后的场景条件
+            chosen: (B, T, D) 好轨迹
+            rejected: (B, T, D) 坏轨迹
+            encoder_outputs: 编码后的场景条件 (来自共享 encoder)
+            action_len: action token 长度
+            action_overlap: action token 重叠量
 
         Returns:
             loss: scalar, DPO 损失
@@ -104,16 +138,28 @@ class FlowMatchingDPOLoss(nn.Module):
 
         # 采样共享的噪声和时间（chosen 和 rejected 用同一组）
         x0 = torch.randn_like(chosen)
-        t = torch.rand(B, 1, 1, device=device)
+        t = torch.rand(B, device=device)
 
-        # 计算训练模型的 log prob
-        log_pi_w = self.compute_log_prob(model, chosen, condition, t, x0)
-        log_pi_l = self.compute_log_prob(model, rejected, condition, t, x0)
+        # 计算训练模型 (policy) 的 log prob
+        log_pi_w = self.compute_log_prob(
+            model, chosen, encoder_outputs, t, x0,
+            action_len, action_overlap
+        )
+        log_pi_l = self.compute_log_prob(
+            model, rejected, encoder_outputs, t, x0,
+            action_len, action_overlap
+        )
 
         # 计算参考模型的 log prob（不计算梯度）
         with torch.no_grad():
-            log_ref_w = self.compute_log_prob(ref_model, chosen, condition, t, x0)
-            log_ref_l = self.compute_log_prob(ref_model, rejected, condition, t, x0)
+            log_ref_w = self.compute_log_prob(
+                ref_model, chosen, encoder_outputs, t, x0,
+                action_len, action_overlap
+            )
+            log_ref_l = self.compute_log_prob(
+                ref_model, rejected, encoder_outputs, t, x0,
+                action_len, action_overlap
+            )
 
         # DPO 核心公式
         # Δ = (log π_θ(y_w) - log π_ref(y_w)) - (log π_θ(y_l) - log π_ref(y_l))
@@ -129,6 +175,8 @@ class FlowMatchingDPOLoss(nn.Module):
             "dpo/chosen_reward": (log_pi_w - log_ref_w).mean().item(),
             "dpo/rejected_reward": (log_pi_l - log_ref_l).mean().item(),
             "dpo/accuracy": (delta > 0).float().mean().item(),  # 模型是否正确偏好 chosen
+            "dpo/log_pi_chosen": log_pi_w.mean().item(),
+            "dpo/log_pi_rejected": log_pi_l.mean().item(),
         }
 
         return loss, metrics

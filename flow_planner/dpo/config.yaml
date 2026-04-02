@@ -34,7 +34,12 @@ dpo:
   batch_size: 8
   lora_rank: 4
   lora_alpha: 16
-  lora_target_modules: ["linear"]  # Decoder linear layers
+  lora_target_modules:             # Decoder linear layers to inject LoRA
+    - "in_proj"                      # JointAttention QKV 投影
+    - "out_proj"                     # JointAttention 输出投影
+    - "ffn"                          # FeedForward 中的 Linear 层
+    - "proj"                         # FinalLayer MLP
+    - "adaLN_modulation"             # FinalLayer 自适应 LayerNorm 调制
   ref_model_path: "checkpoints/model.pth"
   output_dir: "checkpoints/dpo"
 
