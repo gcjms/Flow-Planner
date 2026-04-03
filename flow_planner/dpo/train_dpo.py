@@ -187,27 +187,32 @@ def load_flow_planner(
     logger.info(f"Loading config from {config_path}")
     cfg = OmegaConf.load(config_path)
 
+    # Fix Hydra interpolation errors for missing keys
+    OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)
+    OmegaConf.update(cfg, "data.dataset.train.predicted_neighbor_num", 0, force_add=True)
+    OmegaConf.update(cfg, "normalization_stats", cfg.get("normalization_stats"), force_add=True)
+
     logger.info("Instantiating model...")
     model = instantiate(cfg.model)
 
     logger.info(f"Loading checkpoint from {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location='cpu')
 
     # 适配不同的 checkpoint 格式
     if 'ema_state_dict' in ckpt:
-        state_dict = {
-            k.replace('module.', ''): v
-            for k, v in ckpt['ema_state_dict'].items()
-        }
+        sd = ckpt['ema_state_dict']
     elif 'state_dict' in ckpt:
-        state_dict = {
-            k.replace('module.', ''): v
-            for k, v in ckpt['state_dict'].items()
-        }
+        sd = ckpt['state_dict']
     else:
-        state_dict = ckpt
+        sd = ckpt
+    state_dict = {k.replace('module.', ''): v for k, v in sd.items()}
 
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        logger.warning(f"Missing {len(missing)} keys: {missing[:5]}")
+    if unexpected:
+        logger.warning(f"Unexpected {len(unexpected)} keys: {unexpected[:5]}")
+
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -227,6 +232,14 @@ def prepare_encoder_outputs(
     在 DPO 训练中，encoder 的输出在 chosen 和 rejected 间共享，
     因此对每个 batch 只需运行一次 encoder。
 
+    The encoder requires these exact keys (from extract_encoder_inputs):
+      - neighbor_past -> neighbors
+      - lanes -> lanes
+      - lanes_speedlimit -> lanes_speed_limit
+      - lanes_has_speedlimit -> lanes_has_speed_limit
+      - map_objects -> static
+      - routes -> routes
+
     Args:
         model: FlowPlanner 模型
         condition: 来自 PreferenceDataset 的条件数据
@@ -235,23 +248,22 @@ def prepare_encoder_outputs(
     Returns:
         encoder_outputs: decoder 所需的字典
     """
-    from flow_planner.data.dataset.nuplan import NuPlanDataSample
-
-    # 构建 NuPlanDataSample（简化版，只包含 encoder 需要的字段）
-    B = condition.get('ego_current', condition.get('neighbor_past')).shape[0]
-
-    # 准备 cfg_flags (DPO 训练不需要 CFG, 全部设为 conditioned)
-    cfg_flags = torch.ones(B, device=device, dtype=torch.int32)
-
-    # 将条件移到设备
+    # Move all condition tensors to device
     inputs = {}
     for key, val in condition.items():
         if isinstance(val, torch.Tensor):
             inputs[key] = val.to(device)
         elif isinstance(val, list):
             inputs[key] = [v.to(device) if isinstance(v, torch.Tensor) else v for v in val]
+        else:
+            inputs[key] = val
 
-    # 构建 encoder 输入
+    B = next(v.shape[0] for v in inputs.values() if isinstance(v, torch.Tensor))
+
+    # DPO 训练不需要 CFG, 全部设为 conditioned
+    inputs['cfg_flags'] = torch.ones(B, device=device, dtype=torch.int32)
+
+    # 构建 encoder 输入 (must match extract_encoder_inputs signature)
     encoder_inputs = model.extract_encoder_inputs(inputs)
 
     # encoder 前向
@@ -259,7 +271,6 @@ def prepare_encoder_outputs(
         encoder_outputs = model.encoder(**encoder_inputs)
 
     # 构建 decoder 所需的 model_extra
-    inputs['cfg_flags'] = cfg_flags
     decoder_inputs = model.extract_decoder_inputs(encoder_outputs, inputs)
 
     return decoder_inputs

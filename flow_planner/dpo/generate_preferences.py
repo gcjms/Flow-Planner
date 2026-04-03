@@ -78,7 +78,7 @@ def generate_preferences_with_scorer(
                 pred = model(data, mode='inference',
                            use_cfg=True, cfg_weight=1.8,
                            num_candidates=1)
-                candidates.append(pred['trajectory'].squeeze(0))  # (T, D)
+                candidates.append(pred.squeeze(0).squeeze(0))  # (1,1,T,D) → (T,D)
 
             # Stack: (K, T, D)
             candidates = torch.stack(candidates, dim=0)
@@ -164,11 +164,10 @@ def generate_preferences_with_vlm(
       3. 发送给 Gemini API 评价排名
       4. 排名第 1 → chosen，排名最后 → rejected
     """
-    import google.generativeai as genai
+    from google import genai
     from PIL import Image
 
-    genai.configure(api_key=api_key)
-    vlm = genai.GenerativeModel("gemini-1.5-pro")
+    client = genai.Client(api_key=api_key)
 
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
@@ -206,8 +205,8 @@ def generate_preferences_with_vlm(
             # 渲染 BEV 图
             bev_path = os.path.join(output_dir, 'bev_images', f'scenario_{idx}.png')
             os.makedirs(os.path.dirname(bev_path), exist_ok=True)
-            bev_renderer.render(
-                candidates=candidates.cpu().numpy(),
+            bev_renderer.render_scenario(
+                candidates=candidates.cpu().numpy()[..., :2],
                 neighbors=data.get('neighbor_past', None),
                 lanes=data.get('lane', None),
                 save_path=bev_path,
@@ -216,7 +215,9 @@ def generate_preferences_with_vlm(
             # 调用 Gemini API
             try:
                 img = Image.open(bev_path)
-                response = vlm.generate_content([prompt, img])
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash', contents=[prompt, img]
+                )
                 ranking_text = response.text.strip()
 
                 # 解析排名 "1, 3, 2, 5, 4" → [0, 2, 1, 4, 3]

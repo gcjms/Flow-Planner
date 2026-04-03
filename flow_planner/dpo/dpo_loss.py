@@ -84,11 +84,12 @@ class FlowMatchingDPOLoss(nn.Module):
         B = trajectory.shape[0]
 
         # 将轨迹和噪声分块为 action tokens
-        # traj_chunking: (B, T, D) → list of (B, 1, action_len, D)
-        traj_tokens = traj_chunking(trajectory, action_len, action_overlap)
+        # Training code convention: traj_chunking expects (B, P, T, D) with P=1
+        # traj_chunking: (B, 1, T, D) → list of (B, 1, action_len, D)
+        traj_tokens = traj_chunking(trajectory.unsqueeze(1), action_len, action_overlap)
         traj_tokens = torch.cat(traj_tokens, dim=1)   # (B, P, action_len, D)
 
-        noise_tokens = traj_chunking(x0, action_len, action_overlap)
+        noise_tokens = traj_chunking(x0.unsqueeze(1), action_len, action_overlap)
         noise_tokens = torch.cat(noise_tokens, dim=1)  # (B, P, action_len, D)
 
         # 中间状态 x_t = (1-t)*x0 + t*y (在 token 空间)
