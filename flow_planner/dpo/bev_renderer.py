@@ -133,11 +133,14 @@ class BEVRenderer:
 
         # ===== 3. 绘制候选轨迹 =====
         K = candidates.shape[0]
+        # Spread labels to avoid overlapping
+        label_offsets_y = np.linspace(-3, 3, K) if K > 1 else [0]
+        
         for k in range(K):
             traj = candidates[k]  # (T, >=2)
             color = TRAJECTORY_COLORS[k % len(TRAJECTORY_COLORS)]
-            linewidth = 2.0
-            alpha = 0.8
+            linewidth = 1.0  # Thinner line so overlaps don't become blobs
+            alpha = 0.9      # High alpha to be identifiable
             label = f"#{k+1}"
 
             # 高亮 chosen / rejected
@@ -161,15 +164,14 @@ class BEVRenderer:
             marker_indices = range(10, len(traj), 10)
             ax.plot(traj[marker_indices, 0], traj[marker_indices, 1], 'o', color=color, markersize=4, alpha=0.8, zorder=12)
 
-            # 轨迹末端标注编号
-            end_x, end_y = traj[-1, 0], traj[-1, 1]
-            score_text = f"  {label}"
+            # Draw labels at the end of trajectory, staggered
             if scores is not None and k < len(scores):
-                score_text += f" ({scores[k]:.1f})"
-
-            ax.annotate(score_text, (end_x, end_y),
-                       fontsize=7, color=color, fontweight='bold',
-                       zorder=15)
+                label += f" ({scores[k]:.1f})"
+            
+            tx = traj[-1, 0] + 1.0
+            ty = traj[-1, 1] + label_offsets_y[k]
+            ax.text(tx, ty, label, color=color, fontsize=10, fontweight='bold', zorder=15,
+                    bbox=dict(facecolor=self.bg_color, edgecolor='none', alpha=0.7, pad=0.5))
 
             # 起点小圆点
             ax.plot(traj[0, 0], traj[0, 1], 'o',

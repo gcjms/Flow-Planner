@@ -50,84 +50,95 @@ logger = logging.getLogger(__name__)
 
 class PreferenceDataset(Dataset):
     """
-    加载 generate_preferences 生成的偏好对数据。
+    加载 score_hybrid.py 的偏好对 + dpo_mining 的场景数据。
 
-    数据格式 (preferences.npz):
-      - preferences: array of dicts, 每个 dict 包含:
-          - chosen: (T, D) 好轨迹
-          - rejected: (T, D) 坏轨迹
-          - chosen_score: float
-          - rejected_score: float
-          - score_gap: float
-          - condition: dict of numpy arrays
-            - ego_current: (D_ego,)
-            - neighbor_past: (M, T_p, D_n)
-            - lane: (L, P, D_l)
+    数据来源：
+      - preferences.npz: chosen/rejected 轨迹 (来自 score_hybrid.py)
+      - scene_dir/*.npz: 完整场景数据 (来自 dpo_mining, 包含 lanes/routes/neighbors)
     """
 
     def __init__(
         self,
         preference_path: str,
-        min_score_gap: float = 2.0,
+        scene_dir: str = None,
+        min_score_gap: float = 0.0,
         max_pairs: Optional[int] = None,
         state_dim: int = 4,
     ):
         """
         Args:
-            preference_path: .npz 文件路径
-            min_score_gap: 最小分差阈值（过滤噪声偏好对）
+            preference_path: preferences.npz 路径
+            scene_dir: 场景数据目录 (dpo_mining/)，包含与 scenario_id 匹配的 .npz
+            min_score_gap: 未使用（保留接口兼容）
             max_pairs: 最多使用多少对（用于调试）
-            state_dim: 轨迹的状态维度 (默认 4: x, y, cos_h, sin_h)
+            state_dim: 轨迹状态维度 (默认 4: x, y, cos_h, sin_h)
         """
         logger.info(f"Loading preferences from {preference_path}")
         data = np.load(preference_path, allow_pickle=True)
-        all_prefs = data['preferences']
 
-        # 过滤
-        self.pairs = []
-        for pref in all_prefs:
-            pref_dict = pref if isinstance(pref, dict) else pref.item()
-            gap = pref_dict.get('score_gap', float('inf'))
-            if gap >= min_score_gap:
-                self.pairs.append(pref_dict)
+        self.chosen_all = data['chosen']       # (N, T, D)
+        self.rejected_all = data['rejected']   # (N, T, D)
+        self.scenario_ids = list(data['scenario_ids'])
+        self.n_pairs = len(self.chosen_all)
 
         if max_pairs is not None:
-            self.pairs = self.pairs[:max_pairs]
+            self.n_pairs = min(self.n_pairs, max_pairs)
 
         self.state_dim = state_dim
+        self.scene_dir = scene_dir
+
+        # 预检查场景文件是否存在
+        if scene_dir:
+            missing = 0
+            for i in range(min(self.n_pairs, 5)):
+                sid = self.scenario_ids[i]
+                scene_path = os.path.join(scene_dir, f"{sid}.npz")
+                if not os.path.exists(scene_path):
+                    missing += 1
+            if missing > 0:
+                logger.warning(f"Missing {missing}/5 scene files in {scene_dir}")
+
         logger.info(
-            f"Loaded {len(self.pairs)} preference pairs "
-            f"(filtered from {len(all_prefs)}, min_gap={min_score_gap})"
+            f"Loaded {self.n_pairs} preference pairs "
+            f"(chosen: {self.chosen_all.shape}, rejected: {self.rejected_all.shape})"
         )
+        if scene_dir:
+            logger.info(f"Scene context from: {scene_dir}")
 
     def __len__(self):
-        return len(self.pairs)
+        return self.n_pairs
 
     def __getitem__(self, idx):
-        pref = self.pairs[idx]
-
-        chosen = torch.from_numpy(pref['chosen']).float()      # (T, D)
-        rejected = torch.from_numpy(pref['rejected']).float()  # (T, D)
+        chosen = torch.from_numpy(self.chosen_all[idx]).float()      # (T, D)
+        rejected = torch.from_numpy(self.rejected_all[idx]).float()  # (T, D)
 
         # 确保只取前 state_dim 维 (x, y, cos_h, sin_h)
         chosen = chosen[:, :self.state_dim]
         rejected = rejected[:, :self.state_dim]
 
-        # 条件信息
+        # 加载场景条件数据
         condition = {}
-        if 'condition' in pref:
-            cond = pref['condition']
-            for key in ['ego_current', 'neighbor_past', 'lane']:
-                if key in cond and cond[key] is not None:
-                    condition[key] = torch.from_numpy(
-                        np.array(cond[key])
-                    ).float()
+        if self.scene_dir:
+            sid = self.scenario_ids[idx]
+            scene_path = os.path.join(self.scene_dir, f"{sid}.npz")
+            if os.path.exists(scene_path):
+                scene = np.load(scene_path, allow_pickle=True)
+                # 映射 NPZ key → encoder 所需的 key
+                condition = {
+                    'neighbor_past': torch.from_numpy(scene['neighbor_agents_past']).float(),
+                    'lanes': torch.from_numpy(scene['lanes']).float(),
+                    'lanes_speedlimit': torch.from_numpy(scene['lanes_speed_limit']).float(),
+                    'lanes_has_speedlimit': torch.from_numpy(scene['lanes_has_speed_limit']).bool(),
+                    'routes': torch.from_numpy(scene['route_lanes']).float(),
+                    'map_objects': torch.from_numpy(scene['static_objects']).float(),
+                    'ego_current': torch.from_numpy(scene['ego_current_state']).float(),
+                }
 
         return {
             'chosen': chosen,
             'rejected': rejected,
             'condition': condition,
-            'score_gap': pref.get('score_gap', 0.0),
+            'score_gap': 0.0,
         }
 
 
@@ -329,6 +340,9 @@ def train_dpo(args):
         dropout=args.lora_dropout,
     )
 
+    # LoRA 参数创建在 CPU 上，需要重新移到 GPU
+    policy_model = policy_model.to(device)
+
     # 冻结所有参数，只训练 LoRA
     for p in policy_model.parameters():
         p.requires_grad = False
@@ -347,6 +361,7 @@ def train_dpo(args):
     logger.info("Loading preference dataset...")
     dataset = PreferenceDataset(
         preference_path=args.preference_path,
+        scene_dir=args.scene_dir,
         min_score_gap=args.min_score_gap,
         max_pairs=args.max_pairs,
         state_dim=policy_model.planner_params['state_dim'],
@@ -363,7 +378,7 @@ def train_dpo(args):
     )
 
     # ---- DPO Loss ----
-    dpo_loss_fn = FlowMatchingDPOLoss(beta=args.beta)
+    dpo_loss_fn = FlowMatchingDPOLoss(beta=args.beta, sft_weight=args.sft_weight)
 
     # ---- Optimizer & Scheduler ----
     optimizer = AdamW(
@@ -432,6 +447,8 @@ def train_dpo(args):
                 encoder_outputs=encoder_outputs,
                 action_len=action_len,
                 action_overlap=action_overlap,
+                # data_processor=None → 不归一化，保留 raw space 的大 Δ 信号
+                data_processor=None,
             )
 
             # 反向传播
@@ -560,6 +577,8 @@ def parse_args():
                         help='Minimum score gap for preference pairs')
     parser.add_argument('--max_pairs', type=int, default=None,
                         help='Max preference pairs to use (for debugging)')
+    parser.add_argument('--scene_dir', type=str, default=None,
+                        help='Directory containing scene NPZs (dpo_mining/)')
 
     # 训练
     parser.add_argument('--output_dir', type=str, default='checkpoints/dpo',
@@ -572,6 +591,8 @@ def parse_args():
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
     parser.add_argument('--beta', type=float, default=0.1,
                         help='DPO temperature')
+    parser.add_argument('--sft_weight', type=float, default=0.1,
+                        help='Weight for the SFT loss term (prevent forgetting)')
     parser.add_argument('--num_workers', type=int, default=4)
 
     # LoRA

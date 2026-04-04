@@ -39,15 +39,17 @@ from flow_planner.model.model_utils.traj_tool import traj_chunking
 class FlowMatchingDPOLoss(nn.Module):
     """Flow Matching 框架下的 DPO 损失函数"""
 
-    def __init__(self, beta: float = 0.1):
+    def __init__(self, beta: float = 0.1, sft_weight: float = 0.1):
         """
         Args:
             beta: DPO 温度系数，控制偏好强度。
                   越大 → 对偏好差异越敏感
                   越小 → 更保守，不会偏离参考模型太远
+            sft_weight: SFT 损失的权重，控制锚点效应。
         """
         super().__init__()
         self.beta = beta
+        self.sft_weight = sft_weight
 
     def compute_log_prob(
         self,
@@ -58,30 +60,37 @@ class FlowMatchingDPOLoss(nn.Module):
         x0: torch.Tensor,
         action_len: int,
         action_overlap: int,
+        data_processor=None,
     ) -> torch.Tensor:
         """
         计算模型对给定轨迹的对数似然近似。
 
         流程：
-          1. 将轨迹分块为 action tokens (与训练一致)
-          2. 对噪声也做相同分块
-          3. 计算中间状态和真实速度（在 token 空间）
-          4. 用 decoder 预测速度
-          5. log P(y|x) ≈ -||v_pred - v_true||²
+          1. 归一化轨迹（raw space → model space）
+          2. 将轨迹分块为 action tokens (与训练一致)
+          3. 对噪声也做相同分块
+          4. 计算中间状态和真实速度（在 token 空间）
+          5. 用 decoder 预测速度
+          6. log P(y|x) ≈ -||v_pred - v_true||²
 
         Args:
             model: FlowPlanner 模型 (调用 model.decoder)
-            trajectory: (B, T, D) 轨迹坐标, D=state_dim
+            trajectory: (B, T, D) 轨迹坐标, D=state_dim (raw space)
             encoder_outputs: decoder 所需的条件信息 (来自 model.extract_decoder_inputs)
             t: (B,) 采样的时间步, 范围 [0, 1]
             x0: (B, T, D) 采样的高斯噪声
             action_len: action token 长度 (如 20)
             action_overlap: action token 重叠量 (如 10)
+            data_processor: ModelInputProcessor (用于归一化)
 
         Returns:
             log_prob: (B,) 每个样本的对数似然
         """
         B = trajectory.shape[0]
+
+        # 归一化：raw coordinates → model normalized space
+        if data_processor is not None:
+            trajectory = data_processor.state_preprocess(trajectory)
 
         # 将轨迹和噪声分块为 action tokens
         # Training code convention: traj_chunking expects (B, P, T, D) with P=1
@@ -117,6 +126,7 @@ class FlowMatchingDPOLoss(nn.Module):
         encoder_outputs: dict,
         action_len: int,
         action_overlap: int,
+        data_processor=None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         计算 DPO Loss。
@@ -124,11 +134,13 @@ class FlowMatchingDPOLoss(nn.Module):
         Args:
             model: 正在训练的 Flow-Planner（带 LoRA 的 decoder）
             ref_model: 冻结的参考 Flow-Planner（原始权重）
-            chosen: (B, T, D) 好轨迹
-            rejected: (B, T, D) 坏轨迹
+            chosen: (B, T, D) 好轨迹 (raw space)
+            rejected: (B, T, D) 坏轨迹 (raw space)
             encoder_outputs: 编码后的场景条件 (来自共享 encoder)
             action_len: action token 长度
             action_overlap: action token 重叠量
+            data_processor: ModelInputProcessor (用于归一化)
+            sft_weight: SFT 损失的权重 (防止模式崩溃和遗忘)
 
         Returns:
             loss: scalar, DPO 损失
@@ -144,34 +156,43 @@ class FlowMatchingDPOLoss(nn.Module):
         # 计算训练模型 (policy) 的 log prob
         log_pi_w = self.compute_log_prob(
             model, chosen, encoder_outputs, t, x0,
-            action_len, action_overlap
+            action_len, action_overlap, data_processor
         )
         log_pi_l = self.compute_log_prob(
             model, rejected, encoder_outputs, t, x0,
-            action_len, action_overlap
+            action_len, action_overlap, data_processor
         )
 
         # 计算参考模型的 log prob（不计算梯度）
         with torch.no_grad():
             log_ref_w = self.compute_log_prob(
                 ref_model, chosen, encoder_outputs, t, x0,
-                action_len, action_overlap
+                action_len, action_overlap, data_processor
             )
             log_ref_l = self.compute_log_prob(
                 ref_model, rejected, encoder_outputs, t, x0,
-                action_len, action_overlap
+                action_len, action_overlap, data_processor
             )
 
-        # DPO 核心公式
+        # 核心 DPO 公式
         # Δ = (log π_θ(y_w) - log π_ref(y_w)) - (log π_θ(y_l) - log π_ref(y_l))
         delta = (log_pi_w - log_ref_w) - (log_pi_l - log_ref_l)
 
-        # Loss = -log σ(β · Δ)
-        loss = -F.logsigmoid(self.beta * delta).mean()
+        # 1. DPO Loss = -log σ(β · Δ)
+        dpo_loss = -F.logsigmoid(self.beta * delta).mean()
+
+        # 2. SFT Loss = -log π_θ(y_w) (也就是 chosen 轨迹的 MSE)
+        sft_loss = -log_pi_w.mean()
+
+        # 总损失
+        sft_weight = getattr(self, 'sft_weight', 0.0) # fallback if not set at init
+        loss = dpo_loss + sft_weight * sft_loss
 
         # 训练指标
         metrics = {
             "dpo/loss": loss.item(),
+            "dpo/loss_dpo_only": dpo_loss.item(),
+            "dpo/loss_sft": sft_loss.item(),
             "dpo/delta_mean": delta.mean().item(),
             "dpo/chosen_reward": (log_pi_w - log_ref_w).mean().item(),
             "dpo/rejected_reward": (log_pi_l - log_ref_l).mean().item(),

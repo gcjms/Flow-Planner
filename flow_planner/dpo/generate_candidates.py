@@ -84,7 +84,7 @@ def npz_to_datasample(npz_path, device='cuda'):
     )
 
 
-def generate_candidates(model, npz_path, num_candidates=5, device='cuda'):
+def generate_candidates(model, npz_path, num_candidates=5, device='cuda', use_cfg=False, cfg_weight=0.0):
     """Generate K candidate trajectories for one scenario."""
     data = npz_to_datasample(npz_path, device=device)
 
@@ -92,7 +92,7 @@ def generate_candidates(model, npz_path, num_candidates=5, device='cuda'):
         # use_cfg=False to get diverse trajectories
         candidates = model(
             data, mode='inference',
-            use_cfg=False, cfg_weight=0.0,
+            use_cfg=use_cfg, cfg_weight=cfg_weight,
             num_candidates=num_candidates,
             return_all_candidates=True,
             bon_seed=42,
@@ -115,6 +115,8 @@ def main():
                         help='Directory to save candidate trajectories')
     parser.add_argument('--num_candidates', type=int, default=5)
     parser.add_argument('--max_scenarios', type=int, default=None)
+    parser.add_argument('--use_cfg', action='store_true')
+    parser.add_argument('--cfg_weight', type=float, default=2.0)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -145,8 +147,8 @@ def main():
 
         try:
             candidates = generate_candidates(
-                model, npz_path,
-                num_candidates=args.num_candidates,
+                model, npz_path, num_candidates=args.num_candidates,
+                use_cfg=args.use_cfg, cfg_weight=args.cfg_weight
             )
 
             # Also save the condition data for later BEV rendering

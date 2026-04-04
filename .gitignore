@@ -40,3 +40,9 @@ checkpoints/
 *.npz
 *.log
 __pycache__/
+
+# DPO data (large, not tracked)
+dpo_data/
+
+# PPT files
+*.pptx

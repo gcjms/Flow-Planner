@@ -123,7 +123,8 @@ class FlowPlanner(DiffusionADPlanner):
             return self.forward_inference(
                 data, params['use_cfg'], params['cfg_weight'],
                 num_candidates=params.get('num_candidates', 1),
-                bon_seed=params.get('bon_seed', -1)
+                bon_seed=params.get('bon_seed', -1),
+                return_all_candidates=params.get('return_all_candidates', False),
             )
     
     def forward_train(self, data: NuPlanDataSample):
@@ -276,7 +277,8 @@ class FlowPlanner(DiffusionADPlanner):
         candidates = torch.stack(all_candidates, dim=0)  # (N, B, T, D)
 
         if return_all_candidates:
-            return candidates.permute(1, 0, 2, 3)  # (B, N, T, D)
+            # candidates: (N, B, ...) → (B, N, ...) regardless of ndim
+            return torch.movedim(candidates, 0, 1)
 
         # Score each candidate using safety scorer
         from flow_planner.risk.trajectory_scorer import TrajectoryScorer
