@@ -378,7 +378,7 @@ def train_dpo(args):
     )
 
     # ---- DPO Loss ----
-    dpo_loss_fn = FlowMatchingDPOLoss(beta=args.beta, sft_weight=args.sft_weight)
+    dpo_loss_fn = FlowMatchingDPOLoss(beta=args.beta, sft_weight=args.sft_weight, num_t_samples=args.num_t_samples)
 
     # ---- Optimizer & Scheduler ----
     optimizer = AdamW(
@@ -447,8 +447,9 @@ def train_dpo(args):
                 encoder_outputs=encoder_outputs,
                 action_len=action_len,
                 action_overlap=action_overlap,
-                # data_processor=None → 不归一化，保留 raw space 的大 Δ 信号
-                data_processor=None,
+                # Bug fix: 必须在 normalized space 计算 log_prob
+                # decoder 训练时只见过 normalized 输入，raw space 会导致垃圾梯度
+                data_processor=policy_model.data_processor,
             )
 
             # 反向传播
@@ -547,8 +548,20 @@ def train_dpo(args):
         logger.info("Merging LoRA weights and saving full model...")
         merge_lora(policy_model.model_decoder)
         merged_path = os.path.join(args.output_dir, "model_dpo_merged.pth")
-        torch.save(policy_model.state_dict(), merged_path)
-        logger.info(f"Merged model saved to {merged_path}")
+        # Bug fix: 需要修正 key 前缀以匹配 nuPlan 推理时的期望格式
+        raw_sd = policy_model.state_dict()
+        fixed_sd = {}
+        for k, v in raw_sd.items():
+            # 移除可能的 'module.' 前缀
+            k_clean = k.replace('module.', '')
+            fixed_sd[k_clean] = v
+        # 保存为与原始 checkpoint 兼容的格式
+        torch.save({'state_dict': fixed_sd}, merged_path)
+        logger.info(f"Merged model saved to {merged_path} ({len(fixed_sd)} keys)")
+        # 同时保存一份不带包装的版本
+        merged_raw_path = os.path.join(args.output_dir, "model_dpo_merged_raw.pth")
+        torch.save(fixed_sd, merged_raw_path)
+        logger.info(f"Raw merged model saved to {merged_raw_path}")
 
     if tb_writer:
         tb_writer.close()
@@ -593,6 +606,8 @@ def parse_args():
                         help='DPO temperature')
     parser.add_argument('--sft_weight', type=float, default=0.1,
                         help='Weight for the SFT loss term (prevent forgetting)')
+    parser.add_argument('--num_t_samples', type=int, default=16,
+                        help='Number of timestep samples for log_prob estimation (higher=more stable, slower)')
     parser.add_argument('--num_workers', type=int, default=4)
 
     # LoRA

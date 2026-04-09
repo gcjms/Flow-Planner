@@ -282,7 +282,7 @@ def load_lora(model: nn.Module, path: str, strict: bool = True) -> dict:
     Returns:
         extra_info: 保存时附带的额外信息
     """
-    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     lora_state = checkpoint['lora_state_dict']
 
     # 加载到模型

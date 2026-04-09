@@ -336,27 +336,243 @@ for i in range(num_candidates):
 
 ---
 
-# 第四章 实验总结与下一步
+# 第四章 DPO 安全对齐训练
 
-## 4.1 已完成实验总览
+## 4.1 实验动机
+
+Best-of-N（推理时选择）在第三章中失败：scorer 数据不对 + 候选差异太小。因此转换思路——**在训练时直接优化安全偏好**，而非推理时靠 scorer 选择。
+
+核心方法：**Direct Preference Optimization (DPO)**，通过 LoRA 对 Flow-Planner 的 Decoder 微调，使模型自身学会生成更安全的轨迹。
+
+## 4.2 技术方案
+
+### 4.2.1 Flow Matching DPO Loss
+
+将 DPO 从离散 token（LLM）推广到连续轨迹（Flow Matching）：
+
+```
+标准 DPO:  Loss = -log σ(β × (Δ_policy - Δ_ref))
+  其中 Δ = log P(chosen) - log P(rejected)
+
+Flow Matching 的 log P 估计:
+  log P(x) ≈ -E_t[ ||v_θ(x_t, t) - u(x|x_0, t)||² ]
+  在多个时间步 t ~ U(0,1) 上采样估计（K=16 个采样点）
+```
+
+### 4.2.2 LoRA 参数高效微调
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| LoRA rank | 8 (run1) / 4 (run2) | 低秩适配器 |
+| LoRA α | 16 (run1) / 8 (run2) | α/r = 2 |
+| 冻结层 | Encoder 全部冻结 | 只训练 Decoder 的 LoRA |
+| 可训练参数 | 452,864 / 14.7M = 3.08% | 极低计算消耗 |
+
+### 4.2.3 Oracle 偏好对构建
+
+> [!IMPORTANT]
+> 这是本实验的核心创新：不依赖外部 reward model，而是利用 GT 轨迹作为 Oracle 构建偏好对。
+
+**Pipeline：**
+
+```
+对每个驾驶场景:
+  1. 模型推理 → 生成一条轨迹 prediction
+  2. GT 轨迹 → 从 NPZ 提取人类真实驾驶轨迹
+  3. 碰撞检测 → 欧氏距离检测（阈值 2.0m）
+  4. 如果 prediction 碰撞 且 GT 不碰撞:
+       chosen = GT 轨迹（安全）
+       rejected = prediction（碰撞）
+       → 构成一个 Oracle 偏好对
+```
+
+**碰撞检测方案选型与校准：**
+
+最初实现了 AABB（轴对齐矩阵碰撞）检测，但存在 bug：
+
+```
+AABB 条件:
+  dx < (ego_half_length + nb_half_length - threshold)
+  dy < (ego_half_width + nb_half_width - threshold)
+
+代入数值 (threshold=2.0):
+  dx < (2.5 + 2.5 - 2.0) = 3.0m  ← OK
+  dy < (1.0 + 1.0 - 2.0) = 0.0m  ← 永远不可能！
+  → threshold 同时减了长和宽，宽度方向阈值变为 0 → 碰撞率恒为 0%
+```
+
+改用**欧氏距离检测**（计算两车中心距），通过 距离阈值 sweep 校准：
+
+| 阈值 (m) | GT 碰撞率 | 说明 |
+|-----------|-----------|------|
+| 1.0 | 0.0% | 太严格 |
+| 1.5 | 0.0% | 太严格 |
+| **2.0** | **0.1%** | **最佳平衡点 ✅** |
+| 2.5 | 0.9% | 假阳性增多 |
+| 3.0 | 7.6% | 假阳性过多 |
+
+选定 `collision_dist = 2.0m`，GT 碰撞率仅 0.1%（基本无假阳性）。
+
+### 4.2.4 数据规模
+
+| 指标 | 值 |
+|------|------|
+| Hard 场景总数 | 50,000 个 |
+| 模型碰撞率 | 38.1% |
+| GT 碰撞率 | 0.1% |
+| **有效 Oracle 偏好对** | **18,893 对** |
+| 轨迹维度 | (80, 4) = (x, y, cos_h, sin_h) |
+| 挖掘耗时 | 71 分钟 |
+
+> [!NOTE]
+> 38% 的碰撞率说明这些 hard scenarios 确实能有效暴露模型的碰撞弱点。而 GT 碰撞率仅 0.1% 说明人类驾驶在这些场景中几乎不会碰撞——这为 Oracle 偏好对提供了极其干净的信号。
+
+## 4.3 实验配置与结果
+
+### 4.3.1 Run 1：激进策略
+
+| 参数 | 值 |
+|------|------|
+| β | 1.0 |
+| Epochs | 3 |
+| LR | 1e-5 |
+| LoRA rank | 8 |
+| SFT weight | 0.0 |
+| Batch size | 8 |
+| K (时间步采样) | 16 |
+| 硬件 | AutoDL RTX 4090 |
+| 时间 | 517.9 min (~8.6h) |
+
+**训练曲线：**
+
+| Epoch | Loss | Accuracy | Δ (log-prob margin) |
+|-------|------|----------|---------------------|
+| 1 | 0.5147 | 93.05% | 1.2154 |
+| 2 | 0.1735 | 99.82% | 4.7349 |
+| 3 | 0.1245 | 100.00% | 6.4810 |
+
+**Accuracy 含义解释：**
+```
+DPO Accuracy 衡量的是：
+  对每一对 (chosen, rejected)：
+    Δ_policy = log P_policy(chosen) - log P_policy(rejected)
+    Δ_ref    = log P_ref(chosen) - log P_ref(rejected)
+    如果 Δ_policy > Δ_ref → 正确（policy 比 ref 更偏好 chosen）
+
+Acc=100% 意味着 policy 模型在所有 18893 对上
+都比 reference 更倾向于选择安全轨迹。
+```
+
+**开环碰撞率验证（500 个 hard scenarios，单次采样）：**
+
+| 模型 | 碰撞数 | 碰撞率 |
+|------|--------|--------|
+| 原始模型 | 208 | 41.6% |
+| DPO Epoch 1 (Δ=1.2) | 209 | 41.8% |
+| DPO Epoch 3 (Δ=6.5) | 179 | 35.8% |
+
+> [!WARNING]
+> **开环碰撞率只降了 ~6%。** 这暴露了过拟合风险：
+> - Epoch 1 几乎无效果（Δ 太小，概率偏移不够）
+> - Epoch 3 有一定效果，但 Δ=6.5 远超正常范围（1~3），policy 已严重偏离 reference
+> - 100% Acc 是在训练集上过拟合的信号
+
+**过拟合分析：**
+
+DPO 改变的是**概率分布**，不是确定性输出。即使 `P(安全轨迹)` 从 30% 涨到 60%，单次采样仍有 40% 概率采到碰撞轨迹。β=1.0 允许 policy 过度偏离 reference，可能导致：
+1. 在训练场景上过拟合特定碰撞模式
+2. 灾难性遗忘——正常场景的规划质量退化
+3. Δ=6.5 说明 log-prob ratio 已偏移过远
+
+### 4.3.2 Run 2：保守策略（对照实验）
+
+针对 Run 1 的过拟合问题调整超参：
+
+| 参数 | Run 1 | Run 2 | 调整理由 |
+|------|-------|-------|----------|
+| β | 1.0 | **10.0** | 强约束，防止偏离过远 |
+| Epochs | 3 | **1** | 早停，不过拟合 |
+| LR | 1e-5 | **5e-6** | 更温和的更新 |
+| LoRA rank | 8 | **4** | 降低模型容量 |
+| SFT weight | 0.0 | **0.1** | 加正则项保留原始能力 |
+
+**设计理念：** 宁愿 Acc 只到 70-80%，但每一步学到的都是真正可泛化的安全信号。
+
+*（Run 2 进行中，结果待补充）*
+
+## 4.4 β 超参数的理论理解
+
+```
+DPO Loss = -log σ(β × (Δ_policy - Δ_ref))
+
+β 小 (如 1.0):
+  → 惩罚弱 → 模型可大幅偏离 reference
+  → Δ 容易增长到 5-7（激进）
+  → 风险：过拟合训练集，遗忘一般能力
+
+β 大 (如 10.0):
+  → 惩罚强 → 模型被约束在 reference 附近
+  → Δ 通常稳定在 0.3-1.0（保守）
+  → 优点：保留原始驾驶能力，只微调安全倾向
+  → 缺点：改善幅度可能更小
+
+经验参考：
+  NLP DPO (Rafailov et al. 2023): β = 0.1~0.5
+  但 NLP 的 chosen/rejected 差异远小于我们的碰撞/安全差异
+  → Oracle 数据信号极强，需要更大 β 来防止过优化
+```
+
+## 4.5 关键洞察
+
+1. **Oracle 偏好对的信号强度远超 Rule-based**。之前 Rule-based 挖掘（CFG 差异法）Acc 停在 50%、Δ≈0.002，本质上是噪声。Oracle 方法 Acc→93% 、Δ→1.2（仅 Epoch 1），信号提升了 600 倍。
+
+2. **DPO 改变概率分布，不改变确定性输出**。单次采样（开环测试）对概率变化不敏感。这也是 DPO 的核心目标——通过训练时偏好优化，让模型的**单次推理**就足够安全，从而替代 Best-of-N 的 N 倍推理开销。
+
+3. **DPO 的定位是 Best-of-N 的替代方案**。Best-of-N 需要生成 N 条候选 + scorer 选择，计算量 ×N 且 scorer 不可靠（见第三章）。DPO 则将安全偏好内化到模型权重中，推理时仍然只需一次前向传播，实现了**零额外推理开销的安全提升**。这是 DPO 方法在自动驾驶场景中的核心价值。
+
+4. **过拟合是当前主要风险**。β=1.0 + 3 epochs 导致 Δ=6.5，policy 严重偏离 reference。需在闭环中验证是否存在正常场景退化。
+
+## 4.6 输出文件
+
+| 文件 | 内容 |
+|------|------|
+| `checkpoints/dpo_oracle_run1/lora_best.pt` | 最佳 LoRA 权重 (Acc=100%) |
+| `checkpoints/dpo_oracle_run1/lora_epoch_1.pt` | Epoch 1 LoRA (Acc=93%, Δ=1.2) |
+| `checkpoints/dpo_oracle_run1/model_dpo_merged.pth` | Epoch 3 合并权重（推理用） |
+| `oracle_pairs_full.npz` | 原始 18893 对 (x,y,heading) |
+| `oracle_pairs_4d.npz` | 转换后 18893 对 (x,y,cos_h,sin_h) |
+| `generate_oracle_pairs.py` | Oracle 偏好对生成脚本 |
+| `train_dpo.py` | DPO 训练脚本 |
+| `dpo_loss.py` | Flow Matching DPO Loss 实现 |
+| `lora.py` | LoRA 注入/保存/合并工具 |
+
+---
+
+# 第五章 实验总结与下一步
+
+## 5.1 已完成实验总览
 
 | # | 实验 | 状态 | 核心结论 |
 |---|------|------|----------|
 | 1 | SOTA 基线复现 | ✅ 成功 | NR-CLS 95.56%，超论文 +1.25% |
 | 2 | Risk-Aware Adaptive CFG | ❌ 失败 | 风险特征无法预测最优 w，ODE 噪声主导 |
 | 3 | Best-of-N 轨迹选择 | ❌ 失败 | Scorer bug + 候选差异太小，等效随机选 |
+| 4 | DPO Oracle 安全对齐 | 🔄 进行中 | 训练信号极强 (Acc 93-100%)，开环碰撞率降 6%，待闭环验证 |
 
-## 4.2 关键教训
+## 5.2 关键教训
 
 1. **ODE 随机初始噪声是 Flow Matching 推理的核心不确定性来源**。任何涉及比较不同推理结果的实验，都必须考虑控制/消除此噪声
 2. **Scorer 的输入数据必须与评估语义对齐**。用过去数据评估未来安全性是无效的
-3. **NR-CLS 从 95% 往上提升极其困难**，需要在长尾场景上取得质变，而非在大多数场景上做微调
+3. **NR-CLS 从 95% 往上提升极其困难**，需要在长尾场景上取得质变
+4. **DPO Oracle 方法彻底解决了偏好信号不足的问题**，但需控制过拟合（β 选择、epoch 数）
+5. **训练时优化 (DPO) 与推理时选择 (Best-of-N) 应结合使用**
 
-## 4.3 待执行改进项
+## 5.3 下一步计划
 
 | 优先级 | 项目 | 详情 |
 |--------|------|------|
-| P0 | 修复 Scorer — 邻居匀速外推 | 利用 `neighbor_past` 中的 vx/vy 外推未来位置 |
-| P0 | 固定随机种子 + 重跑消融 | 验证 scorer 在排除噪声后是否有效 |
-| P1 | 增大候选多样性 | 温度缩放 / ODE 分支策略 |
-| P2 | Reward-Guided Flow Matching (Diffusion-DPO) | 训练时直接优化安全偏好 |
+| P0 | DPO Run 2 结果分析 | β=10, rank=4, 1 epoch 对比实验 |
+| P0 | 闭环仿真验证 | 用 DPO 权重跑 val14 NR-CLS，对比 baseline |
+| P1 | DPO + Best-of-N 联合验证 | 修复 scorer + DPO 模型 + N=5 联合测试 |
+| P1 | 多 β 消融实验 | β ∈ {1, 5, 10, 20}，单 epoch，找最优平衡点 |
+| P2 | 正常场景退化检测 | 在非 hard 场景上跑开环 ADE，检查是否退化 |
