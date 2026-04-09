@@ -50,11 +50,11 @@ logger = logging.getLogger(__name__)
 
 class PreferenceDataset(Dataset):
     """
-    加载 score_hybrid.py 的偏好对 + dpo_mining 的场景数据。
+    加载偏好对数据用于 DPO 训练。
 
-    数据来源：
-      - preferences.npz: chosen/rejected 轨迹 (来自 score_hybrid.py)
-      - scene_dir/*.npz: 完整场景数据 (来自 dpo_mining, 包含 lanes/routes/neighbors)
+    支持两种数据格式：
+      - 单目标: chosen/rejected/scenario_ids (来自 generate_oracle_pairs / generate_onpolicy_pairs)
+      - 多目标: chosen/rejected/scenario_ids/dim_labels (来自 generate_multiobjective_pairs)
     """
 
     def __init__(
@@ -65,14 +65,6 @@ class PreferenceDataset(Dataset):
         max_pairs: Optional[int] = None,
         state_dim: int = 4,
     ):
-        """
-        Args:
-            preference_path: preferences.npz 路径
-            scene_dir: 场景数据目录 (dpo_mining/)，包含与 scenario_id 匹配的 .npz
-            min_score_gap: 未使用（保留接口兼容）
-            max_pairs: 最多使用多少对（用于调试）
-            state_dim: 轨迹状态维度 (默认 4: x, y, cos_h, sin_h)
-        """
         logger.info(f"Loading preferences from {preference_path}")
         data = np.load(preference_path, allow_pickle=True)
 
@@ -81,13 +73,20 @@ class PreferenceDataset(Dataset):
         self.scenario_ids = list(data['scenario_ids'])
         self.n_pairs = len(self.chosen_all)
 
+        # Dimension labels for multi-objective pairs (absent in single-objective)
+        if 'dim_labels' in data:
+            self.dim_labels = list(data['dim_labels'])
+            unique, counts = np.unique(self.dim_labels, return_counts=True)
+            logger.info(f"Multi-objective pairs: {dict(zip(unique, counts))}")
+        else:
+            self.dim_labels = ['collision'] * self.n_pairs
+
         if max_pairs is not None:
             self.n_pairs = min(self.n_pairs, max_pairs)
 
         self.state_dim = state_dim
         self.scene_dir = scene_dir
 
-        # 预检查场景文件是否存在
         if scene_dir:
             missing = 0
             for i in range(min(self.n_pairs, 5)):
@@ -134,23 +133,26 @@ class PreferenceDataset(Dataset):
                     'ego_current': torch.from_numpy(scene['ego_current_state']).float(),
                 }
 
+        dim_label = self.dim_labels[idx] if idx < len(self.dim_labels) else 'collision'
+
         return {
             'chosen': chosen,
             'rejected': rejected,
             'condition': condition,
             'score_gap': 0.0,
+            'dim_label': dim_label,
         }
 
 
 def collate_preferences(batch: List[dict]) -> dict:
     """
-    自定义 collate 函数，处理不同形状的 condition。
+    自定义 collate 函数，处理不同形状的 condition 和 dimension labels。
     """
     chosen = torch.stack([item['chosen'] for item in batch])       # (B, T, D)
     rejected = torch.stack([item['rejected'] for item in batch])   # (B, T, D)
     score_gaps = torch.tensor([item['score_gap'] for item in batch])
+    dim_labels = [item.get('dim_label', 'collision') for item in batch]
 
-    # 条件：尝试 stack，如果形状不一致则跳过
     conditions = {}
     keys = batch[0]['condition'].keys()
     for key in keys:
@@ -159,7 +161,6 @@ def collate_preferences(batch: List[dict]) -> dict:
             try:
                 conditions[key] = torch.stack(tensors)
             except RuntimeError:
-                # 形状不一致，保持 list
                 conditions[key] = tensors
         elif len(tensors) > 0:
             conditions[key] = tensors
@@ -169,6 +170,7 @@ def collate_preferences(batch: List[dict]) -> dict:
         'rejected': rejected,
         'condition': conditions,
         'score_gap': score_gaps,
+        'dim_labels': dim_labels,
     }
 
 
@@ -377,6 +379,14 @@ def train_dpo(args):
         collate_fn=collate_preferences,
     )
 
+    # ---- Dimension weights (for multi-objective DPO) ----
+    dim_weight_map = {}
+    if args.dim_weights:
+        for item in args.dim_weights.split(','):
+            d, w = item.strip().split(':')
+            dim_weight_map[d.strip()] = float(w.strip())
+        logger.info(f"Dimension weights: {dim_weight_map}")
+
     # ---- DPO Loss ----
     dpo_loss_fn = FlowMatchingDPOLoss(beta=args.beta, sft_weight=args.sft_weight, num_t_samples=args.num_t_samples)
 
@@ -420,6 +430,8 @@ def train_dpo(args):
             'loss': [], 'delta': [], 'accuracy': [],
             'chosen_reward': [], 'rejected_reward': [],
         }
+        # Per-dimension metrics for multi-objective tracking
+        dim_epoch_metrics = {}
 
         pbar = tqdm(
             dataloader,
@@ -431,12 +443,19 @@ def train_dpo(args):
             chosen = batch['chosen'].to(device)      # (B, T, D)
             rejected = batch['rejected'].to(device)   # (B, T, D)
             condition = batch['condition']
+            batch_dim_labels = batch.get('dim_labels', ['collision'] * chosen.shape[0])
 
             # Encoder 前向（共享，不计算梯度）
             with torch.no_grad():
                 encoder_outputs = prepare_encoder_outputs(
                     policy_model, condition, device
                 )
+
+            # Per-sample weights from dimension labels
+            sample_weights = None
+            if dim_weight_map:
+                sw = [dim_weight_map.get(dl, 1.0) for dl in batch_dim_labels]
+                sample_weights = torch.tensor(sw, dtype=torch.float32)
 
             # DPO Loss
             loss, metrics = dpo_loss_fn(
@@ -447,9 +466,8 @@ def train_dpo(args):
                 encoder_outputs=encoder_outputs,
                 action_len=action_len,
                 action_overlap=action_overlap,
-                # Bug fix: 必须在 normalized space 计算 log_prob
-                # decoder 训练时只见过 normalized 输入，raw space 会导致垃圾梯度
                 data_processor=policy_model.data_processor,
+                sample_weights=sample_weights,
             )
 
             # 反向传播
@@ -470,6 +488,16 @@ def train_dpo(args):
             epoch_metrics['accuracy'].append(metrics['dpo/accuracy'])
             epoch_metrics['chosen_reward'].append(metrics['dpo/chosen_reward'])
             epoch_metrics['rejected_reward'].append(metrics['dpo/rejected_reward'])
+
+            # Per-dimension metric tracking
+            for dl in batch_dim_labels:
+                if dl not in dim_epoch_metrics:
+                    dim_epoch_metrics[dl] = {'delta': [], 'accuracy': [], 'reward_gap': []}
+                dim_epoch_metrics[dl]['delta'].append(metrics['dpo/delta_mean'])
+                dim_epoch_metrics[dl]['accuracy'].append(metrics['dpo/accuracy'])
+                dim_epoch_metrics[dl]['reward_gap'].append(
+                    metrics['dpo/chosen_reward'] - metrics['dpo/rejected_reward']
+                )
 
             # 进度条
             pbar.set_postfix({
@@ -497,6 +525,22 @@ def train_dpo(args):
             f"Δ: {avg_delta:.4f} | "
             f"Time: {elapsed/60:.1f}min"
         )
+
+        # Per-dimension summary
+        if dim_epoch_metrics:
+            for dim_name, dim_vals in sorted(dim_epoch_metrics.items()):
+                d_acc = np.mean(dim_vals['accuracy'])
+                d_delta = np.mean(dim_vals['delta'])
+                d_gap = np.mean(dim_vals['reward_gap'])
+                n_batches = len(dim_vals['delta'])
+                logger.info(
+                    f"  [{dim_name:>10s}] Acc: {d_acc:.2%} | Δ: {d_delta:.4f} | "
+                    f"RewardGap: {d_gap:.4f} | Batches: {n_batches}"
+                )
+                if tb_writer:
+                    tb_writer.add_scalar(f'epoch_dim/{dim_name}/accuracy', d_acc, epoch + 1)
+                    tb_writer.add_scalar(f'epoch_dim/{dim_name}/delta', d_delta, epoch + 1)
+                    tb_writer.add_scalar(f'epoch_dim/{dim_name}/reward_gap', d_gap, epoch + 1)
 
         # 保存 checkpoint
         lora_ckpt_path = os.path.join(
@@ -608,6 +652,9 @@ def parse_args():
                         help='Weight for the SFT loss term (prevent forgetting)')
     parser.add_argument('--num_t_samples', type=int, default=16,
                         help='Number of timestep samples for log_prob estimation (higher=more stable, slower)')
+    parser.add_argument('--dim_weights', type=str, default=None,
+                        help='Per-dimension loss weights as "dim:weight,..." '
+                             'e.g. "collision:5,ttc:5,comfort:2" (default: equal)')
     parser.add_argument('--num_workers', type=int, default=4)
 
     # LoRA

@@ -1,7 +1,7 @@
 """
 FlowODE: Flow Matching 的核心调度模块
 ======================================
-负责训练时的插值采样和推理时的 ODE 求解。
+负责训练时的插值采样和推理时的 ODE/SDE 求解。
 
 核心思想 (Flow Matching):
   定义一条从噪声 x₀ 到数据 x₁ 的路径:
@@ -10,9 +10,10 @@ FlowODE: Flow Matching 的核心调度模块
   训练时: 在路径上随机采一个点 x_t，让网络预测速度场 dx_t/dt = x₁ - x₀
   推理时: 从纯噪声 x₀ 出发，用 ODE solver 沿速度场积分到 t=1，得到生成结果
 
-  对比 Diffusion:
-    - Diffusion: 逐步加噪/去噪，需要上千步
-    - Flow Matching: 直线路径，通常 10-20 步就够
+  SDE 模式 (参考 Flow-GRPO / FlowDrive):
+    在 ODE Euler 步之间注入可控随机扰动，增加采样多样性。
+    噪声 schedule σ(t) = σ_base · (1-t)，早期大扰动探索、后期小扰动保质量。
+    用于 DPO/GRPO 的候选轨迹生成，部署时仍用确定性 ODE。
 """
 
 import torch
@@ -142,7 +143,75 @@ class FlowODE(Scheduler):
                                **model_extra)
         
         return sample
-    
+
+    def generate_sde(self, x_init, model_fn, model_pred_type, use_cfg,
+                     cfg_weight=None, sigma_base=0.3, sde_steps=20,
+                     noise_schedule='linear', **model_extra):
+        """
+        SDE 采样：在 Euler 积分的每一步注入可控随机扰动，增加轨迹多样性。
+
+        参考:
+          - Flow-GRPO (arXiv:2505.05470): ODE→SDE 转换，用于 RL 探索
+          - FlowDrive (arXiv:2509.21961): 流步间扰动注入，用于轨迹多样性
+
+        数学:
+          标准 ODE:  x_{t+dt} = x_t + dt · v(x_t, t)
+          SDE 模式:  x_{t+dt} = x_t + dt · v(x_t, t) + σ(t) · √dt · ε
+
+          噪声 schedule:
+            linear:  σ(t) = σ_base · (1 - t)         — 早期大、后期小
+            cosine:  σ(t) = σ_base · cos(π·t / 2)    — 更平滑的衰减
+            constant: σ(t) = σ_base                   — 全程均匀（不推荐）
+
+        Args:
+            x_init: 初始噪声, shape (B, action_num, action_len, state_dim)
+            model_fn: decoder 函数
+            model_pred_type: 预测类型 ('velocity'/'x_start'/'noise')
+            use_cfg: 是否使用 CFG
+            cfg_weight: CFG 权重，None 时使用 self.cfg_weight
+            sigma_base: 噪声强度基准值，推荐 0.1~0.5
+            sde_steps: SDE 积分步数，推荐 20~50（比部署时多）
+            noise_schedule: 噪声衰减策略 ('linear'/'cosine'/'constant')
+            model_extra: decoder 的额外输入 (encodings, masks 等)
+
+        Returns:
+            x: 生成的轨迹, shape 同 x_init
+        """
+        import math
+
+        velocity_func = self.translation_funcs[(model_pred_type, 'velocity')]
+        w = cfg_weight if cfg_weight is not None else self.cfg_weight
+        velocity_model = VelocityModel(
+            model_fn, self.path, velocity_func,
+            use_cfg=use_cfg, cfg_weight=w,
+        )
+
+        x = x_init * self.sample_params['sample_temperature']
+        dt = 1.0 / sde_steps
+
+        for i in range(sde_steps):
+            t_val = i * dt
+            t_tensor = torch.tensor(t_val, dtype=x.dtype, device=x.device)
+
+            with torch.no_grad():
+                v = velocity_model(x, t_tensor, **model_extra)
+
+            x = x + dt * v
+
+            if sigma_base > 0 and i < sde_steps - 1:
+                t_next = (i + 1) * dt
+                if noise_schedule == 'linear':
+                    sigma_t = sigma_base * (1.0 - t_next)
+                elif noise_schedule == 'cosine':
+                    sigma_t = sigma_base * math.cos(math.pi * t_next / 2.0)
+                else:
+                    sigma_t = sigma_base
+
+                noise = torch.randn_like(x)
+                x = x + sigma_t * (dt ** 0.5) * noise
+
+        return x
+
     def identity(self, x, xt, t):
         """恒等变换: 当模型预测类型与目标类型相同时使用"""
         return x

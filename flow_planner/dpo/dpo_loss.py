@@ -163,14 +163,19 @@ class FlowMatchingDPOLoss(nn.Module):
         action_len: int,
         action_overlap: int,
         data_processor=None,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         计算 DPO Loss（多时间步采样版本）。
+
+        Args:
+            sample_weights: (B,) optional per-sample weights for multi-objective DPO.
+                           Allows weighting TTC pairs higher than comfort pairs, etc.
+                           If None, all samples weighted equally.
         """
         B = chosen.shape[0]
         K = self.num_t_samples
 
-        # 计算 policy model 的 log_prob（多采样平均）
         log_pi_w = self.compute_log_prob_multi_t(
             model, chosen, encoder_outputs,
             action_len, action_overlap, data_processor, K
@@ -180,7 +185,6 @@ class FlowMatchingDPOLoss(nn.Module):
             action_len, action_overlap, data_processor, K
         )
 
-        # 计算 reference model 的 log_prob（多采样平均，不计算梯度）
         with torch.no_grad():
             log_ref_w = self.compute_log_prob_multi_t(
                 ref_model, chosen, encoder_outputs,
@@ -191,10 +195,17 @@ class FlowMatchingDPOLoss(nn.Module):
                 action_len, action_overlap, data_processor, K
             )
 
-        # DPO 公式
         delta = (log_pi_w - log_ref_w) - (log_pi_l - log_ref_l)
 
-        dpo_loss = -F.logsigmoid(self.beta * delta).mean()
+        per_sample_dpo = -F.logsigmoid(self.beta * delta)
+
+        if sample_weights is not None:
+            w = sample_weights.to(per_sample_dpo.device)
+            w = w / (w.sum() + 1e-8) * B
+            dpo_loss = (per_sample_dpo * w).mean()
+        else:
+            dpo_loss = per_sample_dpo.mean()
+
         sft_loss = -log_pi_w.mean()
 
         sft_weight = getattr(self, 'sft_weight', 0.0)
