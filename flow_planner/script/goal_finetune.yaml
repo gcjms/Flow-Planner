@@ -1,0 +1,45 @@
+hydra:
+  run:
+    dir: ${save_dir}
+  job:
+    name: ${job_name}
+
+project_root: /root/autodl-tmp/Flow-Planner
+save_dir: /root/autodl-tmp/Flow-Planner/outputs/goal_finetune/${now:%Y-%m-%d_%H-%M-%S}
+save_every_since: 0
+resume_path: null
+pretrained_checkpoint: /root/autodl-tmp/Flow-Planner/checkpoints/model.pth
+project: FlowPlannerGoal
+job_name: goal_finetune
+logger_level: info
+seed: 3402
+device: cuda
+num_workers: 4
+use_wandb: false
+pin_mem: true
+
+train:
+  batch_size: 32
+  epoch: 50
+  save_utd: 10
+
+ddp:
+  distributed: false
+  world_size: 1
+  rank: 0
+  init_process_group: nccl
+  addr: localhost
+  port: 29529
+
+model_type: x_start
+
+defaults:
+  - _self_
+  - model: flow_planner_goal
+  - core: flow_matching
+  - data/dataset: nuplan_data
+  - data/input_aug: input_aug
+  - normalization_stats: waypoints_norm_stats
+  - ema: ema
+  - optimizer: adamw
+  - scheduler: warmup_const
