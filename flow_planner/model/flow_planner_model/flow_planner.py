@@ -27,6 +27,8 @@ class FlowPlanner(DiffusionADPlanner):
         
         data_processor: ModelInputProcessor = None,
         
+        goal_vocab_path: str = None,
+
         device='cuda',
         **planner_params
     ):
@@ -56,6 +58,14 @@ class FlowPlanner(DiffusionADPlanner):
         self.action_num = (self.planner_params['future_len'] - self.planner_params['action_overlap']) // (self.planner_params['action_len'] - self.planner_params['action_overlap'])
         
         self.basic_loss = nn.MSELoss(reduction='none')
+
+        # Goal Point Conditioning
+        self._goal_vocab = None
+        self._goal_vocab_tensor = None
+        if goal_vocab_path is not None:
+            import numpy as np
+            self._goal_vocab = np.load(goal_vocab_path).astype(np.float32)
+            self._goal_vocab_tensor = torch.from_numpy(self._goal_vocab)
         
     def prepare_model_input(self, cfg_flags, data: NuPlanDataSample, use_cfg, is_training):
         B = data.ego_current.shape[0]
@@ -121,12 +131,24 @@ class FlowPlanner(DiffusionADPlanner):
             return self.forward_train(data)
         elif mode == 'inference':
             return self.forward_inference(
-                data, params['use_cfg'], params['cfg_weight'],
+                data, params.get('use_cfg', True), params.get('cfg_weight', None),
                 num_candidates=params.get('num_candidates', 1),
                 bon_seed=params.get('bon_seed', -1),
                 return_all_candidates=params.get('return_all_candidates', False),
+                goal_point=params.get('goal_point', None),
             )
     
+    def _get_goal_for_gt(self, data: NuPlanDataSample):
+        """从 GT 轨迹终点查 vocabulary 中最近的 goal point, 返回 (B, 2) tensor."""
+        if self._goal_vocab_tensor is None:
+            return None
+        from flow_planner.goal.goal_utils import find_nearest_goal_torch
+        # ego_future: (B, T, D) 原始 ego-centric 坐标 (未归一化)
+        raw_endpoint = data.ego_future[:, -1, :2].float().to(self.device)  # (B, 2)
+        vocab = self._goal_vocab_tensor.to(self.device)  # (K, 2)
+        idx = find_nearest_goal_torch(raw_endpoint, vocab)  # (B,)
+        return vocab[idx]  # (B, 2)
+
     def forward_train(self, data: NuPlanDataSample):
         '''
         Forward a training step and compute the training loss.
@@ -140,6 +162,10 @@ class FlowPlanner(DiffusionADPlanner):
             loss_dict: a dict of loss containing unreduced mse loss, consistency loss and neighbor prediction loss (if one exists).
         '''
         B = data.ego_current.shape[0]
+
+        # Goal conditioning: 从 GT 终点查最近聚类中心 (在 normalize 之前取)
+        goal_point = self._get_goal_for_gt(data)
+
         roll_dice = torch.rand((B, 1))
         cfg_flags = (roll_dice > self.cfg_prob).to(torch.int32).to(self.device) # NOTE: 1 for conditioned (unmasked), 0 for unconditioned (masked)
         model_inputs, gt = self.prepare_model_input(cfg_flags, data, use_cfg=False, is_training=True) # note that the cfg_flags are packed into the model_inputs
@@ -148,6 +174,10 @@ class FlowPlanner(DiffusionADPlanner):
         encoder_outputs = self.encoder(**encoder_inputs)
 
         decoder_model_extra = self.extract_decoder_inputs(encoder_outputs, model_inputs)
+
+        if goal_point is not None:
+            decoder_model_extra['goal_point'] = goal_point
+
         B, P, T_, D = gt.shape
         
         noised_traj, target, t = self.flow_ode.sample(gt[:, :, 1:, :], self._model_type)
@@ -177,7 +207,7 @@ class FlowPlanner(DiffusionADPlanner):
     
     def forward_inference(self, data: NuPlanDataSample, use_cfg=True, cfg_weight=None,
                           num_candidates: int = 1, return_all_candidates: bool = False,
-                          bon_seed: int = -1):
+                          bon_seed: int = -1, goal_point=None):
         """
         Forward inference with optional Best-of-N trajectory selection.
 
@@ -189,6 +219,7 @@ class FlowPlanner(DiffusionADPlanner):
             return_all_candidates: if True, return all N candidates instead of best one
             bon_seed: if >= 0, use deterministic seeds for candidate generation
                       (seed + i for candidate i). Set to -1 for random.
+            goal_point: (B, 2) tensor — goal conditioning. If None, no goal used.
 
         Returns:
             sample: (B, T, D) best trajectory, or (B, N, T, D) if return_all_candidates
@@ -236,6 +267,17 @@ class FlowPlanner(DiffusionADPlanner):
         encoder_inputs = self.extract_encoder_inputs(model_inputs)
         encoder_outputs = self.encoder(**encoder_inputs)
         decoder_model_extra = self.extract_decoder_inputs(encoder_outputs, model_inputs)
+
+        # ---- Goal conditioning ----
+        if goal_point is not None:
+            gp = goal_point.to(self.device).float()  # (B, 2)
+            if use_cfg:
+                # conditioned half 给真实 goal, unconditioned half 给零
+                decoder_model_extra['goal_point'] = torch.cat(
+                    [gp, torch.zeros_like(gp)], dim=0
+                )  # (2B, 2)
+            else:
+                decoder_model_extra['goal_point'] = gp
 
         # ---- Generate N candidate trajectories ----
         all_candidates = []

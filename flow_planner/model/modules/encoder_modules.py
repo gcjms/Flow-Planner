@@ -178,20 +178,10 @@ class LaneFusionEncoder(nn.Module):
                 (~has_speed_limit).sum().item(), -1
             )
             speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
-        
-        speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
-        speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
-
-        speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-            (~has_speed_limit).sum().item(), -1
-        )
-        speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
 
         # Process traffic lights directly for valid positions
         traffic = traffic[valid_indices].type(torch.float32)
-        traffic_light_embedding = self.traffic_emb(traffic)  # Traffic light embedding for valid data
-
-        D = x.shape[-1]
+        traffic_light_embedding = self.traffic_emb(traffic)
 
         x = x + speed_limit_embedding + traffic_light_embedding
 
@@ -265,6 +255,7 @@ class FusionEncoder(nn.Module):
 
     def forward(self, x, mask):
 
+        mask = mask.clone()
         mask[:, 0] = False
 
         for b in self.blocks:

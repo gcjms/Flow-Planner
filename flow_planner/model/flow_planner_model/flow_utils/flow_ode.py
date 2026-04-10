@@ -91,12 +91,13 @@ class FlowODE(Scheduler):
             # 直接预测干净数据 x₁
             target = path_sample.x_1
         elif target_type == 'noise':
-            # 预测噪声 x₀（类似 DDPM）
             target = x_0
+        else:
+            raise ValueError(f"Unknown target_type '{target_type}', expected 'velocity'/'x_start'/'noise'")
             
         return path_sample.x_t, target, t
     
-    def generate(self, x_init, model_fn, model_pred_type, use_cfg, **model_extra):
+    def generate(self, x_init, model_fn, model_pred_type, use_cfg, cfg_weight=None, **model_extra):
         """
         推理时的轨迹生成：从纯噪声出发，用 ODE solver 沿速度场积分到 t=1。
         
@@ -105,6 +106,7 @@ class FlowODE(Scheduler):
             model_fn: decoder 函数，输入 (x_t, t) 输出预测
             model_pred_type: 模型预测的类型 ('velocity'/'x_start'/'noise')
             use_cfg: 是否使用 Classifier-Free Guidance
+            cfg_weight: CFG 权重, None 时使用 self.cfg_weight
             model_extra: decoder 需要的额外输入 (encodings, masks, routes_cond 等)
         
         Returns:
@@ -124,7 +126,8 @@ class FlowODE(Scheduler):
         velocity_func = self.translation_funcs[(model_pred_type, 'velocity')]
         
         # 包装 decoder 为速度模型（内部处理 CFG 的有条件/无条件加权）
-        velocity_model = VelocityModel(model_fn, self.path, velocity_func, use_cfg=use_cfg, cfg_weight=self.cfg_weight)
+        w = cfg_weight if cfg_weight is not None else self.cfg_weight
+        velocity_model = VelocityModel(model_fn, self.path, velocity_func, use_cfg=use_cfg, cfg_weight=w)
         
         # 创建 ODE 求解器
         solver = ODESolver(velocity_model=velocity_model)
@@ -162,6 +165,7 @@ class FlowODE(Scheduler):
             linear:  σ(t) = σ_base · (1 - t)         — 早期大、后期小
             cosine:  σ(t) = σ_base · cos(π·t / 2)    — 更平滑的衰减
             constant: σ(t) = σ_base                   — 全程均匀（不推荐）
+            early_boost: σ(t) = σ_base · (1-t)² · 4   — 只在 t<0.5 时注入大噪声
 
         Args:
             x_init: 初始噪声, shape (B, action_num, action_len, state_dim)
@@ -171,7 +175,7 @@ class FlowODE(Scheduler):
             cfg_weight: CFG 权重，None 时使用 self.cfg_weight
             sigma_base: 噪声强度基准值，推荐 0.1~0.5
             sde_steps: SDE 积分步数，推荐 20~50（比部署时多）
-            noise_schedule: 噪声衰减策略 ('linear'/'cosine'/'constant')
+            noise_schedule: 噪声衰减策略 ('linear'/'cosine'/'constant'/'early_boost')
             model_extra: decoder 的额外输入 (encodings, masks 等)
 
         Returns:
@@ -204,6 +208,10 @@ class FlowODE(Scheduler):
                     sigma_t = sigma_base * (1.0 - t_next)
                 elif noise_schedule == 'cosine':
                     sigma_t = sigma_base * math.cos(math.pi * t_next / 2.0)
+                elif noise_schedule == 'early_boost':
+                    # 只在早期 (t < 0.5) 注入大噪声，尝试跳到不同的 "basin"
+                    # sigma_t 在 t=0 时 = sigma_base * 4，在 t=0.5 时 = sigma_base，t>0.5 时快速衰减
+                    sigma_t = sigma_base * 4.0 * ((1.0 - t_next) ** 2) if t_next < 0.5 else sigma_base * 0.1
                 else:
                     sigma_t = sigma_base
 

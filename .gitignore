@@ -46,3 +46,6 @@ dpo_data/
 
 # PPT files
 *.pptx
+
+# External reference repos (read-only, never push)
+ai_planning-master*/

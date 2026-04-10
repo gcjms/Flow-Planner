@@ -48,7 +48,7 @@ class TrajectoryScorer:
     def extrapolate_neighbor_future(
         neighbor_past: torch.Tensor,
         future_steps: int,
-        dt: float = 0.5,
+        dt: float = 0.1,
     ) -> torch.Tensor:
         """
         用邻居最后一帧的速度做匀速直线外推，生成未来轨迹。
@@ -169,7 +169,7 @@ class TrajectoryScorer:
         neigh_exp = neigh_xy[:, :min_T, :].unsqueeze(0)
 
         # 距离: (N, M, min_T)
-        dists = torch.norm(traj_exp - neigh_exp, dim=-1)
+        dists = torch.linalg.norm(traj_exp - neigh_exp, dim=-1)
 
         # 每条轨迹的最小距离
         min_dists, _ = dists.reshape(N, -1).min(dim=-1)  # (N,)
@@ -246,7 +246,7 @@ class TrajectoryScorer:
         traj_end = trajectories[:, -1, :2]  # (N, 2)
 
         # 找路线上最近的点
-        dists = torch.norm(traj_end.unsqueeze(1) - route.unsqueeze(0), dim=-1)  # (N, T_r)
+        dists = torch.linalg.norm(traj_end.unsqueeze(1) - route.unsqueeze(0), dim=-1)  # (N, T_r)
         min_route_dist, _ = dists.min(dim=-1)  # (N,)
 
         # 评分：100m尺度归一化，偏差越小分数越高
@@ -270,14 +270,14 @@ class TrajectoryScorer:
 
         # 加速度
         acc = (vel[:, 1:, :] - vel[:, :-1, :]) / self.dt  # (N, T-2, 2)
-        acc_mag = torch.norm(acc, dim=-1)  # (N, T-2)
+        acc_mag = torch.linalg.norm(acc, dim=-1)  # (N, T-2)
 
         # 最大加速度
         max_acc, _ = acc_mag.max(dim=-1)  # (N,)
 
         # Jerk（加速度变化率）
         jerk = (acc[:, 1:, :] - acc[:, :-1, :]) / self.dt  # (N, T-3, 2)
-        jerk_mag = torch.norm(jerk, dim=-1)
+        jerk_mag = torch.linalg.norm(jerk, dim=-1)
         max_jerk, _ = jerk_mag.max(dim=-1)  # (N,)
 
         # 评分：加速度 < 4m/s² 且 jerk < 8m/s³ → 满分

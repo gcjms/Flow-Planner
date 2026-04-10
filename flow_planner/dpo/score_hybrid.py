@@ -19,47 +19,76 @@ logger = logging.getLogger(__name__)
 # Tier 1: Rule-Based Scoring
 # ============================================================
 
+def _extrapolate_neighbor_future(neighbor_past: np.ndarray, future_steps: int, dt: float = 0.1) -> np.ndarray:
+    """
+    用恒速模型外推邻居未来位置。
+    Args:
+        neighbor_past: (M, T_p, 11) — 邻居历史 [x, y, cos_h, sin_h, vx, vy, w, l, type*3]
+        future_steps: ego 轨迹的时间步数
+        dt: 每步时间间隔 (秒)
+    Returns:
+        neighbor_future: (M, future_steps, 2) — 外推的 (x, y)
+    """
+    M = neighbor_past.shape[0]
+    future = np.zeros((M, future_steps, 2), dtype=np.float32)
+    for m in range(M):
+        last = neighbor_past[m, -1]
+        x, y = last[0], last[1]
+        vx, vy = last[4], last[5]
+        for t in range(future_steps):
+            future[m, t, 0] = x + vx * dt * (t + 1)
+            future[m, t, 1] = y + vy * dt * (t + 1)
+    return future
+
+
 def rule_score(candidate_npz_path: str) -> Dict:
-    """Score 5 candidates purely by FDE + collision distance."""
+    """Score candidates by FDE + collision distance (with extrapolated neighbor future)."""
     data = np.load(candidate_npz_path, allow_pickle=True)
     cands = data['candidates']
-    if cands.ndim == 4: cands = cands.squeeze(1)  # (5, T, D)
+    if cands.ndim == 4: cands = cands.squeeze(1)  # (K, T, D)
+    num_candidates = cands.shape[0]
 
     gt_future = data['ego_agent_future']  # (T, 3+)
     gt_end = gt_future[-1, :2]
 
     neighbors = data['neighbor_agents_past']  # (M, T_p, 11)
-    curr_n = neighbors[:, -1, :2]
-    valid_n = curr_n[np.abs(curr_n).sum(axis=1) > 1e-6]
+    valid_mask = np.abs(neighbors[:, -1, :2]).sum(axis=1) > 1e-6
+    valid_neighbors = neighbors[valid_mask]  # (M', T_p, 11)
+
+    T_ego = cands.shape[1]
+    neighbor_future = None
+    if len(valid_neighbors) > 0:
+        neighbor_future = _extrapolate_neighbor_future(valid_neighbors, T_ego)  # (M', T_ego, 2)
 
     scores = []
     details = []
-    for k in range(5):
-        traj = cands[k, :, :2]
+    for k in range(num_candidates):
+        traj = cands[k, :, :2]  # (T, 2)
 
-        # FDE: endpoint distance to GT
         fde = float(np.linalg.norm(traj[-1] - gt_end))
 
-        # ADE: average distance to GT (use min of trajectory lengths)
         min_len = min(len(traj), len(gt_future))
         ade = float(np.mean(np.linalg.norm(traj[:min_len] - gt_future[:min_len, :2], axis=-1)))
 
-        # Min obstacle distance
+        # 跟外推的邻居未来位置比，而不是当前位置
         obs_dist = 99.0
-        if len(valid_n) > 0:
-            obs_dist = float(np.min(np.linalg.norm(
-                traj[:, None, :] - valid_n[None, :, :], axis=-1)))
+        if neighbor_future is not None:
+            # traj: (T, 2), neighbor_future: (M', T, 2) → 逐时间步比较
+            min_t = min(T_ego, neighbor_future.shape[1])
+            dists = np.linalg.norm(
+                traj[:min_t, None, :] - neighbor_future[:, :min_t, :].transpose(1, 0, 2),
+                axis=-1,
+            )  # (min_t, M')
+            obs_dist = float(dists.min())
 
-        # Collision penalty: hard penalty if too close
-        collision_penalty = max(0, 3.0 - obs_dist) * 10.0  # steep penalty below 3m
+        collision_penalty = max(0, 3.0 - obs_dist) * 10.0
 
-        # Combined score (higher = better)
         score = -fde - 0.5 * ade - collision_penalty
         scores.append(score)
         details.append({'fde': fde, 'ade': ade, 'obs_dist': obs_dist})
 
-    ranking_idx = np.argsort(scores)[::-1]  # best first
-    ranking = [int(i + 1) for i in ranking_idx]  # 1-indexed
+    ranking_idx = np.argsort(scores)[::-1]
+    ranking = [int(i + 1) for i in ranking_idx]
 
     chosen_idx = int(ranking_idx[0])
     rejected_idx = int(ranking_idx[-1])
@@ -166,8 +195,8 @@ def vlm_score(candidate_npz_path: str, bev_dir: str, client, model_name: str) ->
     ax.text(ego_future[-1, 0]+1, ego_future[-1, 1]+1, 'GT', color='white', fontsize=9,
             fontweight='bold', zorder=15, bbox=dict(facecolor='black', alpha=0.7, pad=2))
 
-    label_offsets = np.linspace(-3, 3, 5)
-    for k in range(5):
+    label_offsets = np.linspace(-3, 3, cands.shape[0])
+    for k in range(cands.shape[0]):
         traj = cands[k, :, :2]; color = TRAJECTORY_COLORS[k % len(TRAJECTORY_COLORS)]
         ax.plot(traj[:, 0], traj[:, 1], color=color, linewidth=1.5, alpha=0.9, zorder=10)
         ax.text(traj[-1, 0]+1, traj[-1, 1]+label_offsets[k], f'#{k+1}', color=color,
@@ -184,15 +213,25 @@ def vlm_score(candidate_npz_path: str, bev_dir: str, client, model_name: str) ->
 
     # --- Compute metrics ---
     traj_xy = cands[:, :, :2]
-    curr_n = neighbors[:, -1, :2]
-    valid_n = curr_n[np.abs(curr_n).sum(axis=1) > 1e-6]
+    num_cands = cands.shape[0]
+
+    valid_mask = np.abs(neighbors[:, -1, :2]).sum(axis=1) > 1e-6
+    valid_nb = neighbors[valid_mask]
+    T_ego = traj_xy.shape[1]
+    nb_future = None
+    if len(valid_nb) > 0:
+        nb_future = _extrapolate_neighbor_future(valid_nb, T_ego)
 
     lines = []
-    for k in range(5):
+    for k in range(num_cands):
         traj = traj_xy[k]
         obs_dist = 99.0
-        if len(valid_n) > 0:
-            obs_dist = float(np.min(np.linalg.norm(traj[:, None, :] - valid_n[None, :, :], axis=-1)))
+        if nb_future is not None:
+            min_t = min(T_ego, nb_future.shape[1])
+            dists = np.linalg.norm(
+                traj[:min_t, None, :] - nb_future[:, :min_t, :].transpose(1, 0, 2), axis=-1
+            )
+            obs_dist = float(dists.min())
         fde = float(np.linalg.norm(traj[-1] - gt_end))
         lines.append(f"- 轨迹#{k+1}: 距最近车辆 {obs_dist:.1f}m, 终点距GT终点 {fde:.1f}m")
 
@@ -284,7 +323,8 @@ def main():
         try:
             spread = compute_lateral_spread(str(npz_path))
             spreads[str(npz_path)] = spread
-        except:
+        except Exception as e:
+            logger.warning(f"Spread computation failed for {npz_path}: {e}")
             spreads[str(npz_path)] = 0.0
 
     high_spread = {k for k, v in spreads.items() if v >= args.spread_threshold}

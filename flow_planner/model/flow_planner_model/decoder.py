@@ -50,6 +50,7 @@ class FlowPlannerDecoder(nn.Module):
             preproj_hidden=256,   # 轨迹预投影的中间维度
             enable_attn_dist=False,  # 是否启用距离感知的 attention bias
             act_pe_type: str = 'learnable',  # action 位置编码类型: learnable/fixed_sin/none
+            goal_dim: int = 0,    # goal point 维度: 0=不启用, 2=(x,y)
             device: str = 'cuda',
             **planner_params      # 包含 action_len, state_dim, future_len, action_overlap 等
     ):
@@ -106,6 +107,19 @@ class FlowPlannerDecoder(nn.Module):
         # CFG 嵌入: 2 个学习的嵌入向量
         # index 0 = 无条件(masked), index 1 = 有条件(unmasked)
         self.cfg_embedding = nn.Embedding(2, hidden_dim)
+
+        # Goal Point Conditioning (GoalFlow-style)
+        # goal_dim=0: 不启用 (向后兼容); goal_dim=2: (x,y) goal point
+        self.goal_dim = goal_dim
+        if goal_dim > 0:
+            self.goal_proj = nn.Sequential(
+                nn.Linear(goal_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            # 初始化最后一层为零，让 goal 在训练初期影响最小
+            nn.init.zeros_(self.goal_proj[-1].weight)
+            nn.init.zeros_(self.goal_proj[-1].bias)
         
         # Action 位置编码: 让模型区分第 0, 1, 2, ... 个 action token
         self.act_pe_type = act_pe_type
@@ -221,8 +235,17 @@ class FlowPlannerDecoder(nn.Module):
         routes_cond = routes_cond.unsqueeze(1)                  # (B, 1, hidden_dim)
         action_pe = self.action_pe.unsqueeze(0).repeat(B, 1, 1) # (B, P, hidden_dim)
 
+        # Goal embedding: 从 model_extra 中取 goal_point (B, 2)
+        goal_embedding = 0
+        if self.goal_dim > 0 and 'goal_point' in model_extra and model_extra['goal_point'] is not None:
+            gp = model_extra['goal_point'].float()  # (B, 2)
+            goal_embedding = self.goal_proj(gp).unsqueeze(1)  # (B, 1, hidden_dim)
+            # CFG masking: unconditioned samples (cfg_flags=0) 不给 goal
+            goal_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+            goal_embedding = goal_embedding * goal_mask
+
         # 综合条件 y: 用于 FinalLayer 的 AdaLN 调制
-        y = time_cond + routes_cond + action_pe + cfg_embedding  # (B, P, hidden_dim)
+        y = time_cond + routes_cond + action_pe + cfg_embedding + goal_embedding  # (B, P, hidden_dim)
 
         # ===== Step D: DiT 多模态 Transformer =====
         # 输入 3 个模态: agents(32+5=37个token), lanes(70个token), trajectory(P个token)
@@ -234,6 +257,7 @@ class FlowPlannerDecoder(nn.Module):
             routes_cond=routes_cond,      # (B, 1, hidden_dim)
             action_encoding=action_pe,    # (B, P, hidden_dim) — 仅用于 trajectory 模态
             cfg_embedding=cfg_embedding,  # (B, 1, hidden_dim) — 仅用于 trajectory 模态
+            goal_embedding=goal_embedding,  # (B, 1, hidden_dim) or 0 — goal point 条件
             attn_dist=attn_dist           # (B, N, N) 距离矩阵用于 attention bias
         )
         
@@ -431,6 +455,7 @@ class FlowPlannerDiT(nn.Module):
         routes_cond = None,     # (B, 1, hidden_dim) 路由条件
         action_encoding = None, # (B, P, hidden_dim) action 位置编码
         cfg_embedding = None,   # (B, 1, hidden_dim) CFG 嵌入
+        goal_embedding = 0,     # (B, 1, hidden_dim) or 0 — goal point 条件
         attn_dist = None,       # (B, N, N) 距离矩阵
     ):
         """
@@ -438,15 +463,15 @@ class FlowPlannerDiT(nn.Module):
         
         为每个模态构建各自的条件向量:
           - agents / lanes 的条件: time + routes (它们不需要知道 action 的位置和 CFG 状态)
-          - trajectory 的条件: time + routes + action_pe + cfg (需要知道时间、位置和 CFG)
+          - trajectory 的条件: time + routes + action_pe + cfg + goal
         
         然后通过 depth 个 DiTBlock，最后 RMSNorm。
         """
         # 构建每个模态的条件向量
         # 前 N-1 个模态 (agents, lanes): 只用 time + routes
         other_modality_conds = [time_cond + routes_cond] * (len(modality_tokens) - 1)
-        # 最后一个模态 (trajectory): time + routes + action_pe + cfg
-        ego_traj_conds = [time_cond + routes_cond + action_encoding + cfg_embedding]
+        # 最后一个模态 (trajectory): time + routes + action_pe + cfg + goal
+        ego_traj_conds = [time_cond + routes_cond + action_encoding + cfg_embedding + goal_embedding]
         modality_conds = other_modality_conds + ego_traj_conds
 
         # 通过每一层 DiTBlock
