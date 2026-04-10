@@ -53,8 +53,8 @@ def find_nearest_goal_torch(endpoints: torch.Tensor, vocab: torch.Tensor) -> tor
 def select_diverse_goals(
     vocab: np.ndarray,
     n_goals: int,
-    max_dist: float = 60.0,
-    min_dist: float = 2.0,
+    max_dist: float = 40.0,
+    min_dist: float = 1.0,
 ) -> tuple:
     """
     从 vocabulary 中选出 n_goals 个最大化多样性的 goal point。
@@ -64,7 +64,7 @@ def select_diverse_goals(
     Args:
         vocab: (K, 2)
         n_goals: 要选几个
-        max_dist: 最远距离 (ego-centric 坐标, 太远的不合理)
+        max_dist: 最远距离 (ego-centric 坐标, 4s horizon ~40m is reasonable)
         min_dist: 最近距离 (太近 = 已经到了, 没意义)
 
     Returns:

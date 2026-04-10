@@ -139,14 +139,16 @@ class FlowPlanner(DiffusionADPlanner):
             )
     
     def _get_goal_for_gt(self, data: NuPlanDataSample):
-        """从 GT 轨迹终点查 vocabulary 中最近的 goal point, 返回 (B, 2) tensor."""
+        """从 GT 轨迹的 goal_frame 处查 vocabulary 中最近的 goal point, 返回 (B, 2) tensor."""
         if self._goal_vocab_tensor is None:
             return None
         from flow_planner.goal.goal_utils import find_nearest_goal_torch
-        # ego_future: (B, T, D) 原始 ego-centric 坐标 (未归一化)
-        raw_endpoint = data.ego_future[:, -1, :2].float().to(self.device)  # (B, 2)
+        goal_frame = self.planner_params.get('goal_frame', 39)  # 39 = 4s@10Hz
+        T = data.ego_future.shape[1]
+        idx_t = (T - 1) if goal_frame < 0 else min(goal_frame, T - 1)
+        raw_point = data.ego_future[:, idx_t, :2].float().to(self.device)  # (B, 2)
         vocab = self._goal_vocab_tensor.to(self.device)  # (K, 2)
-        idx = find_nearest_goal_torch(raw_endpoint, vocab)  # (B,)
+        idx = find_nearest_goal_torch(raw_point, vocab)  # (B,)
         return vocab[idx]  # (B, 2)
 
     def forward_train(self, data: NuPlanDataSample):

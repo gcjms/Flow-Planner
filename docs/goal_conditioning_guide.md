@@ -50,10 +50,14 @@ python -m flow_planner.goal.cluster_goals \
     --data_dir /root/autodl-tmp/nuplan_npz \
     --data_list /root/autodl-tmp/nuplan_npz/train_list.json \
     --output_path /root/Flow-Planner/goal_vocab.npy \
-    --n_clusters 64
+    --n_clusters 64 \
+    --goal_frame 39
 ```
 
-输出: `goal_vocab.npy` — shape (64, 2)，64 个 ego-centric (x, y) 聚类中心。
+- `--goal_frame 39` = 取 GT 轨迹第 39 帧（4s @10Hz）做聚类。设 `-1` 则用最后一帧（8s）。
+- 4 秒处左绕/右绕/刹停的位置差异最大，8 秒太远容易收敛到同一个终点。
+
+输出: `goal_vocab.npy` — shape (64, 2)，64 个 ego-centric (x, y) 聚类中心（4 秒处的位置）。
 
 **验证**：脚本会打印每个聚类的中心坐标和样本数，确认分布合理。
 
@@ -65,7 +69,7 @@ python -m flow_planner.goal.cluster_goals \
 
 在 `flow_planner/script/model/flow_planner.yaml` 中加两处：
 
-**顶层加 `goal_vocab_path`：**
+**顶层加 `goal_vocab_path`，`planner_params` 里加 `goal_frame`：**
 ```yaml
 _target_: flow_planner.model.flow_planner_model.flow_planner.FlowPlanner
 
@@ -73,6 +77,13 @@ goal_vocab_path: /root/Flow-Planner/goal_vocab.npy   # ← 新增
 
 neighbor_num: 32
 # ... 其余不变
+```
+
+**在 `planner_params` 段里加 `goal_frame`：**
+```yaml
+planner_params:
+  goal_frame: 39   # ← 新增：与 cluster_goals.py 的 --goal_frame 保持一致
+  # ... 其余不变
 ```
 
 **`model_decoder` 段加 `goal_dim: 2`：**
@@ -97,7 +108,7 @@ torchrun --nproc_per_node=8 \
 
 模型会自动：
 1. 加载 goal_vocab.npy
-2. 每个训练样本从 GT 终点查最近聚类中心作为 goal 条件
+2. 每个训练样本从 GT 轨迹第 `goal_frame` 帧（默认 4 秒处）查最近聚类中心作为 goal 条件
 3. CFG 随机 drop goal（跟 neighbors 共用 cfg_flags）
 
 **验证**：训练日志应该能看到 goal_vocab 加载成功，loss 正常下降。
@@ -199,6 +210,7 @@ python -m flow_planner.dpo.eval_multidim \
 | 参数 | 推荐值 | 说明 |
 |------|--------|------|
 | n_clusters (K) | 64 | nuPlan 数据下 64 够用, 可试 32/128 |
+| goal_frame | 39 | 0-indexed, 39=4s@10Hz. 必须聚类和训练一致 |
 | goal_dim | 2 | (x, y) 坐标, 不需要 heading |
 | cfg_prob | 0.3 | 沿用原值, goal 跟 neighbors 一起被 mask |
 | num_candidates | 5 | DPO 候选数, 每个对应不同 goal |
@@ -210,5 +222,6 @@ python -m flow_planner.dpo.eval_multidim \
 
 1. **Step 2 是必须的** — 不重训模型，goal embedding 永远是零，换 goal 没有效果
 2. **Step 2 的 config_goal.yaml** — 训练完成后把训练用的 yaml 拷贝一份到 checkpoints/ 备用
-3. **Step 3 的 ckpt** — 必须用 Step 2 训出来的带 goal 的模型，不能用原模型
-4. **Step 5 的 --scene_dir** — 需要指向包含原始 NPZ 场景文件的目录（用于 encoder 计算条件）
+3. **goal_frame 必须一致** — `cluster_goals.py --goal_frame` 和 yaml 里 `planner_params.goal_frame` 必须是同一个值，否则训练时 goal 对不上聚类中心
+4. **Step 3 的 ckpt** — 必须用 Step 2 训出来的带 goal 的模型，不能用原模型
+5. **Step 5 的 --scene_dir** — 需要指向包含原始 NPZ 场景文件的目录（用于 encoder 计算条件）

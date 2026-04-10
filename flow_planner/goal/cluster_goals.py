@@ -42,6 +42,11 @@ def main():
         help="Number of goal clusters (K). 64 is a good starting point for nuPlan.",
     )
     parser.add_argument(
+        "--goal_frame", type=int, default=39,
+        help="Which future frame to use as goal point (0-indexed). "
+             "Default 39 = 4s at 10Hz. Use -1 for last frame (8s).",
+    )
+    parser.add_argument(
         "--max_samples", type=int, default=None,
         help="Limit number of samples (for debugging)",
     )
@@ -64,7 +69,9 @@ def main():
         try:
             data = np.load(path)
             gt_future = data["ego_agent_future"]  # (T, D), D >= 2
-            endpoint = gt_future[-1, :2].astype(np.float32)
+            T = gt_future.shape[0]
+            goal_idx = (T - 1) if args.goal_frame < 0 else min(args.goal_frame, T - 1)
+            endpoint = gt_future[goal_idx, :2].astype(np.float32)
 
             if np.isnan(endpoint).any() or np.linalg.norm(endpoint) > 200:
                 skipped += 1

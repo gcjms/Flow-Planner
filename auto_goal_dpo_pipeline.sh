@@ -46,6 +46,7 @@ DPO_DIR=checkpoints/dpo_goal
 
 # ===================== Hyperparameters =====================
 N_CLUSTERS=64
+GOAL_FRAME=39          # 0-indexed: 39 = 4s@10Hz, -1 = last frame (8s)
 NUM_CANDIDATES=5
 CFG_WEIGHT=1.8
 DPO_BETA=5.0
@@ -69,6 +70,7 @@ if [ ! -f "$GOAL_VOCAB" ]; then
         --data_list /root/autodl-tmp/nuplan_npz/train_list.json \
         --output_path $GOAL_VOCAB \
         --n_clusters $N_CLUSTERS \
+        --goal_frame $GOAL_FRAME \
         2>&1 | tee -a $LOG
     echo "[Step 1] Done at $(date)" | tee -a $LOG
 else
@@ -183,7 +185,7 @@ echo "[Step 6] Evaluation..." | tee -a $LOG
 echo "========================================" > $REPORT
 echo "  Goal + DPO Evaluation Report" >> $REPORT
 echo "  $(date)" >> $REPORT
-echo "  Clusters: $N_CLUSTERS" >> $REPORT
+echo "  Clusters: $N_CLUSTERS (goal_frame=$GOAL_FRAME)" >> $REPORT
 echo "  Candidates per scene: $NUM_CANDIDATES" >> $REPORT
 echo "  Preference pairs: $N_PAIRS" >> $REPORT
 echo "  DPO: beta=$DPO_BETA, rank=$LORA_RANK, epochs=$DPO_EPOCHS" >> $REPORT
