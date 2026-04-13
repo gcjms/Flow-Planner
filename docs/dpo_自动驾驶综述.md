@@ -203,6 +203,147 @@ $$\mathcal{L}_{DPO} = -\log \sigma\left(\beta \cdot \left[\log \frac{\pi_\theta(
    - 比 Best-of-N 推理时快 5 倍（N=1 vs N=5）
 5. **实验**：nuPlan val14 闭环 NR-CLS 量化对比
 
+### 4.3 Goal Conditioning 诊断结论
+
+我们最近对 `goal conditioning` 做了一次关键诊断，这个结果对后续论文 framing 很重要。
+
+#### 诊断动机
+
+此前我们观察到：
+
+- 带 `goal_point` 重训后的 checkpoint 在开环规划指标上明显差于 base
+- 但同一批 checkpoint 在 DPO 候选生成里又能明显提升轨迹多样性
+
+这两个现象表面上矛盾。更合理的怀疑是：
+
+> 模型训练时依赖 `goal` 条件，但评估时没有把 `goal_point` 喂进去，导致评估设置与训练假设不一致。
+
+#### 三种设置
+
+| 设置 | 含义 | 用途 |
+|------|------|------|
+| `train no-goal / eval no-goal` | 标准 base 模型 | 基线 |
+| `train with-goal / eval no-goal` | 训练时有 goal，测试时不给 goal | 错配诊断 |
+| `train with-goal / eval gt-nearest-goal` | 训练时有 goal，测试时用 GT endpoint 最近的 cluster 作为 goal | Oracle 条件诊断 |
+
+其中第三种是 **oracle-style evaluation**：
+
+- 它不是可部署评估，因为使用了 GT future 的终点信息
+- 但它非常适合回答一个关键问题：
+  - 如果 goal 给对了，模型本身到底会不会用这个条件？
+
+#### 关键实验结果
+
+在远程机上对同一批 `goal_finetune` checkpoint（`e50/e60/e70`）重新跑评估后，结论非常明确。
+
+**错误设置：`goal_mode=none`**
+
+| 模型 | ADE | FDE | CollRate | Progress |
+|------|-----|-----|----------|----------|
+| base | 2.5563 | 6.2287 | 7% | 0.6411 |
+| e50 | 6.2955 | 16.5964 | 20% | 0.4454 |
+| e60 | 5.4893 | 15.1340 | 20% | 0.4622 |
+| e70 | 4.5311 | 12.3644 | 18% | 0.5021 |
+
+表面结论像是：
+
+> goal-conditioned model 明显退化。
+
+但这组结果实际上测的是：
+
+> 一个训练时依赖 goal 的模型，在测试时不给 goal，还能剩下多少性能。
+
+**正确诊断设置：`goal_mode=gt_nearest`**
+
+| 模型 | ADE | FDE | CollRate | Progress |
+|------|-----|-----|----------|----------|
+| base | 2.7279 | 6.6853 | 5% | 0.6424 |
+| e50 | 1.1068 | 2.4054 | 0% | 0.6600 |
+| e60 | 1.0890 | 2.1752 | 0% | 0.6609 |
+| e70 | 1.0530 | 2.0113 | 0% | 0.6578 |
+
+这说明：
+
+1. **模型本身已经学会了使用 goal 条件**
+2. **此前看到的大幅退化，主要来自评估方式错误，而不是方法本身无效**
+3. **在正确 goal 条件下，goal-conditioned checkpoint 显著优于 base**
+
+#### 对论文叙事的意义
+
+这个结果直接改变了我们的判断：
+
+- 现在不能再把问题表述成“goal conditioning 没有提升主指标”
+- 更准确的说法应该是：
+
+> Goal-conditioned Flow Matching 在 oracle goal 条件下显著优于 base，说明模型已经具备利用高层意图变量拆解多模态 future 的能力；当前真正的瓶颈不在生成器本身，而在于 **测试时如何在没有 GT 的情况下选择或预测合适的 goal**。
+
+这会把后续论文故事自然推向：
+
+1. **先证明 goal conditioning 可以缓解 mode ambiguity**
+2. **再解决 non-oracle goal selection / prediction**
+3. **最后把更强的多模态候选接入 DPO**
+
+#### 初步 non-oracle baseline 结果
+
+为了回答“没有 GT 时 goal 从哪里来”，我们继续做了两个无需额外训练的 baseline：
+
+1. **route-nearest**
+   - 只用 `route_lanes` 几何
+   - 先从 route 上提取一个前向 anchor
+   - 再从 `goal_vocab` 中检索最贴 route 的 goal
+
+2. **self-nearest**
+   - 先让同一个 goal-conditioned checkpoint 在 **无 goal** 下跑一遍
+   - 用它自己预测的终点检索最近的 goal cluster
+   - 再带着这个 goal 重跑一次
+
+结果如下。
+
+**route-nearest（100 scenes）**
+
+| 模型 | ADE | FDE | CollRate | Progress |
+|------|-----|-----|----------|----------|
+| base | 2.5332 | 5.9611 | 5% | 0.6403 |
+| e50 | 8.7242 | 22.7152 | 23% | 0.4426 |
+| e60 | 8.4508 | 22.2266 | 24% | 0.4478 |
+| e70 | 8.5094 | 22.2303 | 25% | 0.4450 |
+
+**self-nearest（100 scenes）**
+
+| 模型 | ADE | FDE | CollRate | Progress |
+|------|-----|-----|----------|----------|
+| base | 2.6493 | 6.3378 | 5% | 0.6427 |
+| e50 | 6.1501 | 15.0788 | 18% | 0.4508 |
+| e60 | 5.2266 | 12.9208 | 17% | 0.4841 |
+| e70 | 4.3135 | 11.4244 | 15% | 0.5075 |
+
+这两个 baseline 说明：
+
+1. **纯几何 route 检索远远不够**
+   - 只靠 route polyline 去匹配 goal prototype，会在岔路、长 route、交互场景里严重选偏
+
+2. **self-bootstrap 比 route-only 稍好，但仍然明显落后于 oracle**
+   - 说明 goal-conditioned model 在没有显式 goal 时的初始终点预测还不够稳定
+   - “先无条件跑一遍，再映射到最近 goal” 不能充分恢复 oracle 条件下的优势
+
+3. **当前最真实的结论是：生成器已经具备使用正确 goal 的能力，但 non-oracle goal selection 仍是主瓶颈**
+
+这意味着后续真正值得做的，不是立刻切到方向 3，而是优先补一个更可靠的：
+
+`scene-conditioned goal selector / predictor`
+
+例如：
+
+- route-aware goal classifier
+- top-K goal proposal + reranking
+- 使用 encoder 全局表征预测 goal cluster id
+
+#### 当前最重要的研究结论
+
+如果要把这段压缩成论文里一句最关键的话，可以写成：
+
+> Our oracle-conditioned analysis shows that the apparent degradation of goal-conditioned Flow Matching is largely caused by evaluation mismatch rather than model failure. When supplied with a correct goal prototype, the goal-conditioned planner substantially outperforms the base model, suggesting that the remaining challenge lies in deployable goal selection rather than conditional trajectory generation itself.
+
 ---
 
 ## 五、推荐阅读顺序

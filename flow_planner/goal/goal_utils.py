@@ -33,6 +33,76 @@ def find_nearest_goal(endpoints: np.ndarray, vocab: np.ndarray) -> np.ndarray:
     return dists.argmin(axis=1)
 
 
+def extract_valid_route_points(route_lanes: np.ndarray) -> np.ndarray:
+    """Extract valid XY route points from raw route lanes."""
+    points = np.asarray(route_lanes)[..., :2].reshape(-1, 2)
+    finite_mask = np.isfinite(points).all(axis=1)
+    nonzero_mask = np.linalg.norm(points, axis=1) > 1e-3
+    return points[finite_mask & nonzero_mask]
+
+
+def select_goal_from_route(
+    route_lanes: np.ndarray,
+    vocab: np.ndarray,
+    min_forward: float = 2.0,
+    max_goal_dist: float = 45.0,
+    target_progress: float = 30.0,
+) -> np.ndarray:
+    """
+    Select a non-oracle goal point using route geometry only.
+
+    Strategy:
+      1. Extract valid route points in ego frame.
+      2. Pick a forward route anchor near a target progress distance.
+      3. Retrieve the goal-cluster center that best matches the route polyline
+         and stays close to the forward anchor.
+    """
+    route_points = extract_valid_route_points(route_lanes)
+    goal_points = np.asarray(vocab, dtype=np.float32)
+
+    if goal_points.ndim != 2 or goal_points.shape[1] != 2:
+        raise ValueError(f"Expected vocab shape (K, 2), got {goal_points.shape}")
+
+    goal_norm = np.linalg.norm(goal_points, axis=-1)
+    goal_mask = (
+        (goal_points[:, 0] > -1.0)
+        & (goal_norm >= min_forward)
+        & (goal_norm <= max_goal_dist)
+    )
+    valid_goals = goal_points[goal_mask]
+    if len(valid_goals) == 0:
+        valid_goals = goal_points
+
+    if len(route_points) == 0:
+        target_idx = np.argmin(np.abs(np.linalg.norm(valid_goals, axis=-1) - target_progress))
+        return valid_goals[target_idx]
+
+    route_norm = np.linalg.norm(route_points, axis=-1)
+    forward_mask = (
+        (route_points[:, 0] > 0.0)
+        & (route_norm >= min_forward)
+        & (route_norm <= max_goal_dist + 10.0)
+    )
+    forward_points = route_points[forward_mask]
+    if len(forward_points) == 0:
+        forward_points = route_points
+
+    forward_norm = np.linalg.norm(forward_points, axis=-1)
+    anchor_idx = np.argmin(np.abs(forward_norm - target_progress))
+    anchor = forward_points[anchor_idx]
+
+    route_dist = np.linalg.norm(
+        valid_goals[:, None, :] - route_points[None, :, :],
+        axis=-1,
+    ).min(axis=1)
+    anchor_dist = np.linalg.norm(valid_goals - anchor[None, :], axis=-1)
+    progress_bias = np.abs(np.linalg.norm(valid_goals, axis=-1) - np.linalg.norm(anchor))
+
+    # Route matching dominates; anchor/progress stabilize retrieval on turns.
+    score = route_dist + 0.35 * anchor_dist + 0.05 * progress_bias
+    return valid_goals[np.argmin(score)]
+
+
 def find_nearest_goal_torch(endpoints: torch.Tensor, vocab: torch.Tensor) -> torch.Tensor:
     """
     Torch 版本，用于训练循环中 (GPU 上直接算，不走 numpy)。
