@@ -52,8 +52,21 @@ def trainer(cfg: DictConfig):
 
     # load pretrain checkpoint
     if cfg.pretrained_checkpoint is not None:
-        ckpt = torch.load(cfg.pretrained_checkpoint, weights_only=True)
-        model.load_state_dict({n.split("module.")[1]: v for n, v in ckpt['ema_state_dict'].items()})
+        ckpt = torch.load(cfg.pretrained_checkpoint, map_location='cpu', weights_only=False)
+        # Support multiple checkpoint formats
+        if isinstance(ckpt, dict) and 'ema_state_dict' in ckpt:
+            sd = ckpt['ema_state_dict']
+        elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
+            sd = ckpt['state_dict']
+        else:
+            sd = ckpt  # raw state_dict
+        # Strip 'module.' prefix if present
+        sd = {(k.split("module.", 1)[1] if k.startswith("module.") else k): v for k, v in sd.items()}
+        load_result = model.load_state_dict(sd, strict=False)
+        if len(load_result.missing_keys) > 0:
+            logger.info("missing pretrained keys: %s", load_result.missing_keys)
+        if len(load_result.unexpected_keys) > 0:
+            logger.info("unexpected pretrained keys: %s", load_result.unexpected_keys)
 
     model = model.to(local_rank)  # Move model to the current global_rank's GPU
     if cfg.ddp.distributed:
@@ -171,7 +184,8 @@ def trainer(cfg: DictConfig):
             
     logger.info(f"Training finished - Time consumed: {time.strftime('%H:%M:%S', time.gmtime(time.time()-timer))}")
     
-    torch.distributed.destroy_process_group()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
     
 if __name__ == '__main__':
     trainer()

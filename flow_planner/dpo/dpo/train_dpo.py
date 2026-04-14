@@ -35,7 +35,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.dpo.dpo_loss import FlowMatchingDPOLoss
 from flow_planner.dpo.lora import (
     inject_lora, get_lora_params, merge_lora,
@@ -199,7 +198,7 @@ def load_flow_planner(
     from hydra.utils import instantiate
 
     logger.info(f"Loading config from {config_path}")
-    cfg = load_composed_config(config_path)
+    cfg = OmegaConf.load(config_path)
 
     # Fix Hydra interpolation errors for missing keys
     OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)

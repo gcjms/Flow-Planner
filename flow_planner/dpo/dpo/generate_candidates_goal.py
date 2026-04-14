@@ -31,7 +31,6 @@ import numpy as np
 
 sys.path.insert(0, '/root/Flow-Planner')
 
-from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.goal_utils import load_goal_vocab, select_diverse_goals
 
 logger = logging.getLogger(__name__)
@@ -42,7 +41,7 @@ def load_model(config_path, ckpt_path, device='cuda'):
     from omegaconf import OmegaConf
     from hydra.utils import instantiate
 
-    cfg = load_composed_config(config_path)
+    cfg = OmegaConf.load(config_path)
     OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)
     OmegaConf.update(cfg, "data.dataset.train.predicted_neighbor_num", 0, force_add=True)
 
@@ -122,11 +121,8 @@ def generate_candidates_with_goals(
                 bon_seed=42 + i,
                 goal_point=gp,
             )
-            # Normalize model output to a single candidate trajectory (T, D).
-            traj = traj.squeeze(0)
-            if traj.ndim == 3 and traj.shape[0] == 1:
-                traj = traj.squeeze(0)
-            all_trajs.append(traj.cpu().numpy())
+            # traj: (B=1, T, D)
+            all_trajs.append(traj.squeeze(0).cpu().numpy())
 
     candidates = np.stack(all_trajs, axis=0)  # (K, T, D)
     return candidates, goals

@@ -1,38 +1,30 @@
 #!/usr/bin/env python3
 """
-DPO Candidate Generation with Goal-Diverse Sampling (Step 3)
-=============================================================
-用不同的 goal point 生成决策级不同的候选轨迹，用于 DPO 偏好对构建。
+DPO Candidate Generation Script (AutoDL)
+=========================================
+对筛选后的 NPZ 场景生成 K 条候选轨迹，保存为偏好对生成的原材料。
 
-与原版 generate_candidates.py 的区别:
-  - 原版: 5 条轨迹只靠不同随机种子 → 几乎一样
-  - 本版: 5 条轨迹各给不同的 goal point → 左绕/右绕/刹停等不同行为
-
-前提: 需要先完成 Step 1 (cluster_goals.py) 和 Step 2 (重训带 goal 的模型)
-
-用法:
-  python -m flow_planner.dpo.generate_candidates_goal \
+用法 (在 AutoDL 上):
+  python /root/scripts/generate_candidates.py \
       --data_dir /root/autodl-tmp/dpo_mining \
-      --config_path /root/Flow-Planner/checkpoints/config_goal.yaml \
-      --ckpt_path /root/Flow-Planner/checkpoints/model_goal.pth \
-      --vocab_path /root/Flow-Planner/goal_vocab.npy \
-      --output_dir /root/autodl-tmp/dpo_candidates_goal \
+      --config_path /root/Flow-Planner/checkpoints/config.yaml \
+      --ckpt_path /root/Flow-Planner/checkpoints/model.pth \
+      --output_dir /root/autodl-tmp/dpo_candidates \
       --num_candidates 5
 """
 
 import os
 import sys
 import glob
+import json
 import argparse
 import logging
 import time
 import torch
 import numpy as np
 
+# Add project root to path
 sys.path.insert(0, '/root/Flow-Planner')
-
-from flow_planner.dpo.config_utils import load_composed_config
-from flow_planner.goal.goal_utils import load_goal_vocab, select_diverse_goals
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +34,7 @@ def load_model(config_path, ckpt_path, device='cuda'):
     from omegaconf import OmegaConf
     from hydra.utils import instantiate
 
-    cfg = load_composed_config(config_path)
+    cfg = OmegaConf.load(config_path)
     OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)
     OmegaConf.update(cfg, "data.dataset.train.predicted_neighbor_num", 0, force_add=True)
 
@@ -59,9 +51,9 @@ def load_model(config_path, ckpt_path, device='cuda'):
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        logger.warning(f"Missing {len(missing)} keys: {missing[:5]}")
+        logger.warning(f"Missing {len(missing)} keys: {missing[:3]}")
     if unexpected:
-        logger.warning(f"Unexpected {len(unexpected)} keys: {unexpected[:5]}")
+        logger.warning(f"Unexpected {len(unexpected)} keys: {unexpected[:3]}")
 
     model = model.to(device).eval()
     logger.info(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} params")
@@ -80,7 +72,7 @@ def npz_to_datasample(npz_path, device='cuda'):
         ego_current=torch.from_numpy(data['ego_current_state']).unsqueeze(0).to(device),
         ego_future=torch.from_numpy(data['ego_agent_future']).float().unsqueeze(0).to(device),
         neighbor_past=torch.from_numpy(data['neighbor_agents_past'][:32]).unsqueeze(0).to(device),
-        neighbor_future=torch.zeros(1, 0, 80, 3, device=device),
+        neighbor_future=torch.zeros(1, 0, 80, 3, device=device),  # empty (predicted_neighbor_num=0)
         neighbor_future_observed=torch.from_numpy(data['neighbor_agents_future']).unsqueeze(0).to(device),
         lanes=torch.from_numpy(data['lanes']).unsqueeze(0).to(device),
         lanes_speedlimit=torch.from_numpy(data['lanes_speed_limit']).unsqueeze(0).to(device),
@@ -92,77 +84,47 @@ def npz_to_datasample(npz_path, device='cuda'):
     )
 
 
-def generate_candidates_with_goals(
-    model, npz_path, vocab, num_candidates=5,
-    device='cuda', use_cfg=True, cfg_weight=1.8,
-):
-    """
-    用不同的 goal point 生成 K 条候选轨迹。
-
-    Returns:
-        candidates: (K, T, D) numpy array
-        goal_labels: (K, 2) numpy array — 每条轨迹对应的 goal point
-    """
+def generate_candidates(model, npz_path, num_candidates=5, device='cuda', use_cfg=False, cfg_weight=0.0):
+    """Generate K candidate trajectories for one scenario."""
     data = npz_to_datasample(npz_path, device=device)
 
-    # 选择 K 个多样化的 goal point
-    _, goals = select_diverse_goals(vocab, n_goals=num_candidates)
-    # goals: (K, 2)
-
-    all_trajs = []
     with torch.no_grad():
-        for i in range(num_candidates):
-            gp = torch.from_numpy(goals[i:i+1]).float().to(device)  # (1, 2)
+        # use_cfg=False to get diverse trajectories
+        candidates = model(
+            data, mode='inference',
+            use_cfg=use_cfg, cfg_weight=cfg_weight,
+            num_candidates=num_candidates,
+            return_all_candidates=True,
+            bon_seed=42,
+        )
+        # candidates: (B=1, N, T, D) → (N, T, D)
+        candidates = candidates.squeeze(0).cpu().numpy()
 
-            traj = model(
-                data, mode='inference',
-                use_cfg=use_cfg, cfg_weight=cfg_weight,
-                num_candidates=1,
-                return_all_candidates=False,
-                bon_seed=42 + i,
-                goal_point=gp,
-            )
-            # Normalize model output to a single candidate trajectory (T, D).
-            traj = traj.squeeze(0)
-            if traj.ndim == 3 and traj.shape[0] == 1:
-                traj = traj.squeeze(0)
-            all_trajs.append(traj.cpu().numpy())
-
-    candidates = np.stack(all_trajs, axis=0)  # (K, T, D)
-    return candidates, goals
+    return candidates
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate DPO candidates with goal-diverse sampling"
-    )
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--config_path', type=str, required=True)
-    parser.add_argument('--ckpt_path', type=str, required=True)
-    parser.add_argument('--vocab_path', type=str, required=True,
-                        help='Path to goal_vocab.npy from Step 1')
-    parser.add_argument('--output_dir', type=str, required=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, required=True,
+                        help='Directory containing NPZ files')
+    parser.add_argument('--config_path', type=str,
+                        default='/root/Flow-Planner/checkpoints/config.yaml')
+    parser.add_argument('--ckpt_path', type=str,
+                        default='/root/Flow-Planner/checkpoints/model.pth')
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='Directory to save candidate trajectories')
     parser.add_argument('--num_candidates', type=int, default=5)
     parser.add_argument('--max_scenarios', type=int, default=None)
-    parser.add_argument('--use_cfg', action='store_true', default=True,
-                        help='Enable CFG (default: True)')
-    parser.add_argument('--no_cfg', dest='use_cfg', action='store_false',
-                        help='Disable CFG')
-    parser.add_argument('--cfg_weight', type=float, default=1.8)
+    parser.add_argument('--use_cfg', action='store_true')
+    parser.add_argument('--cfg_weight', type=float, default=2.0)
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s: %(message)s',
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s: %(message)s')
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load vocab
-    vocab = load_goal_vocab(args.vocab_path)
-    logger.info(f"Goal vocabulary: {vocab.shape[0]} clusters")
-
-    # Find NPZ files
+    # Find all NPZ files
     npz_files = sorted(glob.glob(os.path.join(args.data_dir, '*.npz')))
     if args.max_scenarios:
         npz_files = npz_files[:args.max_scenarios]
@@ -171,9 +133,10 @@ def main():
     # Load model
     model = load_model(args.config_path, args.ckpt_path)
 
-    # Generate
+    # Generate candidates
     t0 = time.time()
-    success, fail = 0, 0
+    success = 0
+    fail = 0
     for i, npz_path in enumerate(npz_files):
         fname = os.path.basename(npz_path).replace('.npz', '')
         out_path = os.path.join(args.output_dir, fname + '_candidates.npz')
@@ -183,17 +146,16 @@ def main():
             continue
 
         try:
-            candidates, goal_labels = generate_candidates_with_goals(
-                model, npz_path, vocab,
-                num_candidates=args.num_candidates,
-                use_cfg=args.use_cfg, cfg_weight=args.cfg_weight,
+            candidates = generate_candidates(
+                model, npz_path, num_candidates=args.num_candidates,
+                use_cfg=args.use_cfg, cfg_weight=args.cfg_weight
             )
 
+            # Also save the condition data for later BEV rendering
             raw = np.load(npz_path)
             np.savez_compressed(
                 out_path,
-                candidates=candidates,        # (K, T, D)
-                goal_labels=goal_labels,       # (K, 2) — 每条轨迹的 goal point
+                candidates=candidates,  # (K, T, D)
                 ego_agent_past=raw['ego_agent_past'],
                 ego_current_state=raw['ego_current_state'],
                 ego_agent_future=raw['ego_agent_future'],

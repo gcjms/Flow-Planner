@@ -8,7 +8,7 @@
 #   Step 3: Goal-diverse 候选生成
 #   Step 4: 打分 → 构建偏好对
 #   Step 5: DPO 训练
-#   Step 6: 合并 LoRA + 开环评估 + 闭环仿真
+#   Step 6: 候选多样性评估 + DPO 后模型对比
 #
 # 前提:
 #   - Step 2 已完成 (带 goal 的模型已训好)
@@ -36,13 +36,14 @@ export NUPLAN_MAPS_ROOT=/root/autodl-tmp/maps_raw/maps
 export NUPLAN_DATA_ROOT=/root/autodl-tmp/val_data/data/cache
 
 # ===================== Paths =====================
-GOAL_VOCAB=/root/Flow-Planner/goal_vocab.npy
+GOAL_VOCAB=/root/autodl-tmp/Flow-Planner/goal_vocab.npy
 CONFIG_GOAL=checkpoints/config_goal.yaml
 CKPT_GOAL=checkpoints/model_goal.pth
 SCENE_DIR=/root/autodl-tmp/dpo_mining
 CANDIDATES_DIR=/root/autodl-tmp/dpo_candidates_goal
 PREFERENCES_DIR=/root/autodl-tmp/dpo_preferences_goal
 DPO_DIR=checkpoints/dpo_goal
+DIVERSITY_EVAL_SCENES=200
 
 # ===================== Hyperparameters =====================
 N_CLUSTERS=64
@@ -180,7 +181,7 @@ echo "[Step 5] Done at $(date)" | tee -a $LOG
 # =====================================================
 # STEP 6: 评估
 # =====================================================
-echo "[Step 6] Evaluation..." | tee -a $LOG
+echo "[Step 6] Diversity-focused evaluation..." | tee -a $LOG
 
 echo "========================================" > $REPORT
 echo "  Goal + DPO Evaluation Report" >> $REPORT
@@ -194,8 +195,8 @@ echo "" >> $REPORT
 
 MERGED_CKPT=$DPO_DIR/model_dpo_merged.pth
 
-# 开环评估: 原模型 vs DPO 模型
-echo "[Open-Loop Evaluation: $MAX_EVAL_SCENES scenes]" >> $REPORT
+# 候选多样性评估: 原 goal 模型 vs DPO 后模型
+echo "[Goal Diversity Evaluation: $DIVERSITY_EVAL_SCENES scenes]" >> $REPORT
 
 for MODEL_INFO in \
     "Original:$CKPT_GOAL" \
@@ -204,11 +205,14 @@ for MODEL_INFO in \
     CKPT="${MODEL_INFO##*:}"
     if [ -f "$CKPT" ]; then
         echo "  Evaluating $NAME..." | tee -a $LOG
-        RESULT=$(python -u -m flow_planner.dpo.eval_multidim \
+        RESULT=$(python -u -m flow_planner.dpo.eval_goal_diversity \
             --ckpt_path "$CKPT" \
             --config_path $CONFIG_GOAL \
-            --scene_dir /root/autodl-tmp/hard_scenarios_v2 \
-            --max_scenes $MAX_EVAL_SCENES 2>&1 | grep -E "SUMMARY|collision|ttc|comfort|progress|route" || true)
+            --data_dir /root/autodl-tmp/hard_scenarios_v2 \
+            --vocab_path $GOAL_VOCAB \
+            --max_scenarios $DIVERSITY_EVAL_SCENES \
+            --num_candidates $NUM_CANDIDATES \
+            --cfg_weight $CFG_WEIGHT 2>&1 | grep -E "Summary|Summary|scenes_|endpoint_spread|pairwise_|score_|unique_" || true)
         echo "  $NAME:" >> $REPORT
         echo "$RESULT" >> $REPORT
         echo "" >> $REPORT
