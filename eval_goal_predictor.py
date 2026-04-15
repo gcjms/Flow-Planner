@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--planner-config", required=True)
     parser.add_argument("--planner-ckpt", required=True)
+    parser.add_argument("--goal-vocab-path", default=None)
     parser.add_argument("--predictor-ckpt", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--data-list", required=True)
@@ -45,7 +46,17 @@ def topk_hits(logits: torch.Tensor, labels: torch.Tensor, ks=(1, 3, 5)):
 
 def main() -> None:
     args = parse_args()
-    planner, cfg = load_planner(args.planner_config, args.planner_ckpt, args.device)
+    planner_config_path = args.planner_config
+    if args.goal_vocab_path:
+        from omegaconf import OmegaConf
+        from flow_planner.dpo.config_utils import load_composed_config
+
+        cfg_for_vocab = load_composed_config(args.planner_config)
+        OmegaConf.update(cfg_for_vocab, "model.goal_vocab_path", args.goal_vocab_path, force_add=True)
+        planner_config_path = args.planner_config + ".goal_predictor_eval.resolved.yaml"
+        OmegaConf.save(cfg_for_vocab, planner_config_path)
+
+    planner, cfg = load_planner(planner_config_path, args.planner_ckpt, args.device)
     checkpoint = torch.load(args.predictor_ckpt, map_location="cpu", weights_only=False)
     train_args = checkpoint.get("args", {})
     predictor = GoalPredictor(

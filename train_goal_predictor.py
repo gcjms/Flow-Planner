@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from flow_planner.data.utils.collect import collect_batch
+from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.goal_predictor import GoalPredictor
 
 
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--planner-config", required=True, help="Path to planner config yaml.")
     parser.add_argument("--planner-ckpt", required=True, help="Path to pretrained planner checkpoint.")
+    parser.add_argument("--goal-vocab-path", default=None, help="Optional override for planner goal_vocab.npy.")
     parser.add_argument("--train-data-dir", required=True)
     parser.add_argument("--train-data-list", required=True)
     parser.add_argument("--val-data-dir", default=None)
@@ -56,7 +58,7 @@ def set_seed(seed: int) -> None:
 
 
 def load_planner(cfg_path: str, ckpt_path: str, device: str):
-    cfg = OmegaConf.load(cfg_path)
+    cfg = load_composed_config(cfg_path)
     OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)
     OmegaConf.update(cfg, "data.dataset.train.predicted_neighbor_num", 0, force_add=True)
     model = instantiate(cfg.model)
@@ -79,6 +81,8 @@ def load_planner(cfg_path: str, ckpt_path: str, device: str):
 
 
 def build_dataset(cfg, data_dir: str, data_list: str, max_samples: int | None):
+    os.environ["TRAINING_DATA"] = data_dir
+    os.environ["TRAINING_JSON"] = data_list
     ds_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.dataset.train, resolve=True))
     ds_cfg.data_dir = data_dir
     ds_cfg.data_list = data_list
@@ -127,7 +131,16 @@ def main() -> None:
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    planner, cfg = load_planner(args.planner_config, args.planner_ckpt, args.device)
+    if args.goal_vocab_path:
+        cfg_for_vocab = load_composed_config(args.planner_config)
+        OmegaConf.update(cfg_for_vocab, "model.goal_vocab_path", args.goal_vocab_path, force_add=True)
+        tmp_cfg_path = Path(args.save_dir) / "planner_config_resolved.yaml"
+        OmegaConf.save(cfg_for_vocab, tmp_cfg_path)
+        planner_config_path = str(tmp_cfg_path)
+    else:
+        planner_config_path = args.planner_config
+
+    planner, cfg = load_planner(planner_config_path, args.planner_ckpt, args.device)
     model = GoalPredictor(
         planner_backbone=planner,
         hidden_dim=args.hidden_dim,
@@ -229,7 +242,7 @@ def main() -> None:
             "scheduler": scheduler.state_dict(),
             "history": history,
             "args": vars(args),
-            "planner_config": args.planner_config,
+            "planner_config": planner_config_path,
             "planner_ckpt": args.planner_ckpt,
         }
         torch.save(payload, latest_path)
