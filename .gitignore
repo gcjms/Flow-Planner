@@ -49,3 +49,7 @@ dpo_data/
 
 # External reference repos (read-only, never push)
 ai_planning-master*/
+
+# Local experiment artifacts
+outputs/
+goal_clusters_visualization.png
