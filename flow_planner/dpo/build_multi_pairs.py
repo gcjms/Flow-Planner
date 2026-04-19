@@ -393,6 +393,9 @@ def main() -> None:
     scenario_ids: List[str] = []
     dim_labels: List[str] = []
     score_gaps: List[float] = []
+    chosen_goals: List[np.ndarray] = []
+    rejected_goals: List[np.ndarray] = []
+    has_pair_goals = True
     meta_records: List[Dict[str, object]] = []
     pair_type_counts: Counter[str] = Counter()
     dim_label_counts: Counter[str] = Counter()
@@ -424,6 +427,16 @@ def main() -> None:
             meta_records.append(record)
             dim_labels.append(str(record["dim_label"]))
             score_gaps.append(float(record["score_gap"]))
+            chosen_goal = record["goal_labels"]["chosen"]
+            rejected_goal = record["goal_labels"]["rejected"]
+            if chosen_goal is None or rejected_goal is None:
+                has_pair_goals = False
+            chosen_goals.append(
+                np.asarray(chosen_goal if chosen_goal is not None else [np.nan, np.nan], dtype=np.float32)
+            )
+            rejected_goals.append(
+                np.asarray(rejected_goal if rejected_goal is not None else [np.nan, np.nan], dtype=np.float32)
+            )
             pair_type_counts.update([str(record["pair_type"])])
             dim_label_counts.update([str(record["dim_label"])])
             pair_id += 1
@@ -431,14 +444,18 @@ def main() -> None:
     if not chosen_rows:
         raise RuntimeError("No multi-pairs were generated. Check score gaps and scene quality.")
 
-    np.savez_compressed(
-        args.output_path,
-        chosen=np.array(chosen_rows),
-        rejected=np.array(rejected_rows),
-        scenario_ids=np.array(scenario_ids),
-        dim_labels=np.array(dim_labels),
-        score_gaps=np.array(score_gaps, dtype=np.float32),
-    )
+    payload = {
+        "chosen": np.array(chosen_rows),
+        "rejected": np.array(rejected_rows),
+        "scenario_ids": np.array(scenario_ids),
+        "dim_labels": np.array(dim_labels),
+        "score_gaps": np.array(score_gaps, dtype=np.float32),
+    }
+    if has_pair_goals:
+        payload["chosen_goals"] = np.stack(chosen_goals).astype(np.float32)
+        payload["rejected_goals"] = np.stack(rejected_goals).astype(np.float32)
+
+    np.savez_compressed(args.output_path, **payload)
 
     with open(meta_path, "w", encoding="utf-8") as fp:
         for record in meta_records:

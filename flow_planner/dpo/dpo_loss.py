@@ -159,7 +159,8 @@ class FlowMatchingDPOLoss(nn.Module):
         ref_model: nn.Module,
         chosen: torch.Tensor,
         rejected: torch.Tensor,
-        encoder_outputs: dict,
+        chosen_encoder_outputs: dict,
+        rejected_encoder_outputs: dict,
         action_len: int,
         action_overlap: int,
         data_processor=None,
@@ -170,21 +171,21 @@ class FlowMatchingDPOLoss(nn.Module):
         K = self.num_t_samples
 
         log_pi_w = self.compute_log_prob_multi_t(
-            model, chosen, encoder_outputs,
+            model, chosen, chosen_encoder_outputs,
             action_len, action_overlap, data_processor, K
         )
         log_pi_l = self.compute_log_prob_multi_t(
-            model, rejected, encoder_outputs,
+            model, rejected, rejected_encoder_outputs,
             action_len, action_overlap, data_processor, K
         )
 
         with torch.no_grad():
             log_ref_w = self.compute_log_prob_multi_t(
-                ref_model, chosen, encoder_outputs,
+                ref_model, chosen, chosen_encoder_outputs,
                 action_len, action_overlap, data_processor, K
             )
             log_ref_l = self.compute_log_prob_multi_t(
-                ref_model, rejected, encoder_outputs,
+                ref_model, rejected, rejected_encoder_outputs,
                 action_len, action_overlap, data_processor, K
             )
 
@@ -224,7 +225,8 @@ class FlowMatchingDPOLoss(nn.Module):
         ref_model: nn.Module,
         chosen: torch.Tensor,
         rejected: torch.Tensor,
-        encoder_outputs: dict,
+        chosen_encoder_outputs: dict,
+        rejected_encoder_outputs: dict,
         action_len: int,
         action_overlap: int,
         data_processor=None,
@@ -243,7 +245,8 @@ class FlowMatchingDPOLoss(nn.Module):
             ref_model=ref_model,
             chosen=chosen,
             rejected=rejected,
-            encoder_outputs=encoder_outputs,
+            chosen_encoder_outputs=chosen_encoder_outputs,
+            rejected_encoder_outputs=rejected_encoder_outputs,
             action_len=action_len,
             action_overlap=action_overlap,
             data_processor=data_processor,

@@ -46,6 +46,18 @@ from flow_planner.dpo.lora import (
 logger = logging.getLogger(__name__)
 
 
+def _clone_decoder_inputs(decoder_inputs: dict) -> dict:
+    cloned = {}
+    for key, value in decoder_inputs.items():
+        if isinstance(value, torch.Tensor):
+            cloned[key] = value
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+        else:
+            cloned[key] = value
+    return cloned
+
+
 def _component_grad_norm(loss: torch.Tensor, params: List[torch.nn.Parameter]) -> float:
     """Measure how strongly one loss component pushes the trainable LoRA params."""
     grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
@@ -90,6 +102,11 @@ class PreferenceDataset(Dataset):
         self.rejected_all = data['rejected']   # (N, T, D)
         self.scenario_ids = list(data['scenario_ids'])
         self.n_pairs = len(self.chosen_all)
+        self.score_gaps = (
+            np.asarray(data['score_gaps'], dtype=np.float32)
+            if 'score_gaps' in data
+            else np.zeros((self.n_pairs,), dtype=np.float32)
+        )
 
         # Dimension labels for multi-objective pairs (absent in single-objective)
         if 'dim_labels' in data:
@@ -102,6 +119,15 @@ class PreferenceDataset(Dataset):
                 "Preference file has no dim_labels; marking all pairs as 'legacy_unlabeled'. "
                 "Per-dimension training stats will not be meaningful."
             )
+
+        if 'chosen_goals' in data and 'rejected_goals' in data:
+            self.chosen_goals = np.asarray(data['chosen_goals'], dtype=np.float32)
+            self.rejected_goals = np.asarray(data['rejected_goals'], dtype=np.float32)
+            logger.info("Loaded pair-specific chosen/rejected goals for goal-conditioned DPO.")
+        else:
+            self.chosen_goals = None
+            self.rejected_goals = None
+            logger.info("Preference file has no pair-specific goals; DPO train will stay goal-free.")
 
         if max_pairs is not None:
             self.n_pairs = min(self.n_pairs, max_pairs)
@@ -156,13 +182,26 @@ class PreferenceDataset(Dataset):
                 }
 
         dim_label = self.dim_labels[idx] if idx < len(self.dim_labels) else 'legacy_unlabeled'
+        score_gap = float(self.score_gaps[idx]) if idx < len(self.score_gaps) else 0.0
+        chosen_goal = None
+        rejected_goal = None
+        if self.chosen_goals is not None and idx < len(self.chosen_goals):
+            chosen_goal_np = np.asarray(self.chosen_goals[idx], dtype=np.float32)
+            if np.isfinite(chosen_goal_np).all():
+                chosen_goal = torch.from_numpy(chosen_goal_np).float()
+        if self.rejected_goals is not None and idx < len(self.rejected_goals):
+            rejected_goal_np = np.asarray(self.rejected_goals[idx], dtype=np.float32)
+            if np.isfinite(rejected_goal_np).all():
+                rejected_goal = torch.from_numpy(rejected_goal_np).float()
 
         return {
             'chosen': chosen,
             'rejected': rejected,
             'condition': condition,
-            'score_gap': 0.0,
+            'score_gap': score_gap,
             'dim_label': dim_label,
+            'chosen_goal': chosen_goal,
+            'rejected_goal': rejected_goal,
         }
 
 
@@ -174,6 +213,12 @@ def collate_preferences(batch: List[dict]) -> dict:
     rejected = torch.stack([item['rejected'] for item in batch])   # (B, T, D)
     score_gaps = torch.tensor([item['score_gap'] for item in batch])
     dim_labels = [item.get('dim_label', 'legacy_unlabeled') for item in batch]
+    chosen_goals = None
+    rejected_goals = None
+    if all(item.get('chosen_goal') is not None for item in batch):
+        chosen_goals = torch.stack([item['chosen_goal'] for item in batch])
+    if all(item.get('rejected_goal') is not None for item in batch):
+        rejected_goals = torch.stack([item['rejected_goal'] for item in batch])
 
     conditions = {}
     keys = batch[0]['condition'].keys()
@@ -193,6 +238,8 @@ def collate_preferences(batch: List[dict]) -> dict:
         'condition': conditions,
         'score_gap': score_gaps,
         'dim_labels': dim_labels,
+        'chosen_goals': chosen_goals,
+        'rejected_goals': rejected_goals,
     }
 
 
@@ -309,6 +356,18 @@ def prepare_encoder_outputs(
     decoder_inputs = model.extract_decoder_inputs(encoder_outputs, inputs)
 
     return decoder_inputs
+
+
+def attach_goal_to_decoder_inputs(
+    decoder_inputs: dict,
+    goal_point: Optional[torch.Tensor],
+    device: str = 'cuda',
+) -> dict:
+    conditioned_inputs = _clone_decoder_inputs(decoder_inputs)
+    if goal_point is None:
+        return conditioned_inputs
+    conditioned_inputs['goal_point'] = goal_point.to(device).float()
+    return conditioned_inputs
 
 
 # ==============================================================
@@ -467,12 +526,20 @@ def train_dpo(args):
             chosen = batch['chosen'].to(device)      # (B, T, D)
             rejected = batch['rejected'].to(device)   # (B, T, D)
             condition = batch['condition']
+            chosen_goals = batch.get('chosen_goals')
+            rejected_goals = batch.get('rejected_goals')
             batch_dim_labels = batch.get('dim_labels', ['legacy_unlabeled'] * chosen.shape[0])
 
             # Encoder 前向（共享，不计算梯度）
             with torch.no_grad():
                 encoder_outputs = prepare_encoder_outputs(
                     policy_model, condition, device
+                )
+                chosen_encoder_outputs = attach_goal_to_decoder_inputs(
+                    encoder_outputs, chosen_goals, device
+                )
+                rejected_encoder_outputs = attach_goal_to_decoder_inputs(
+                    encoder_outputs, rejected_goals, device
                 )
 
             # Per-sample weights from dimension labels
@@ -487,7 +554,8 @@ def train_dpo(args):
                 ref_model=ref_model,
                 chosen=chosen,
                 rejected=rejected,
-                encoder_outputs=encoder_outputs,
+                chosen_encoder_outputs=chosen_encoder_outputs,
+                rejected_encoder_outputs=rejected_encoder_outputs,
                 action_len=action_len,
                 action_overlap=action_overlap,
                 data_processor=policy_model.data_processor,
