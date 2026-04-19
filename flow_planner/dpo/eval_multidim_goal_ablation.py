@@ -39,6 +39,24 @@ def main():
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--scene_dir", type=str, required=True)
     parser.add_argument(
+        "--scene_manifest",
+        type=str,
+        default=None,
+        help="Optional .txt/.json manifest listing which scene files to evaluate.",
+    )
+    parser.add_argument(
+        "--write_scene_manifest",
+        type=str,
+        default=None,
+        help="Optional output .txt/.json path to save the resolved scene list.",
+    )
+    parser.add_argument(
+        "--manifest_seed",
+        type=int,
+        default=None,
+        help="If set and no manifest is provided, sample max_scenes deterministically with this seed.",
+    )
+    parser.add_argument(
         "--goal_mode",
         type=str,
         choices=("none", "route_goal", "predicted_goal"),
@@ -141,6 +159,9 @@ def main():
         goal_mode=args.goal_mode,
         goal_vocab=goal_vocab,
         goal_predictor=goal_predictor,
+        scene_manifest=args.scene_manifest,
+        manifest_seed=args.manifest_seed,
+        scene_manifest_out=args.write_scene_manifest,
     )
     log_summary(summary, ckpt_path=args.ckpt_path)
 
@@ -153,6 +174,9 @@ def main():
                 "ckpt_path": args.ckpt_path,
                 "config_path": args.config_path,
                 "scene_dir": args.scene_dir,
+                "scene_manifest": args.scene_manifest,
+                "write_scene_manifest": args.write_scene_manifest,
+                "manifest_seed": args.manifest_seed,
                 "goal_mode": args.goal_mode,
                 "goal_vocab_path": args.goal_vocab_path,
                 "goal_predictor_ckpt": args.goal_predictor_ckpt,

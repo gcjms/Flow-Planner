@@ -24,6 +24,7 @@ import copy
 import time
 import logging
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -43,6 +44,22 @@ from flow_planner.dpo.lora import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _component_grad_norm(loss: torch.Tensor, params: List[torch.nn.Parameter]) -> float:
+    """Measure how strongly one loss component pushes the trainable LoRA params."""
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    total = torch.zeros((), device=loss.device)
+    for grad in grads:
+        if grad is not None:
+            total = total + grad.detach().pow(2).sum()
+    return float(torch.sqrt(total).item())
+
+
+def _ema_update(previous: Optional[float], value: float, decay: float) -> float:
+    if previous is None:
+        return float(value)
+    return float(decay * previous + (1.0 - decay) * value)
 
 
 # ==============================================================
@@ -80,7 +97,11 @@ class PreferenceDataset(Dataset):
             unique, counts = np.unique(self.dim_labels, return_counts=True)
             logger.info(f"Multi-objective pairs: {dict(zip(unique, counts))}")
         else:
-            self.dim_labels = ['collision'] * self.n_pairs
+            self.dim_labels = ['legacy_unlabeled'] * self.n_pairs
+            logger.warning(
+                "Preference file has no dim_labels; marking all pairs as 'legacy_unlabeled'. "
+                "Per-dimension training stats will not be meaningful."
+            )
 
         if max_pairs is not None:
             self.n_pairs = min(self.n_pairs, max_pairs)
@@ -134,7 +155,7 @@ class PreferenceDataset(Dataset):
                     'ego_current': torch.from_numpy(scene['ego_current_state']).float(),
                 }
 
-        dim_label = self.dim_labels[idx] if idx < len(self.dim_labels) else 'collision'
+        dim_label = self.dim_labels[idx] if idx < len(self.dim_labels) else 'legacy_unlabeled'
 
         return {
             'chosen': chosen,
@@ -152,7 +173,7 @@ def collate_preferences(batch: List[dict]) -> dict:
     chosen = torch.stack([item['chosen'] for item in batch])       # (B, T, D)
     rejected = torch.stack([item['rejected'] for item in batch])   # (B, T, D)
     score_gaps = torch.tensor([item['score_gap'] for item in batch])
-    dim_labels = [item.get('dim_label', 'collision') for item in batch]
+    dim_labels = [item.get('dim_label', 'legacy_unlabeled') for item in batch]
 
     conditions = {}
     keys = batch[0]['condition'].keys()
@@ -424,6 +445,8 @@ def train_dpo(args):
     global_step = 0
     best_accuracy = 0.0
     start_time = time.time()
+    ema_grad_dpo = None
+    ema_grad_sft = None
 
     for epoch in range(args.epochs):
         policy_model.train()
@@ -444,7 +467,7 @@ def train_dpo(args):
             chosen = batch['chosen'].to(device)      # (B, T, D)
             rejected = batch['rejected'].to(device)   # (B, T, D)
             condition = batch['condition']
-            batch_dim_labels = batch.get('dim_labels', ['collision'] * chosen.shape[0])
+            batch_dim_labels = batch.get('dim_labels', ['legacy_unlabeled'] * chosen.shape[0])
 
             # Encoder 前向（共享，不计算梯度）
             with torch.no_grad():
@@ -459,7 +482,7 @@ def train_dpo(args):
                 sample_weights = torch.tensor(sw, dtype=torch.float32)
 
             # DPO Loss
-            loss, metrics = dpo_loss_fn(
+            dpo_loss_only, sft_loss_only, metrics = dpo_loss_fn.compute_loss_components(
                 model=policy_model,
                 ref_model=ref_model,
                 chosen=chosen,
@@ -470,6 +493,76 @@ def train_dpo(args):
                 data_processor=policy_model.data_processor,
                 sample_weights=sample_weights,
             )
+            need_component_grads = (
+                args.adaptive_dpo_ratio_target > 0.0
+                or (
+                    args.log_component_grad_every > 0
+                    and (global_step + 1) % args.log_component_grad_every == 0
+                )
+            )
+            grad_norm_dpo = math.nan
+            grad_norm_sft = math.nan
+            lambda_dpo = 1.0
+
+            if need_component_grads:
+                grad_norm_dpo = _component_grad_norm(dpo_loss_only, lora_params)
+                grad_norm_sft = _component_grad_norm(sft_loss_only, lora_params)
+                metrics['dpo/grad_norm_dpo_only'] = grad_norm_dpo
+                metrics['dpo/grad_norm_sft_only'] = grad_norm_sft
+                if grad_norm_sft > 0:
+                    metrics['dpo/grad_norm_ratio_dpo_to_sft'] = grad_norm_dpo / grad_norm_sft
+
+            if args.adaptive_dpo_ratio_target > 0.0:
+                effective_sft_grad = dpo_loss_fn.sft_weight * grad_norm_sft
+                ema_grad_dpo = _ema_update(
+                    ema_grad_dpo,
+                    grad_norm_dpo,
+                    args.adaptive_dpo_ema_decay,
+                )
+                ema_grad_sft = _ema_update(
+                    ema_grad_sft,
+                    effective_sft_grad,
+                    args.adaptive_dpo_ema_decay,
+                )
+                raw_lambda_dpo = (
+                    args.adaptive_dpo_ratio_target
+                    * ema_grad_sft
+                    / max(ema_grad_dpo, args.adaptive_dpo_eps)
+                )
+                lambda_dpo = float(
+                    np.clip(
+                        raw_lambda_dpo,
+                        args.adaptive_dpo_min,
+                        args.adaptive_dpo_max,
+                    )
+                )
+                metrics['dpo/lambda_dpo'] = lambda_dpo
+                metrics['dpo/raw_lambda_dpo'] = raw_lambda_dpo
+                metrics['dpo/ema_grad_norm_dpo_only'] = ema_grad_dpo
+                metrics['dpo/ema_grad_norm_sft_effective'] = ema_grad_sft
+                metrics['dpo/adaptive_ratio_target'] = args.adaptive_dpo_ratio_target
+
+            loss = lambda_dpo * dpo_loss_only + dpo_loss_fn.sft_weight * sft_loss_only
+            metrics['dpo/loss'] = loss.item()
+            metrics['dpo/effective_loss_dpo'] = float(lambda_dpo * dpo_loss_only.item())
+            metrics['dpo/effective_loss_sft'] = float(dpo_loss_fn.sft_weight * sft_loss_only.item())
+
+            if args.log_component_grad_every > 0 and (global_step + 1) % args.log_component_grad_every == 0:
+                logger.info(
+                    "Step %d grad probe | L_dpo=%.4f | L_sft=%.4f | lambda_dpo=%.4f | "
+                    "grad_dpo=%.4f | grad_sft=%.4f%s",
+                    global_step + 1,
+                    metrics['dpo/loss_dpo_only'],
+                    metrics['dpo/loss_sft'],
+                    lambda_dpo,
+                    grad_norm_dpo,
+                    grad_norm_sft,
+                    (
+                        f" | ratio={metrics['dpo/grad_norm_ratio_dpo_to_sft']:.3f}"
+                        if grad_norm_sft > 0 and 'dpo/grad_norm_ratio_dpo_to_sft' in metrics
+                        else ""
+                    ),
+                )
 
             # 反向传播
             optimizer.zero_grad()
@@ -651,6 +744,16 @@ def parse_args():
                         help='DPO temperature')
     parser.add_argument('--sft_weight', type=float, default=0.1,
                         help='Weight for the SFT loss term (prevent forgetting)')
+    parser.add_argument('--adaptive_dpo_ratio_target', type=float, default=0.0,
+                        help='If >0, adaptively scale lambda_dpo so its grad norm tracks this fraction of the effective SFT grad norm')
+    parser.add_argument('--adaptive_dpo_ema_decay', type=float, default=0.9,
+                        help='EMA decay for adaptive DPO grad-norm tracking')
+    parser.add_argument('--adaptive_dpo_min', type=float, default=0.01,
+                        help='Minimum lambda_dpo when adaptive scaling is enabled')
+    parser.add_argument('--adaptive_dpo_max', type=float, default=5.0,
+                        help='Maximum lambda_dpo when adaptive scaling is enabled')
+    parser.add_argument('--adaptive_dpo_eps', type=float, default=1e-8,
+                        help='Numerical epsilon for adaptive lambda_dpo computation')
     parser.add_argument('--num_t_samples', type=int, default=16,
                         help='Number of timestep samples for log_prob estimation (higher=more stable, slower)')
     parser.add_argument('--dim_weights', type=str, default=None,
@@ -668,6 +771,8 @@ def parse_args():
     # 日志
     parser.add_argument('--log_every', type=int, default=10,
                         help='Log to TensorBoard every N steps')
+    parser.add_argument('--log_component_grad_every', type=int, default=0,
+                        help='If >0, log separate DPO/SFT grad norms every N steps')
     parser.add_argument('--save_merged', action='store_true',
                         help='Save merged model after training')
 

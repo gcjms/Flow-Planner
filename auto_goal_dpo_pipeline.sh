@@ -42,6 +42,8 @@ CKPT_GOAL=checkpoints/model_goal.pth
 SCENE_DIR=/root/autodl-tmp/dpo_mining
 CANDIDATES_DIR=/root/autodl-tmp/dpo_candidates_goal
 PREFERENCES_DIR=/root/autodl-tmp/dpo_preferences_goal
+SCORED_DIR=$PREFERENCES_DIR/scored_dir
+PREF_META=$PREFERENCES_DIR/preferences_multi_meta.jsonl
 DPO_DIR=checkpoints/dpo_goal
 DIVERSITY_EVAL_SCENES=200
 
@@ -128,23 +130,37 @@ fi
 # =====================================================
 # STEP 4: 打分 → 构建偏好对
 # =====================================================
-echo "[Step 4] Scoring candidates and building preference pairs..." | tee -a $LOG
+echo "[Step 4] Structured scoring candidates and building multi-pair preferences..." | tee -a $LOG
 
 python -u -m flow_planner.dpo.score_hybrid \
     --candidates_dir $CANDIDATES_DIR \
     --output_dir $PREFERENCES_DIR \
+    --scored_dir $SCORED_DIR \
+    --use_structured_scores \
+    --emit_traj_info \
     --skip_vlm \
     --spread_threshold $SPREAD_THRESHOLD \
     2>&1 | tee -a $LOG
 
-PREF_FILE=$PREFERENCES_DIR/preferences.npz
+python -u -m flow_planner.dpo.build_multi_pairs \
+    --scored_dir $SCORED_DIR \
+    --candidates_dir $CANDIDATES_DIR \
+    --output_path $PREFERENCES_DIR/preferences_multi.npz \
+    --meta_path $PREF_META \
+    --top_good_per_cluster 1 \
+    --subtle_bad_per_good 2 \
+    2>&1 | tee -a $LOG
+
+PREF_FILE=$PREFERENCES_DIR/preferences_multi.npz
 if [ ! -f "$PREF_FILE" ]; then
-    echo "[Step 4] FAILED: No preferences generated!" | tee -a $LOG
+    echo "[Step 4] FAILED: No structured multi-pair preferences generated!" | tee -a $LOG
     exit 1
 fi
 
 N_PAIRS=$(python -c "import numpy as np; d=np.load('$PREF_FILE', allow_pickle=True); print(d['chosen'].shape[0])")
-echo "[Step 4] Built $N_PAIRS preference pairs" | tee -a $LOG
+DIM_COUNTS=$(python -c "import numpy as np; d=np.load('$PREF_FILE', allow_pickle=True); u,c=np.unique(d['dim_labels'], return_counts=True); print(dict(zip([str(x) for x in u], [int(x) for x in c])))")
+echo "[Step 4] Built $N_PAIRS structured preference pairs" | tee -a $LOG
+echo "[Step 4] Dimension mix: $DIM_COUNTS" | tee -a $LOG
 echo "[Step 4] Done at $(date)" | tee -a $LOG
 
 if [ "$N_PAIRS" -lt 20 ]; then

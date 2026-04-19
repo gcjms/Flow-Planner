@@ -19,6 +19,76 @@ from flow_planner.goal.goal_utils import load_goal_vocab, select_goal_from_route
 logger = logging.getLogger(__name__)
 
 
+def _read_scene_manifest(scene_manifest: str) -> List[str]:
+    manifest_path = Path(scene_manifest)
+    text = manifest_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if manifest_path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        if not isinstance(payload, list):
+            raise ValueError(f"Scene manifest JSON must be a list, got {type(payload)!r}")
+        return [str(item) for item in payload]
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _write_scene_manifest(scene_manifest_out: str, scene_files: List[str], scene_dir: str) -> None:
+    manifest_path = Path(scene_manifest_out)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    rel_paths = [os.path.relpath(scene_file, scene_dir) for scene_file in scene_files]
+    if manifest_path.suffix.lower() == ".json":
+        manifest_path.write_text(
+            json.dumps(rel_paths, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        manifest_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
+    logger.info("Saved scene manifest to %s", manifest_path)
+
+
+def resolve_scene_files(
+    scene_dir: str,
+    max_scenes: int = 500,
+    scene_manifest: Optional[str] = None,
+    manifest_seed: Optional[int] = None,
+    scene_manifest_out: Optional[str] = None,
+) -> List[str]:
+    all_scene_files = sorted(glob.glob(os.path.join(scene_dir, "*.npz")))
+    if scene_manifest:
+        manifest_entries = _read_scene_manifest(scene_manifest)
+        scene_files: List[str] = []
+        missing_entries: List[str] = []
+        for entry in manifest_entries:
+            scene_file = entry if os.path.isabs(entry) else os.path.join(scene_dir, entry)
+            if os.path.exists(scene_file):
+                scene_files.append(scene_file)
+            else:
+                missing_entries.append(entry)
+        if missing_entries:
+            raise FileNotFoundError(
+                f"{len(missing_entries)} scene manifest entries are missing. "
+                f"First few: {missing_entries[:5]}"
+            )
+        if max_scenes:
+            scene_files = scene_files[:max_scenes]
+        logger.info("Loaded %d scenes from manifest %s", len(scene_files), scene_manifest)
+        return scene_files
+
+    scene_files = all_scene_files
+    if max_scenes and len(scene_files) > max_scenes:
+        if manifest_seed is None:
+            scene_files = scene_files[:max_scenes]
+        else:
+            rng = np.random.default_rng(manifest_seed)
+            selected_idx = np.sort(rng.choice(len(scene_files), size=max_scenes, replace=False))
+            scene_files = [scene_files[int(idx)] for idx in selected_idx]
+
+    if scene_manifest_out:
+        _write_scene_manifest(scene_manifest_out, scene_files, scene_dir)
+
+    return scene_files
+
+
 def _ensure_device_available(device: str) -> None:
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"Requested device '{device}' but CUDA is not available")
@@ -387,10 +457,17 @@ def run_multidim_evaluation(
     goal_mode: str = "none",
     goal_vocab: Optional[np.ndarray] = None,
     goal_predictor: Optional[GoalPredictor] = None,
+    scene_manifest: Optional[str] = None,
+    manifest_seed: Optional[int] = None,
+    scene_manifest_out: Optional[str] = None,
 ) -> Tuple[Dict[str, float], List[Dict[str, str]]]:
-    scene_files = sorted(glob.glob(os.path.join(scene_dir, "*.npz")))
-    if max_scenes:
-        scene_files = scene_files[:max_scenes]
+    scene_files = resolve_scene_files(
+        scene_dir=scene_dir,
+        max_scenes=max_scenes,
+        scene_manifest=scene_manifest,
+        manifest_seed=manifest_seed,
+        scene_manifest_out=scene_manifest_out,
+    )
     logger.info("Evaluating %d scenes from %s", len(scene_files), scene_dir)
 
     metrics = {

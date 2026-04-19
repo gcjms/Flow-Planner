@@ -153,7 +153,7 @@ class FlowMatchingDPOLoss(nn.Module):
         # 平均 K 个采样的 log_prob
         return torch.stack(log_probs, dim=0).mean(dim=0)  # (B,)
 
-    def forward(
+    def compute_loss_components(
         self,
         model: nn.Module,
         ref_model: nn.Module,
@@ -164,15 +164,8 @@ class FlowMatchingDPOLoss(nn.Module):
         action_overlap: int,
         data_processor=None,
         sample_weights: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        计算 DPO Loss（多时间步采样版本）。
-
-        Args:
-            sample_weights: (B,) optional per-sample weights for multi-objective DPO.
-                           Allows weighting TTC pairs higher than comfort pairs, etc.
-                           If None, all samples weighted equally.
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the DPO and SFT loss components before combining them."""
         B = chosen.shape[0]
         K = self.num_t_samples
 
@@ -223,4 +216,38 @@ class FlowMatchingDPOLoss(nn.Module):
             "dpo/log_pi_rejected": log_pi_l.mean().item(),
         }
 
+        return dpo_loss, sft_loss, metrics
+
+    def forward(
+        self,
+        model: nn.Module,
+        ref_model: nn.Module,
+        chosen: torch.Tensor,
+        rejected: torch.Tensor,
+        encoder_outputs: dict,
+        action_len: int,
+        action_overlap: int,
+        data_processor=None,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        计算 DPO Loss（多时间步采样版本）。
+
+        Args:
+            sample_weights: (B,) optional per-sample weights for multi-objective DPO.
+                           Allows weighting TTC pairs higher than comfort pairs, etc.
+                           If None, all samples weighted equally.
+        """
+        dpo_loss, sft_loss, metrics = self.compute_loss_components(
+            model=model,
+            ref_model=ref_model,
+            chosen=chosen,
+            rejected=rejected,
+            encoder_outputs=encoder_outputs,
+            action_len=action_len,
+            action_overlap=action_overlap,
+            data_processor=data_processor,
+            sample_weights=sample_weights,
+        )
+        loss = dpo_loss + self.sft_weight * sft_loss
         return loss, metrics

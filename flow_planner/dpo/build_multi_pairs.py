@@ -28,6 +28,7 @@ from flow_planner.dpo.analyze_candidate_modes import ensure_candidates_shape
 
 SOFT_FAILURES = {"progress", "comfort", "route", "semantic", "legality"}
 SCORE_DIMS = ("margin", "progress", "comfort", "route", "legality", "semantic")
+GOOD_SOFT_FAILURES = {"comfort"}
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,41 @@ def _dim_label_from_failure(failure_type: str) -> str:
     return mapping.get(failure, "collision")
 
 
+def _dim_label_from_score_drops(score_drops: Dict[str, float]) -> str:
+    dim_candidates = {
+        "collision": float(score_drops.get("margin", 0.0)),
+        "progress": float(score_drops.get("progress", 0.0)),
+        "comfort": float(score_drops.get("comfort", 0.0)),
+        "route": max(
+            float(score_drops.get("route", 0.0)),
+            float(score_drops.get("legality", 0.0)),
+        ),
+        "semantic": float(score_drops.get("semantic", 0.0)),
+    }
+    best_label, best_value = max(
+        dim_candidates.items(),
+        key=lambda item: (item[1], item[0]),
+    )
+    if best_value > 0.0:
+        return best_label
+    return "comfort"
+
+
+def _pair_dim_label(
+    chosen: Dict[str, object],
+    rejected: Dict[str, object],
+    failure_type: str,
+    score_drops: Dict[str, float],
+) -> str:
+    # For hard failures, keep the explicit failure semantics.
+    if not rejected.get("hard_ok", False):
+        return _dim_label_from_failure(failure_type)
+
+    # For soft failures, use the dominant relative score drop instead of the
+    # rejected candidate's coarse primary_failure, which is often just "comfort".
+    return _dim_label_from_score_drops(score_drops)
+
+
 def _pair_type(chosen: Dict[str, object], rejected: Dict[str, object]) -> str:
     if int(chosen.get("cluster_id", -1)) == int(rejected.get("cluster_id", -2)):
         if rejected.get("hard_ok", False):
@@ -131,7 +167,8 @@ def _is_good_representative(candidate: Dict[str, object], config: PairMiningConf
         return False
     if not config.strict_pair_mining:
         return True
-    if _primary_failure(candidate) != "none":
+    primary_failure = _primary_failure(candidate)
+    if primary_failure not in {"none"} | GOOD_SOFT_FAILURES:
         return False
     return float(candidate.get("total_score", 0.0)) >= config.min_good_total_score
 
@@ -275,6 +312,12 @@ def _meta_record(
     score_gap = _candidate_score_gap(chosen, rejected)
     failure_type = str(rejected.get("primary_failure", "collision"))
     score_drops = _score_drops(chosen, rejected)
+    dim_label = _pair_dim_label(
+        chosen=chosen,
+        rejected=rejected,
+        failure_type=failure_type,
+        score_drops=score_drops,
+    )
 
     chosen_goal = None
     rejected_goal = None
@@ -294,7 +337,7 @@ def _meta_record(
         "pair_type": _pair_type(chosen, rejected),
         "score_gap": score_gap,
         "failure_type": failure_type,
-        "dim_label": _dim_label_from_failure(failure_type),
+        "dim_label": dim_label,
         "score_drops": score_drops,
         "goal_labels": {
             "chosen": chosen_goal,
@@ -349,8 +392,10 @@ def main() -> None:
     rejected_rows: List[np.ndarray] = []
     scenario_ids: List[str] = []
     dim_labels: List[str] = []
+    score_gaps: List[float] = []
     meta_records: List[Dict[str, object]] = []
     pair_type_counts: Counter[str] = Counter()
+    dim_label_counts: Counter[str] = Counter()
 
     pair_id = 0
     for scored_file in scored_files:
@@ -378,7 +423,9 @@ def main() -> None:
             )
             meta_records.append(record)
             dim_labels.append(str(record["dim_label"]))
+            score_gaps.append(float(record["score_gap"]))
             pair_type_counts.update([str(record["pair_type"])])
+            dim_label_counts.update([str(record["dim_label"])])
             pair_id += 1
 
     if not chosen_rows:
@@ -390,6 +437,7 @@ def main() -> None:
         rejected=np.array(rejected_rows),
         scenario_ids=np.array(scenario_ids),
         dim_labels=np.array(dim_labels),
+        score_gaps=np.array(score_gaps, dtype=np.float32),
     )
 
     with open(meta_path, "w", encoding="utf-8") as fp:
@@ -401,6 +449,7 @@ def main() -> None:
     print(f"Saved pair metadata to {meta_path}")
     print(f"Strict pair mining: {mining_config.strict_pair_mining}")
     print(f"Pair type counts: {dict(sorted(pair_type_counts.items()))}")
+    print(f"Dim label counts: {dict(sorted(dim_label_counts.items()))}")
     print("=" * 60)
 
 

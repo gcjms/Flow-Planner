@@ -53,3 +53,4 @@ ai_planning-master*/
 # Local experiment artifacts
 outputs/
 goal_clusters_visualization.png
+artifacts/

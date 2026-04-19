@@ -37,6 +37,23 @@ STRUCTURED_SCORE_WEIGHTS = {
 }
 
 
+def _dim_label_from_failure(failure_type: str) -> str:
+    """Map structured failure tags to train-time dim labels."""
+    failure = (failure_type or "collision").lower()
+    mapping = {
+        "collision": "collision",
+        "off_lane": "route",
+        "reverse": "route",
+        "progress": "progress",
+        "comfort": "comfort",
+        "route": "route",
+        "legality": "route",
+        "semantic": "semantic",
+        "none": "collision",
+    }
+    return mapping.get(failure, "collision")
+
+
 def _extrapolate_neighbor_future(
     neighbor_past: np.ndarray,
     future_steps: int,
@@ -844,6 +861,21 @@ def main() -> None:
                 "reason": result["reason"],
                 "method": result["method"],
                 "lateral_spread": spreads.get(npz_str, 0.0),
+                "dim_label": (
+                    _dim_label_from_failure(
+                        result["traj_infos"][result["rejected_idx"]]["primary_failure"]
+                    )
+                    if "traj_infos" in result
+                    else "legacy_rule"
+                ),
+                "score_gap": (
+                    float(
+                        result["traj_infos"][result["chosen_idx"]]["total_score"]
+                        - result["traj_infos"][result["rejected_idx"]]["total_score"]
+                    )
+                    if "traj_infos" in result
+                    else float(result["scores"][result["chosen_idx"]] - result["scores"][result["rejected_idx"]])
+                ),
             }
         )
 
@@ -880,6 +912,8 @@ def main() -> None:
         scenario_ids=[pref["scenario_id"] for pref in preferences],
         rankings=[pref["ranking"] for pref in preferences],
         reasons=[pref["reason"] for pref in preferences],
+        dim_labels=np.array([pref["dim_label"] for pref in preferences]),
+        score_gaps=np.array([pref["score_gap"] for pref in preferences], dtype=np.float32),
     )
     logger.info("Saved %d pairs to %s", len(preferences), output_path)
 
@@ -893,6 +927,8 @@ def main() -> None:
             "reason": pref["reason"],
             "method": pref["method"],
             "lateral_spread": round(float(pref["lateral_spread"]), 2),
+            "dim_label": pref["dim_label"],
+            "score_gap": round(float(pref["score_gap"]), 4),
         }
         for pref in preferences
     ]
