@@ -14,7 +14,11 @@ import torch
 from flow_planner.data.dataset.nuplan import NuPlanDataSample
 from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.goal_predictor import GoalPredictor
-from flow_planner.goal.goal_utils import load_goal_vocab, select_goal_from_route
+from flow_planner.goal.goal_utils import (
+    find_nearest_goal,
+    load_goal_vocab,
+    select_goal_from_route,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +354,29 @@ def choose_goal_point(
         if goal_points.ndim != 3 or goal_points.shape[1] == 0:
             raise RuntimeError("Goal predictor did not return a usable top-1 goal")
         return goal_points[:, 0, :].to(device)
+
+    if goal_mode == "oracle_goal":
+        # Oracle (cheating) mode: snap the GT future endpoint to its nearest
+        # goal-vocabulary cluster. This reproduces the `gt_nearest` setting in
+        # docs/dpo_自动驾驶综述.md Ch 4.3 and provides the upper bound on
+        # decoder performance when the "right" goal is supplied. Not deployable.
+        if goal_vocab is None:
+            raise ValueError("oracle_goal requires a goal vocabulary")
+        ego_future = scene_data.get("ego_agent_future")
+        if ego_future is None:
+            raise RuntimeError(
+                "oracle_goal requires scene NPZ to contain 'ego_agent_future'"
+            )
+        ego_future_arr = np.asarray(ego_future, dtype=np.float32)
+        if ego_future_arr.ndim < 2 or ego_future_arr.shape[0] == 0:
+            raise RuntimeError(
+                f"oracle_goal: 'ego_agent_future' has invalid shape {ego_future_arr.shape}"
+            )
+        gt_endpoint = ego_future_arr[-1, :2]
+        vocab_arr = np.asarray(goal_vocab, dtype=np.float32)
+        nearest_idx = int(find_nearest_goal(gt_endpoint[None, :], vocab_arr)[0])
+        nearest_goal = vocab_arr[nearest_idx]
+        return torch.from_numpy(nearest_goal).unsqueeze(0).to(device)
 
     raise ValueError(f"Unsupported goal_mode '{goal_mode}'")
 

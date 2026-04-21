@@ -43,6 +43,7 @@ CFG_WEIGHT="${CFG_WEIGHT:-1.8}"
 BON_SEED="${BON_SEED:--1}"
 USE_CFG="${USE_CFG:-1}"
 RUN_PREDICTED_GOAL="${RUN_PREDICTED_GOAL:-1}"
+RUN_ORACLE_GOAL="${RUN_ORACLE_GOAL:-1}"
 
 if [[ "$USE_CFG" == "1" ]]; then
   CFG_ARGS=(--use_cfg --cfg_weight "$CFG_WEIGHT")
@@ -151,6 +152,27 @@ if [[ "$RUN_PREDICTED_GOAL" == "1" ]]; then
     --output_json "$OUTPUT_DIR/eval_multidim_goal_predicted.json"
 else
   echo "Skipping predicted_goal ablation because RUN_PREDICTED_GOAL=$RUN_PREDICTED_GOAL"
+fi
+
+if [[ "$RUN_ORACLE_GOAL" == "1" ]]; then
+  # Oracle (cheating) goal: snaps GT future endpoint to nearest goal-vocab
+  # cluster. Not deployable, but gives the upper bound on decoder quality when
+  # the "right" goal is supplied. Used to diagnose whether DPO training hurt
+  # the decoder's ability to follow a correct goal.
+  run_and_log eval_multidim_goal_oracle \
+    -m flow_planner.dpo.eval_multidim_goal_ablation \
+    --ckpt_path "$DPO_CKPT" \
+    --config_path "$DPO_CONFIG" \
+    --scene_dir "$SCENE_DIR" \
+    --device "$DEVICE" \
+    --goal_mode oracle_goal \
+    --goal_vocab_path "$GOAL_VOCAB" \
+    --max_scenes "$MAX_SCENES" \
+    --bon_seed "$BON_SEED" \
+    "${CFG_ARGS[@]}" \
+    --output_json "$OUTPUT_DIR/eval_multidim_goal_oracle.json"
+else
+  echo "Skipping oracle_goal ablation because RUN_ORACLE_GOAL=$RUN_ORACLE_GOAL"
 fi
 
 echo ""

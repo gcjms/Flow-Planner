@@ -59,7 +59,7 @@ def main():
     parser.add_argument(
         "--goal_mode",
         type=str,
-        choices=("none", "route_goal", "predicted_goal"),
+        choices=("none", "route_goal", "predicted_goal", "oracle_goal"),
         required=True,
     )
     parser.add_argument("--max_scenes", type=int, default=500)
