@@ -17,8 +17,88 @@ import torch.nn as nn
 from timm.layers import Mlp
 from flow_planner.model.modules.decoder_modules import FinalLayer, PostFusion
 from flow_planner.model.model_utils.tool_func import sinusoidal_positional_encoding
+from flow_planner.model.model_utils.traj_tool import traj_chunking
 from flow_planner.model.modules.decoder_modules import RMSNorm, FeedForward, AdaptiveLayerNorm
 from flow_planner.model.flow_planner_model.global_attention import JointAttention
+
+
+class AnchorTrajEncoder(nn.Module):
+    """Encode a full-horizon anchor trajectory into per-action-token embeddings.
+
+    Why per-token instead of a single broadcast vector?
+      - The old goal path fed a single ``(B, 1, hidden)`` embedding to every action
+        token. That gives every slice of the predicted trajectory the *same*
+        hint, which is exactly the regime where the network "averages out"
+        different driving styles (see GOAL_DESIGN.md §"Goal 注入太强").
+      - An anchor carries a full (T, 3) shape. If we align the anchor's time
+        axis with the action-token chunking (same ``action_len`` / ``action_overlap``
+        used for ego trajectory), each action token gets the *slice* of anchor
+        it is supposed to refine. This matches MultiPath / MTR's "select-then-
+        refine-residual" intuition without introducing a new joint-attention
+        modality.
+
+    Forward:
+        anchor_traj (B, T, anchor_state_dim=3)  ->  (B, P, hidden_dim)
+    """
+
+    def __init__(
+        self,
+        anchor_state_dim: int,
+        action_len: int,
+        action_overlap: int,
+        action_num: int,
+        hidden_dim: int,
+        mlp_hidden: int = 128,
+    ):
+        super().__init__()
+        self.anchor_state_dim = anchor_state_dim
+        self.action_len = action_len
+        self.action_overlap = action_overlap
+        self.action_num = action_num
+        self.window_in_dim = action_len * anchor_state_dim
+
+        # Per-window MLP: (action_len * anchor_state_dim) -> hidden
+        # Last layer zero-init so the anchor contribution starts at 0 and the
+        # model learns to trust anchors only as training progresses.
+        self.window_mlp = nn.Sequential(
+            nn.Linear(self.window_in_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, hidden_dim),
+        )
+        nn.init.zeros_(self.window_mlp[-1].weight)
+        nn.init.zeros_(self.window_mlp[-1].bias)
+
+    def forward(self, anchor_traj: torch.Tensor) -> torch.Tensor:
+        """Args:
+            anchor_traj: (B, T, anchor_state_dim)
+        Returns:
+            anchor_tokens: (B, action_num, hidden_dim)
+        """
+        B, T, D = anchor_traj.shape
+        if D != self.anchor_state_dim:
+            raise ValueError(
+                f"Anchor state_dim mismatch: got {D}, expected {self.anchor_state_dim}"
+            )
+
+        # Reuse the same chunking convention as the ego trajectory tokens so the
+        # anchor window i covers exactly the frames that action token i predicts.
+        windows = traj_chunking(anchor_traj, self.action_len, self.action_overlap)
+        if len(windows) == 0:
+            raise ValueError(
+                "traj_chunking produced zero windows. Check anchor_len vs "
+                "(action_len, action_overlap). Typical setup: T=future_len."
+            )
+        if len(windows) < self.action_num:
+            # Horizon shorter than future_len: pad missing windows with the last
+            # frame so downstream shapes stay consistent.
+            pad = [windows[-1]] * (self.action_num - len(windows))
+            windows = windows + pad
+        elif len(windows) > self.action_num:
+            windows = windows[: self.action_num]
+
+        stacked = torch.stack(windows, dim=1)       # (B, P, action_len, D)
+        flat = stacked.reshape(B, self.action_num, -1)  # (B, P, action_len*D)
+        return self.window_mlp(flat)                # (B, P, hidden_dim)
 
 
 class FlowPlannerDecoder(nn.Module):
@@ -50,7 +130,9 @@ class FlowPlannerDecoder(nn.Module):
             preproj_hidden=256,   # 轨迹预投影的中间维度
             enable_attn_dist=False,  # 是否启用距离感知的 attention bias
             act_pe_type: str = 'learnable',  # action 位置编码类型: learnable/fixed_sin/none
-            goal_dim: int = 0,    # goal point 维度: 0=不启用, 2=(x,y)
+            goal_dim: int = 0,    # [LEGACY] goal point 维度: 0=不启用, 2=(x,y)
+            anchor_state_dim: int = 0,  # trajectory anchor 单帧维度: 0=不启用, 3=(x,y,heading)
+            anchor_len: int = 0,  # anchor 时序长度 T (应等于 future_len)；0=不启用
             device: str = 'cuda',
             **planner_params      # 包含 action_len, state_dim, future_len, action_overlap 等
     ):
@@ -108,8 +190,9 @@ class FlowPlannerDecoder(nn.Module):
         # index 0 = 无条件(masked), index 1 = 有条件(unmasked)
         self.cfg_embedding = nn.Embedding(2, hidden_dim)
 
-        # Goal Point Conditioning (GoalFlow-style)
-        # goal_dim=0: 不启用 (向后兼容); goal_dim=2: (x,y) goal point
+        # Goal Point Conditioning (GoalFlow-style) — LEGACY, kept for A/B testing
+        # goal_dim=0: disabled (backward compat); goal_dim=2: (x,y) goal point.
+        # Prefer the anchor path below; goal and anchor are mutually exclusive.
         self.goal_dim = goal_dim
         if goal_dim > 0:
             self.goal_proj = nn.Sequential(
@@ -117,9 +200,30 @@ class FlowPlannerDecoder(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
-            # 初始化最后一层为零，让 goal 在训练初期影响最小
             nn.init.zeros_(self.goal_proj[-1].weight)
             nn.init.zeros_(self.goal_proj[-1].bias)
+
+        # Trajectory Anchor Conditioning (Phase 1) — replaces endpoint goal with a
+        # full (T, 3) template. anchor_state_dim=0 means disabled.
+        self.anchor_state_dim = anchor_state_dim
+        self.anchor_len = anchor_len
+        if anchor_state_dim > 0 and goal_dim > 0:
+            raise ValueError(
+                "goal_dim and anchor_state_dim are mutually exclusive. "
+                "Set exactly one of them > 0."
+            )
+        if anchor_state_dim > 0:
+            if anchor_len <= 0:
+                raise ValueError(
+                    "When anchor_state_dim > 0, anchor_len must be set (= future_len)."
+                )
+            self.anchor_encoder = AnchorTrajEncoder(
+                anchor_state_dim=anchor_state_dim,
+                action_len=planner_params['action_len'],
+                action_overlap=planner_params['action_overlap'],
+                action_num=self.action_num,
+                hidden_dim=hidden_dim,
+            )
         
         # Action 位置编码: 让模型区分第 0, 1, 2, ... 个 action token
         self.act_pe_type = act_pe_type
@@ -235,17 +339,22 @@ class FlowPlannerDecoder(nn.Module):
         routes_cond = routes_cond.unsqueeze(1)                  # (B, 1, hidden_dim)
         action_pe = self.action_pe.unsqueeze(0).repeat(B, 1, 1) # (B, P, hidden_dim)
 
-        # Goal embedding: 从 model_extra 中取 goal_point (B, 2)
-        goal_embedding = 0
-        if self.goal_dim > 0 and 'goal_point' in model_extra and model_extra['goal_point'] is not None:
-            gp = model_extra['goal_point'].float()  # (B, 2)
-            goal_embedding = self.goal_proj(gp).unsqueeze(1)  # (B, 1, hidden_dim)
-            # CFG masking: unconditioned samples (cfg_flags=0) 不给 goal
-            goal_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-            goal_embedding = goal_embedding * goal_mask
+        # Conditioning embedding: goal (legacy, (B,1,H) broadcast) OR
+        # anchor (new, per-action-token (B,P,H)). Exactly one is active.
+        cond_embedding = 0
+        if self.goal_dim > 0 and model_extra.get('goal_point') is not None:
+            gp = model_extra['goal_point'].float()                # (B, 2)
+            cond_embedding = self.goal_proj(gp).unsqueeze(1)      # (B, 1, hidden_dim)
+            goal_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)
+            cond_embedding = cond_embedding * goal_mask
+        elif self.anchor_state_dim > 0 and model_extra.get('anchor_traj') is not None:
+            anchor_traj = model_extra['anchor_traj'].float()      # (B, T, anchor_state_dim)
+            cond_embedding = self.anchor_encoder(anchor_traj)     # (B, P, hidden_dim)
+            anchor_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)
+            cond_embedding = cond_embedding * anchor_mask
 
-        # 综合条件 y: 用于 FinalLayer 的 AdaLN 调制
-        y = time_cond + routes_cond + action_pe + cfg_embedding + goal_embedding  # (B, P, hidden_dim)
+        # Combined condition y: used by FinalLayer's AdaLN modulation.
+        y = time_cond + routes_cond + action_pe + cfg_embedding + cond_embedding  # (B, P, hidden_dim)
 
         # ===== Step D: DiT 多模态 Transformer =====
         # 输入 3 个模态: agents(32+5=37个token), lanes(70个token), trajectory(P个token)
@@ -257,7 +366,7 @@ class FlowPlannerDecoder(nn.Module):
             routes_cond=routes_cond,      # (B, 1, hidden_dim)
             action_encoding=action_pe,    # (B, P, hidden_dim) — 仅用于 trajectory 模态
             cfg_embedding=cfg_embedding,  # (B, 1, hidden_dim) — 仅用于 trajectory 模态
-            goal_embedding=goal_embedding,  # (B, 1, hidden_dim) or 0 — goal point 条件
+            goal_embedding=cond_embedding,  # (B,1,H) goal OR (B,P,H) anchor — same slot
             attn_dist=attn_dist           # (B, N, N) 距离矩阵用于 attention bias
         )
         
@@ -455,22 +564,20 @@ class FlowPlannerDiT(nn.Module):
         routes_cond = None,     # (B, 1, hidden_dim) 路由条件
         action_encoding = None, # (B, P, hidden_dim) action 位置编码
         cfg_embedding = None,   # (B, 1, hidden_dim) CFG 嵌入
-        goal_embedding = 0,     # (B, 1, hidden_dim) or 0 — goal point 条件
+        goal_embedding = 0,     # (B,1,H) goal / (B,P,H) anchor / 0 — trajectory 条件槽
         attn_dist = None,       # (B, N, N) 距离矩阵
     ):
         """
         完整 DiT 前向传播。
         
         为每个模态构建各自的条件向量:
-          - agents / lanes 的条件: time + routes (它们不需要知道 action 的位置和 CFG 状态)
-          - trajectory 的条件: time + routes + action_pe + cfg + goal
+          - agents / lanes 的条件: time + routes
+          - trajectory 的条件: time + routes + action_pe + cfg + (goal OR anchor)
         
-        然后通过 depth 个 DiTBlock，最后 RMSNorm。
+        ``goal_embedding`` 这个形参名保留是为了兼容，但实际同一槽位既承载
+        老的 (B,1,H) goal 也承载新的 (B,P,H) anchor，二选一。加法广播能自然处理。
         """
-        # 构建每个模态的条件向量
-        # 前 N-1 个模态 (agents, lanes): 只用 time + routes
         other_modality_conds = [time_cond + routes_cond] * (len(modality_tokens) - 1)
-        # 最后一个模态 (trajectory): time + routes + action_pe + cfg + goal
         ego_traj_conds = [time_cond + routes_cond + action_encoding + cfg_embedding + goal_embedding]
         modality_conds = other_modality_conds + ego_traj_conds
 

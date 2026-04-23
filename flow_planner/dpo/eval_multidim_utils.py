@@ -13,6 +13,12 @@ import torch
 
 from flow_planner.data.dataset.nuplan import NuPlanDataSample
 from flow_planner.dpo.config_utils import load_composed_config
+from flow_planner.goal.anchor_predictor import AnchorPredictor
+from flow_planner.goal.anchor_utils import (
+    find_nearest_anchor,
+    load_anchor_vocab,
+    select_anchor_from_route,
+)
 from flow_planner.goal.goal_predictor import GoalPredictor
 from flow_planner.goal.goal_utils import (
     find_nearest_goal,
@@ -127,6 +133,7 @@ def load_planner_model(
     ckpt_path: str,
     device: str = "cuda",
     goal_vocab_path: Optional[str] = None,
+    anchor_vocab_path: Optional[str] = None,
 ):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -154,8 +161,14 @@ def load_planner_model(
             cfg.get("normalization_stats"),
             force_add=True,
         )
+    if goal_vocab_path is not None and anchor_vocab_path is not None:
+        raise ValueError(
+            "goal_vocab_path and anchor_vocab_path are mutually exclusive."
+        )
     if goal_vocab_path is not None:
         OmegaConf.update(cfg, "model.goal_vocab_path", goal_vocab_path, force_add=True)
+    if anchor_vocab_path is not None:
+        OmegaConf.update(cfg, "model.anchor_vocab_path", anchor_vocab_path, force_add=True)
 
     model = instantiate(cfg.model)
 
@@ -221,6 +234,57 @@ def resolve_goal_vocab(model, goal_vocab_path: Optional[str] = None) -> np.ndarr
     raise ValueError(
         "Goal vocabulary is required for route_goal/predicted_goal. "
         "Pass --goal_vocab_path or use a config with model.goal_vocab_path."
+    )
+
+
+def load_anchor_predictor_model(
+    planner_model,
+    ckpt_path: str,
+    device: str = "cuda",
+    hidden_dim: int = 256,
+    dropout: float = 0.1,
+) -> AnchorPredictor:
+    """Instantiate an AnchorPredictor on top of ``planner_model`` and load ``ckpt_path``."""
+    _ensure_device_available(device)
+
+    predictor = AnchorPredictor(
+        planner_backbone=planner_model,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        freeze_backbone=True,
+    )
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = _unwrap_state_dict(ckpt)
+
+    if any(k.startswith(("backbone.", "head.")) for k in state_dict):
+        predictor_state = {
+            k: v for k, v in state_dict.items() if not k.startswith("backbone.")
+        }
+        missing, unexpected = predictor.load_state_dict(predictor_state, strict=False)
+    else:
+        missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        logger.warning("Anchor predictor missing %d keys: %s", len(missing), missing[:5])
+    if unexpected:
+        logger.warning(
+            "Anchor predictor unexpected %d keys: %s", len(unexpected), unexpected[:5]
+        )
+
+    predictor = predictor.to(device).eval()
+    predictor.backbone.device = device
+    return predictor
+
+
+def resolve_anchor_vocab(model, anchor_vocab_path: Optional[str] = None) -> np.ndarray:
+    if anchor_vocab_path is not None:
+        return load_anchor_vocab(anchor_vocab_path)
+    if getattr(model, "_anchor_vocab", None) is not None:
+        return np.asarray(model._anchor_vocab, dtype=np.float32)
+    raise ValueError(
+        "Anchor vocabulary is required for route_anchor/predicted_anchor/oracle_anchor. "
+        "Pass --anchor_vocab_path or use a config with model.anchor_vocab_path."
     )
 
 
@@ -381,6 +445,66 @@ def choose_goal_point(
     raise ValueError(f"Unsupported goal_mode '{goal_mode}'")
 
 
+def choose_anchor(
+    anchor_mode: str,
+    scene_data: Dict[str, np.ndarray],
+    data: NuPlanDataSample,
+    device: str,
+    anchor_vocab: Optional[np.ndarray] = None,
+    anchor_predictor: Optional[AnchorPredictor] = None,
+) -> Optional[torch.Tensor]:
+    """Select a trajectory anchor (B=1, T, 3) to feed the decoder.
+
+    Modes mirror ``choose_goal_point`` but return full anchor templates:
+      - "none"              → no conditioning
+      - "route_anchor"      → pure geometry, pick anchor best matching the route polyline
+      - "predicted_anchor"  → use trained AnchorPredictor's top-1 output
+      - "oracle_anchor"     → cheat: snap GT future to its nearest vocab anchor
+    """
+    if anchor_mode == "none":
+        return None
+
+    if anchor_mode == "route_anchor":
+        if anchor_vocab is None:
+            raise ValueError("route_anchor requires an anchor vocabulary")
+        anchor = select_anchor_from_route(scene_data["route_lanes"], anchor_vocab)
+        return torch.from_numpy(np.asarray(anchor, dtype=np.float32)).unsqueeze(0).to(device)
+
+    if anchor_mode == "predicted_anchor":
+        if anchor_predictor is None:
+            raise ValueError("predicted_anchor requires an anchor predictor checkpoint")
+        prediction = anchor_predictor.predict_topk(data, top_k=1)
+        anchor_trajs = prediction["anchor_trajs"]  # (B, k, T, 3)
+        if anchor_trajs.ndim != 4 or anchor_trajs.shape[1] == 0:
+            raise RuntimeError("Anchor predictor did not return a usable top-1 anchor")
+        return anchor_trajs[:, 0, :, :].to(device)  # (B, T, 3)
+
+    if anchor_mode == "oracle_anchor":
+        # Oracle (cheating): snap the GT future trajectory to its nearest vocab anchor.
+        # Provides the upper bound on decoder performance when the "right" anchor is
+        # supplied. Not deployable — requires access to ego_agent_future.
+        if anchor_vocab is None:
+            raise ValueError("oracle_anchor requires an anchor vocabulary")
+        ego_future = scene_data.get("ego_agent_future")
+        if ego_future is None:
+            raise RuntimeError(
+                "oracle_anchor requires scene NPZ to contain 'ego_agent_future'"
+            )
+        ego_future_arr = np.asarray(ego_future, dtype=np.float32)
+        T = anchor_vocab.shape[1]
+        if ego_future_arr.ndim < 2 or ego_future_arr.shape[0] < T or ego_future_arr.shape[-1] < 3:
+            raise RuntimeError(
+                f"oracle_anchor: ego_agent_future shape {ego_future_arr.shape} "
+                f"incompatible with anchor vocab horizon T={T} (needs (>=T, >=3))"
+            )
+        gt_traj = ego_future_arr[:T, :3]
+        nearest_idx = int(find_nearest_anchor(gt_traj, anchor_vocab))
+        nearest_anchor = anchor_vocab[nearest_idx]   # (T, 3)
+        return torch.from_numpy(nearest_anchor).unsqueeze(0).to(device)
+
+    raise ValueError(f"Unsupported anchor_mode '{anchor_mode}'")
+
+
 def normalize_prediction(prediction: torch.Tensor) -> np.ndarray:
     result = prediction.detach().cpu().numpy()
     if result.ndim >= 1 and result.shape[0] == 1:
@@ -397,6 +521,7 @@ def infer_single_trajectory(
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
     goal_point: Optional[torch.Tensor] = None,
+    anchor_traj: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     with torch.no_grad():
         prediction = model(
@@ -408,6 +533,7 @@ def infer_single_trajectory(
             return_all_candidates=False,
             bon_seed=bon_seed,
             goal_point=goal_point,
+            anchor_traj=anchor_traj,
         )
     return normalize_prediction(prediction)
 
@@ -484,10 +610,17 @@ def run_multidim_evaluation(
     goal_mode: str = "none",
     goal_vocab: Optional[np.ndarray] = None,
     goal_predictor: Optional[GoalPredictor] = None,
+    anchor_mode: str = "none",
+    anchor_vocab: Optional[np.ndarray] = None,
+    anchor_predictor: Optional[AnchorPredictor] = None,
     scene_manifest: Optional[str] = None,
     manifest_seed: Optional[int] = None,
     scene_manifest_out: Optional[str] = None,
 ) -> Tuple[Dict[str, float], List[Dict[str, str]]]:
+    if goal_mode != "none" and anchor_mode != "none":
+        raise ValueError(
+            f"goal_mode={goal_mode!r} and anchor_mode={anchor_mode!r} are mutually exclusive."
+        )
     scene_files = resolve_scene_files(
         scene_dir=scene_dir,
         max_scenes=max_scenes,
@@ -528,6 +661,14 @@ def run_multidim_evaluation(
                 goal_vocab=goal_vocab,
                 goal_predictor=goal_predictor,
             )
+            anchor_traj = choose_anchor(
+                anchor_mode=anchor_mode,
+                scene_data=scene_data,
+                data=data,
+                device=device,
+                anchor_vocab=anchor_vocab,
+                anchor_predictor=anchor_predictor,
+            )
             pred_traj = infer_single_trajectory(
                 model,
                 data,
@@ -535,6 +676,7 @@ def run_multidim_evaluation(
                 cfg_weight=cfg_weight,
                 bon_seed=bon_seed,
                 goal_point=goal_point,
+                anchor_traj=anchor_traj,
             )
             scene_metrics = evaluate_trajectory(
                 pred_traj,
@@ -577,6 +719,7 @@ def run_multidim_evaluation(
 
     summary = {
         "goal_mode": goal_mode,
+        "anchor_mode": anchor_mode,
         "use_cfg": bool(use_cfg),
         "cfg_weight": float(cfg_weight),
         "bon_seed": int(bon_seed),
@@ -600,6 +743,7 @@ def log_summary(summary: Dict[str, float], ckpt_path: str) -> None:
     logger.info("SUMMARY - Multi-Dimensional Open-Loop Evaluation")
     logger.info("  Checkpoint: %s", ckpt_path)
     logger.info("  goal_mode: %s", summary["goal_mode"])
+    logger.info("  anchor_mode: %s", summary.get("anchor_mode", "none"))
     logger.info("  use_cfg: %s", summary["use_cfg"])
     logger.info("  cfg_weight: %.3f", summary["cfg_weight"])
     logger.info("  Scenes requested: %d", summary["scenes_requested"])

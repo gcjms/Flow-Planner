@@ -21,8 +21,10 @@ import argparse
 import logging
 
 from flow_planner.dpo.eval_multidim_utils import (
+    load_anchor_predictor_model,
     load_planner_model,
     log_summary,
+    resolve_anchor_vocab,
     run_multidim_evaluation,
     save_summary_json,
 )
@@ -84,6 +86,25 @@ def main():
         help="Optional override for model.goal_vocab_path when loading config.",
     )
     parser.add_argument(
+        "--anchor_vocab_path",
+        type=str,
+        default=None,
+        help="Path to anchor_vocab.npy (K, T, 3). Required for any --anchor_mode != 'none'.",
+    )
+    parser.add_argument(
+        "--anchor_mode",
+        type=str,
+        default="none",
+        choices=["none", "route_anchor", "predicted_anchor", "oracle_anchor"],
+        help="Trajectory-anchor conditioning mode. Mutually exclusive with goal_mode.",
+    )
+    parser.add_argument(
+        "--anchor_predictor_ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint of a trained AnchorPredictor (required when --anchor_mode=predicted_anchor).",
+    )
+    parser.add_argument(
         "--output_json",
         type=str,
         default=None,
@@ -102,8 +123,20 @@ def main():
         args.ckpt_path,
         device=args.device,
         goal_vocab_path=args.goal_vocab_path,
+        anchor_vocab_path=args.anchor_vocab_path,
     )
     logger.info("Model loaded successfully")
+
+    anchor_vocab = None
+    anchor_predictor = None
+    if args.anchor_mode != "none":
+        anchor_vocab = resolve_anchor_vocab(model, args.anchor_vocab_path)
+        if args.anchor_mode == "predicted_anchor":
+            if args.anchor_predictor_ckpt is None:
+                raise ValueError("--anchor_mode=predicted_anchor requires --anchor_predictor_ckpt")
+            anchor_predictor = load_anchor_predictor_model(
+                model, args.anchor_predictor_ckpt, device=args.device
+            )
 
     summary, failures = run_multidim_evaluation(
         model,
@@ -115,6 +148,9 @@ def main():
         cfg_weight=args.cfg_weight,
         bon_seed=args.bon_seed,
         goal_mode="none",
+        anchor_mode=args.anchor_mode,
+        anchor_vocab=anchor_vocab,
+        anchor_predictor=anchor_predictor,
         scene_manifest=args.scene_manifest,
         manifest_seed=args.manifest_seed,
         scene_manifest_out=args.write_scene_manifest,
@@ -134,6 +170,9 @@ def main():
                 "write_scene_manifest": args.write_scene_manifest,
                 "manifest_seed": args.manifest_seed,
                 "goal_vocab_path": args.goal_vocab_path,
+                "anchor_vocab_path": args.anchor_vocab_path,
+                "anchor_mode": args.anchor_mode,
+                "anchor_predictor_ckpt": args.anchor_predictor_ckpt,
             },
         )
 

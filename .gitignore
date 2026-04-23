@@ -54,3 +54,14 @@ ai_planning-master*/
 outputs/
 goal_clusters_visualization.png
 artifacts/
+
+# Slide/report exports (non-code artifacts that stray into the working tree)
+*.xlsx
+*.ppt_export/
+.ppt_export/
+flow_planner/.ppt_export/
+slide_outline_utf8.txt
+
+# Anchor vocab visualization (local-only)
+anchor_viz/
+anchor_clusters_visualization.png

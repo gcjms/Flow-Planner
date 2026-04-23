@@ -19,10 +19,10 @@ Trajectory Anchor Vocabulary Construction (Phase 0-1)
       --data_list /root/autodl-tmp/nuplan_npz/train_list.json \
       --output_path /root/Flow-Planner/anchor_vocab.npy \
       --n_anchors 128 \
-      --traj_len 40 \
+      --traj_len 80 \
       --heading_weight 5.0 \
       --use_pca \
-      --pca_dim 16
+      --pca_dim 32
 """
 
 from __future__ import annotations
@@ -170,8 +170,10 @@ def parse_args() -> argparse.Namespace:
                         help="Where to save the anchor vocab (K, T, 3) numpy array")
     parser.add_argument("--n_anchors", type=int, default=128,
                         help="Number of anchor clusters (K). Plan default = 128.")
-    parser.add_argument("--traj_len", type=int, default=40,
-                        help="Future horizon in frames. 40 = 4s @ 10Hz (matches goal_frame=39)")
+    parser.add_argument("--traj_len", type=int, default=80,
+                        help="Future horizon in frames. MUST equal model's future_len so the "
+                             "anchor template aligns with all P action tokens during decoding. "
+                             "Default 80 = 8s @ 10Hz (matches FlowPlanner default future_len).")
     parser.add_argument("--max_endpoint_norm", type=float, default=200.0,
                         help="Drop samples whose endpoint is farther than this (meters)")
     parser.add_argument("--heading_weight", type=float, default=5.0,

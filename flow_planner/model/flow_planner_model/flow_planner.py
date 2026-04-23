@@ -28,6 +28,7 @@ class FlowPlanner(DiffusionADPlanner):
         data_processor: ModelInputProcessor = None,
         
         goal_vocab_path: str = None,
+        anchor_vocab_path: str = None,
 
         device='cuda',
         **planner_params
@@ -59,13 +60,32 @@ class FlowPlanner(DiffusionADPlanner):
         
         self.basic_loss = nn.MSELoss(reduction='none')
 
-        # Goal Point Conditioning
+        # Goal Point Conditioning (legacy)
         self._goal_vocab = None
         self._goal_vocab_tensor = None
         if goal_vocab_path is not None:
             import numpy as np
             self._goal_vocab = np.load(goal_vocab_path).astype(np.float32)
             self._goal_vocab_tensor = torch.from_numpy(self._goal_vocab)
+
+        # Trajectory Anchor Conditioning (Phase 1)
+        # anchor_vocab_path points at a (K, T, 3) numpy array produced by
+        # cluster_trajectories.py. Goal and anchor vocabs are mutually exclusive.
+        self._anchor_vocab = None
+        self._anchor_vocab_tensor = None
+        if anchor_vocab_path is not None:
+            if goal_vocab_path is not None:
+                raise ValueError(
+                    "goal_vocab_path and anchor_vocab_path are mutually exclusive; "
+                    "set exactly one."
+                )
+            import numpy as np
+            self._anchor_vocab = np.load(anchor_vocab_path).astype(np.float32)
+            if self._anchor_vocab.ndim != 3 or self._anchor_vocab.shape[-1] != 3:
+                raise ValueError(
+                    f"anchor_vocab must be (K, T, 3); got {self._anchor_vocab.shape}"
+                )
+            self._anchor_vocab_tensor = torch.from_numpy(self._anchor_vocab)
         
     def prepare_model_input(self, cfg_flags, data: NuPlanDataSample, use_cfg, is_training):
         B = data.ego_current.shape[0]
@@ -136,6 +156,7 @@ class FlowPlanner(DiffusionADPlanner):
                 bon_seed=params.get('bon_seed', -1),
                 return_all_candidates=params.get('return_all_candidates', False),
                 goal_point=params.get('goal_point', None),
+                anchor_traj=params.get('anchor_traj', None),
             )
     
     def _get_goal_for_gt(self, data: NuPlanDataSample):
@@ -151,6 +172,38 @@ class FlowPlanner(DiffusionADPlanner):
         idx = find_nearest_goal_torch(raw_point, vocab)  # (B,)
         return vocab[idx]  # (B, 2)
 
+    def _get_anchor_for_gt(self, data: NuPlanDataSample):
+        """Find the nearest anchor trajectory for each GT future in the batch.
+
+        Returns:
+            anchor_traj: (B, T, 3) float tensor on ``self.device``, or ``None``
+            if the anchor vocab is not configured.
+        """
+        if self._anchor_vocab_tensor is None:
+            return None
+        from flow_planner.goal.anchor_utils import find_nearest_anchor_torch
+
+        vocab = self._anchor_vocab_tensor.to(self.device)  # (K, T, 3)
+        K, T_anchor, _ = vocab.shape
+
+        gt_future = data.ego_future  # (B, T_future, D); D >= 3
+        if gt_future.shape[-1] < 3:
+            raise ValueError(
+                f"ego_future needs at least 3 channels (x, y, heading); got "
+                f"{gt_future.shape[-1]}. The anchor path requires heading."
+            )
+
+        T_future = gt_future.shape[1]
+        if T_anchor != T_future:
+            raise ValueError(
+                f"Anchor horizon T={T_anchor} must match data.ego_future T={T_future}. "
+                f"Regenerate anchor_vocab.npy with --traj_len={T_future}."
+            )
+
+        gt_traj = gt_future[:, :T_anchor, :3].float().to(self.device)  # (B, T, 3)
+        idx = find_nearest_anchor_torch(gt_traj, vocab)                # (B,)
+        return vocab[idx]                                              # (B, T, 3)
+
     def forward_train(self, data: NuPlanDataSample):
         '''
         Forward a training step and compute the training loss.
@@ -165,8 +218,10 @@ class FlowPlanner(DiffusionADPlanner):
         '''
         B = data.ego_current.shape[0]
 
-        # Goal conditioning: 从 GT 终点查最近聚类中心 (在 normalize 之前取)
+        # Conditioning: pick goal (legacy) or anchor (Phase 1) BEFORE normalization.
+        # Exactly one branch is active (vocab constructors enforce exclusivity).
         goal_point = self._get_goal_for_gt(data)
+        anchor_traj = self._get_anchor_for_gt(data)
 
         roll_dice = torch.rand((B, 1))
         cfg_flags = (roll_dice > self.cfg_prob).to(torch.int32).to(self.device) # NOTE: 1 for conditioned (unmasked), 0 for unconditioned (masked)
@@ -179,6 +234,8 @@ class FlowPlanner(DiffusionADPlanner):
 
         if goal_point is not None:
             decoder_model_extra['goal_point'] = goal_point
+        if anchor_traj is not None:
+            decoder_model_extra['anchor_traj'] = anchor_traj
 
         B, P, T_, D = gt.shape
         
@@ -209,7 +266,7 @@ class FlowPlanner(DiffusionADPlanner):
     
     def forward_inference(self, data: NuPlanDataSample, use_cfg=True, cfg_weight=None,
                           num_candidates: int = 1, return_all_candidates: bool = False,
-                          bon_seed: int = -1, goal_point=None):
+                          bon_seed: int = -1, goal_point=None, anchor_traj=None):
         """
         Forward inference with optional Best-of-N trajectory selection.
 
@@ -221,7 +278,9 @@ class FlowPlanner(DiffusionADPlanner):
             return_all_candidates: if True, return all N candidates instead of best one
             bon_seed: if >= 0, use deterministic seeds for candidate generation
                       (seed + i for candidate i). Set to -1 for random.
-            goal_point: (B, 2) tensor — goal conditioning. If None, no goal used.
+            goal_point: (B, 2) tensor — legacy goal conditioning. If None, no goal used.
+            anchor_traj: (B, T, 3) tensor — trajectory anchor conditioning (Phase 1).
+                          Mutually exclusive with goal_point.
 
         Returns:
             sample: (B, T, D) best trajectory, or (B, N, T, D) if return_all_candidates
@@ -270,16 +329,29 @@ class FlowPlanner(DiffusionADPlanner):
         encoder_outputs = self.encoder(**encoder_inputs)
         decoder_model_extra = self.extract_decoder_inputs(encoder_outputs, model_inputs)
 
-        # ---- Goal conditioning ----
+        # ---- Conditioning injection (goal legacy OR anchor Phase 1) ----
+        if goal_point is not None and anchor_traj is not None:
+            raise ValueError(
+                "goal_point and anchor_traj are mutually exclusive at inference."
+            )
         if goal_point is not None:
             gp = goal_point.to(self.device).float()  # (B, 2)
             if use_cfg:
-                # conditioned half 给真实 goal, unconditioned half 给零
                 decoder_model_extra['goal_point'] = torch.cat(
                     [gp, torch.zeros_like(gp)], dim=0
                 )  # (2B, 2)
             else:
                 decoder_model_extra['goal_point'] = gp
+        if anchor_traj is not None:
+            at = anchor_traj.to(self.device).float()  # (B, T, 3)
+            if at.dim() != 3 or at.size(-1) != 3:
+                raise ValueError(f"anchor_traj must be (B, T, 3); got {tuple(at.shape)}")
+            if use_cfg:
+                decoder_model_extra['anchor_traj'] = torch.cat(
+                    [at, torch.zeros_like(at)], dim=0
+                )  # (2B, T, 3)
+            else:
+                decoder_model_extra['anchor_traj'] = at
 
         # ---- Generate N candidate trajectories ----
         all_candidates = []
