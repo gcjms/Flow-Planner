@@ -215,3 +215,92 @@ MSE 对这种冲突最安全的解是取“平均”：
 - `dpo/generate_candidates_goal.py`、`dpo/eval_goal_diversity.py` 对 vocab 形状敏感，需要配合 Step 1 更新。
 - `risk/trajectory_scorer.py` 与 goal 无耦合，Step 3 的候选流程可直接复用。
 
+---
+
+## 8. Trajectory Anchor 路线（强烈推荐，解决根本问题）
+
+### 8.1 当前 Goal 的核心缺陷回顾
+
+你最初的目标是：**原始 Flow Planner（不带 goal）就能在同一 scene 下输出明显不同的多模态轨迹**，然后再用这些轨迹去做 DPO preference。
+
+但实际发现：
+- 原始 FM 严重 mode collapse，采样出来的轨迹高度相似。
+- 加入 endpoint goal 后，虽然能在一定程度上分离粗模态，但因为 goal 只包含 `(x,y)`（信息太少），同一个 goal 下会混入多种冲突行为（早变道 vs 晚变道、激进 vs 保守），导致训练时互相抵消，最终轨迹“直冲 goal、yaw 不变”。
+
+这就是你现在遇到的根本矛盾。
+
+### 8.2 Anchor vs 当前 Goal 的本质区别
+
+**当前 Goal** = 一个终点 `(x, y)`（或 `(x, y, θ)`）
+- 信息量少
+- 多个不同驾驶风格容易被映射到同一个 anchor
+- 训练时同一个条件对应多种 target → 模型学“平均解”
+
+**Trajectory Anchor** = 一整条多秒的参考轨迹（例如 4 秒 = 40 帧的 `(x, y, heading)`）
+- 信息量丰富（携带形状、曲率、最终朝向、驾驶风格）
+- 不同行为风格天然被聚到不同 cluster
+- 每个 anchor 代表一种清晰的“驾驶意图模板”
+
+**MTR 的 Motion Query** 则是 Anchor 的可学习版本：
+- 不是离线 KMeans 聚类，而是模型内部放 64~128 个可学习 query
+- 训练过程中这些 query 自己去竞争、收敛成不同 mode
+- 比静态聚类更灵活（MTR 的核心思想）
+
+### 8.3 Anchor 的具体好处（针对你的痛点）
+
+1. **Mode 分离能力大幅提升**  
+   同一个终点可能对应“早超 vs 晚超 vs 跟车”，现在会被分到不同 Anchor，训练冲突大大减少，不再容易学成平均解。
+
+2. **为 FM 提供清晰的 mode 先验**  
+   不再让 FM 从纯噪声里“自己长出 mode”，而是“先选 Anchor → FM 在 Anchor 附近 refine”。这比纯采样稳定得多。
+
+3. **DPO pair 构造更合理**  
+   - 可以做 **同 Anchor 内** 的细粒度 preference（同一模态下的不同风格）
+   - 也可以做 **跨 Anchor** 的粗粒度 preference（不同驾驶意图之间的优选）
+   - 避免了你现在遇到的严重 cross-goal 问题。
+
+4. **更接近人类驾驶意图**  
+   人类想的是“我要走哪种风格”，而不是“我终点要去哪个 (x,y)”。
+
+### 8.4 推荐实现路径（最小改动版 → MTR 风格）
+
+**第一阶段（推荐立即开始，改动最小）—— 静态 Trajectory Anchor**
+
+1. 修改 `cluster_goals.py` → `cluster_trajectories.py`
+   - 不再只取终点，改成取未来 40 帧 `(x, y, heading)`
+   - 对展平后的轨迹做 KMeans（建议先 PCA 降维再聚类，K=128~256）
+   - 输出 `trajectory_anchors.npy`（形状 `(K, 40, 3)` 或展平形式）
+
+2. 将 `GoalPredictor` 升级为 `AnchorPredictor`
+   - 输入 scene feature，输出每个 anchor 的 imitation score + multi-metric scores（collision, progress, comfort, route 等）
+   - 复用你现有的 `TrajectoryScorer` 做 offline teacher labeling
+
+3. 训练时同时优化：
+   - Imitation loss（学像 GT 的 anchor）
+   - Multi-target distillation loss（学每个 anchor 在当前 scene 下的合理性）
+
+4. 推理时：Predictor 输出 top-k anchors → 每个 anchor 让 FM refine 几次 → 得到真正多模态候选
+
+**第二阶段**：把静态 Anchor 升级为可学习的 Motion Queries（MTR 风格），进一步提升灵活性。
+
+### 8.5 与 DPO 的结合方式
+
+- **粗粒度**：不同 Anchor 之间的 preference（激进超车 anchor vs 保守跟车 anchor）
+- **细粒度**：同一个 Anchor 下，用不同 seed / noise 生成多个变体，再做 DPO pair
+- 这样 pair 的 condition 一致性远高于现在的 cross-goal 做法
+
+---
+
+**总结推荐**
+
+当前最优路径不是继续在 endpoint goal 上打补丁，而是**切换到 Trajectory Anchor 路线**。
+
+这既能解决你原始 FM 多模态不足的问题，又能让后续 DPO 建立在更稳固的 mode 基础上，是目前最匹配你真实需求的方案。
+
+下一阶段具体行动计划：
+1. 先实现静态 Trajectory Anchor（1-2 周可见效）
+2. 验证多模态是否显著提升
+3. 再决定是否往 MTR-style learnable queries 迁移
+
+（本节完）
+

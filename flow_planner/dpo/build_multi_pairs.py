@@ -29,6 +29,7 @@ from flow_planner.dpo.analyze_candidate_modes import ensure_candidates_shape
 SOFT_FAILURES = {"progress", "comfort", "route", "semantic", "legality"}
 SCORE_DIMS = ("margin", "progress", "comfort", "route", "legality", "semantic")
 GOOD_SOFT_FAILURES = {"comfort"}
+UNSAFE_PRIMARY_FAILURES = {"collision", "off_lane", "reverse", "route", "legality"}
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,9 @@ class PairMiningConfig:
     min_good_total_score: float = 7.0
     strict_same_group_min_score_gap: float = 0.75
     strict_same_group_min_dim_drop: float = 0.15
+    gt_near_unsafe_per_good: int = 1
+    chosen_near_unsafe_per_good: int = 1
+    unsafe_score_threshold: float = 0.55
 
 
 def _load_scene_json(path: str) -> Dict[str, object]:
@@ -162,6 +166,56 @@ def _candidate_score_gap(chosen: Dict[str, object], rejected: Dict[str, object])
     return float(chosen.get("total_score", 0.0)) - float(rejected.get("total_score", 0.0))
 
 
+def _candidate_idx(candidate: Dict[str, object]) -> int:
+    return int(candidate["candidate_idx"])
+
+
+def _candidate_metric(candidate: Dict[str, object], key: str, default: float = 0.0) -> float:
+    return float(candidate.get("metrics", {}).get(key, default))
+
+
+def _traj_pairwise_distance(
+    chosen_idx: int,
+    rejected_idx: int,
+    candidate_trajs: np.ndarray,
+) -> Tuple[float, float]:
+    chosen_traj = np.asarray(candidate_trajs[chosen_idx], dtype=np.float32)
+    rejected_traj = np.asarray(candidate_trajs[rejected_idx], dtype=np.float32)
+    if chosen_traj.ndim != 2 or rejected_traj.ndim != 2:
+        return float("inf"), float("inf")
+    min_len = min(chosen_traj.shape[0], rejected_traj.shape[0])
+    if min_len <= 0:
+        return float("inf"), float("inf")
+    pos_err = np.linalg.norm(
+        chosen_traj[:min_len, :2] - rejected_traj[:min_len, :2],
+        axis=-1,
+    )
+    return float(pos_err.mean()), float(pos_err[-1])
+
+
+def _is_unsafe_candidate(
+    chosen: Dict[str, object],
+    candidate: Dict[str, object],
+    config: PairMiningConfig,
+) -> bool:
+    if _candidate_idx(candidate) == _candidate_idx(chosen):
+        return False
+    if _candidate_score_gap(chosen, candidate) < config.min_score_gap:
+        return False
+    if not candidate.get("hard_ok", True):
+        return True
+
+    primary_failure = _primary_failure(candidate)
+    if primary_failure in UNSAFE_PRIMARY_FAILURES:
+        return True
+
+    unsafe_threshold = float(config.unsafe_score_threshold)
+    return any(
+        _score_value(candidate, dim) < unsafe_threshold
+        for dim in ("margin", "route", "legality")
+    )
+
+
 def _is_good_representative(candidate: Dict[str, object], config: PairMiningConfig) -> bool:
     if not candidate.get("hard_ok", False):
         return False
@@ -197,10 +251,13 @@ def _select_rejected_candidates(
     chosen: Dict[str, object],
     group_members: Sequence[Dict[str, object]],
     all_candidates: Sequence[Dict[str, object]],
+    candidate_trajs: np.ndarray,
     subtle_bad_per_good: int,
     config: PairMiningConfig,
-) -> List[Dict[str, object]]:
+) -> List[Tuple[Dict[str, object], str]]:
     chosen_idx = int(chosen["candidate_idx"])
+    selected: List[Tuple[Dict[str, object], str]] = []
+    selected_ids = {chosen_idx}
 
     def sort_pool(pool: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
         return sorted(
@@ -211,70 +268,130 @@ def _select_rejected_candidates(
             ),
         )
 
+    def append_candidates(
+        pool: Iterable[Dict[str, object]],
+        source: str,
+        *,
+        max_take: Optional[int] = None,
+        ranking_key=None,
+    ) -> None:
+        if max_take is not None and max_take <= 0:
+            return
+        ranked = list(pool)
+        if ranking_key is None:
+            ranked = sort_pool(ranked)
+        else:
+            ranked = sorted(ranked, key=ranking_key)
+
+        added = 0
+        for candidate in ranked:
+            candidate_id = _candidate_idx(candidate)
+            if candidate_id in selected_ids:
+                continue
+            selected.append((candidate, source))
+            selected_ids.add(candidate_id)
+            added += 1
+            if len(selected) >= subtle_bad_per_good:
+                return
+            if max_take is not None and added >= max_take:
+                return
+
     if config.strict_pair_mining:
         strict_same_group = [
             candidate
             for candidate in group_members
-            if int(candidate["candidate_idx"]) != chosen_idx
+            if _candidate_idx(candidate) != chosen_idx
             and _is_strict_same_group_subtle_bad(chosen, candidate, config)
         ]
-        return sort_pool(strict_same_group)[:subtle_bad_per_good]
+        append_candidates(strict_same_group, "strict_same_group")
+        if len(selected) >= subtle_bad_per_good:
+            return selected
+
+    unsafe_pool = [
+        candidate
+        for candidate in all_candidates
+        if _is_unsafe_candidate(chosen, candidate, config)
+    ]
+    if config.gt_near_unsafe_per_good > 0:
+        append_candidates(
+            unsafe_pool,
+            "gt_near_unsafe",
+            max_take=config.gt_near_unsafe_per_good,
+            ranking_key=lambda candidate: (
+                _candidate_metric(candidate, "fde") + 0.5 * _candidate_metric(candidate, "ade"),
+                _candidate_metric(candidate, "fde"),
+                _candidate_metric(candidate, "ade"),
+                _candidate_score_gap(chosen, candidate),
+            ),
+        )
+        if len(selected) >= subtle_bad_per_good:
+            return selected
+
+    if config.chosen_near_unsafe_per_good > 0:
+        append_candidates(
+            unsafe_pool,
+            "chosen_near_unsafe",
+            max_take=config.chosen_near_unsafe_per_good,
+            ranking_key=lambda candidate: (
+                *_traj_pairwise_distance(chosen_idx, _candidate_idx(candidate), candidate_trajs),
+                _candidate_score_gap(chosen, candidate),
+            ),
+        )
+        if len(selected) >= subtle_bad_per_good:
+            return selected
 
     same_group_soft = [
         candidate
         for candidate in group_members
-        if int(candidate["candidate_idx"]) != chosen_idx
+        if _candidate_idx(candidate) != chosen_idx
         and candidate.get("hard_ok", False)
         and _candidate_score_gap(chosen, candidate) >= config.min_score_gap
     ]
-    selected: List[Dict[str, object]] = sort_pool(same_group_soft)[:subtle_bad_per_good]
-
+    append_candidates(
+        same_group_soft,
+        "same_group_soft",
+        max_take=max(subtle_bad_per_good - len(selected), 0),
+    )
     if len(selected) >= subtle_bad_per_good:
         return selected
 
-    selected_ids = {int(candidate["candidate_idx"]) for candidate in selected} | {chosen_idx}
     cross_group_soft = [
         candidate
         for candidate in all_candidates
-        if int(candidate["candidate_idx"]) not in selected_ids
+        if _candidate_idx(candidate) not in selected_ids
         and candidate.get("hard_ok", False)
         and candidate.get("primary_failure") in SOFT_FAILURES
         and _candidate_score_gap(chosen, candidate) >= config.min_score_gap
     ]
-    for candidate in sort_pool(cross_group_soft):
-        selected.append(candidate)
-        selected_ids.add(int(candidate["candidate_idx"]))
-        if len(selected) >= subtle_bad_per_good:
-            return selected
+    append_candidates(cross_group_soft, "cross_group_soft")
+    if len(selected) >= subtle_bad_per_good:
+        return selected
 
     hard_failures = [
         candidate
         for candidate in all_candidates
-        if int(candidate["candidate_idx"]) not in selected_ids
+        if _candidate_idx(candidate) not in selected_ids
         and not candidate.get("hard_ok", True)
         and _candidate_score_gap(chosen, candidate) >= config.min_score_gap
     ]
-    for candidate in sort_pool(hard_failures):
-        selected.append(candidate)
-        selected_ids.add(int(candidate["candidate_idx"]))
-        if len(selected) >= subtle_bad_per_good:
-            break
+    append_candidates(hard_failures, "hard_failure_fallback")
 
     return selected
 
 
 def _scene_pairs(
     scene_payload: Dict[str, object],
+    candidate_trajs: np.ndarray,
     top_good_per_cluster: int,
     subtle_bad_per_good: int,
     config: PairMiningConfig,
-) -> List[Tuple[Dict[str, object], Dict[str, object]]]:
+) -> List[Tuple[Dict[str, object], Dict[str, object], str]]:
     candidates = list(scene_payload.get("candidates", []))
     groups: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for candidate in candidates:
         groups[_group_key(candidate)].append(candidate)
 
-    pairs: List[Tuple[Dict[str, object], Dict[str, object]]] = []
+    pairs: List[Tuple[Dict[str, object], Dict[str, object], str]] = []
     seen: set[Tuple[int, int]] = set()
 
     for group_members in groups.values():
@@ -285,10 +402,11 @@ def _scene_pairs(
         if not good_reps:
             continue
         for chosen in good_reps[:top_good_per_cluster]:
-            for rejected in _select_rejected_candidates(
+            for rejected, selection_source in _select_rejected_candidates(
                 chosen=chosen,
                 group_members=group_members,
                 all_candidates=candidates,
+                candidate_trajs=candidate_trajs,
                 subtle_bad_per_good=subtle_bad_per_good,
                 config=config,
             ):
@@ -296,7 +414,7 @@ def _scene_pairs(
                 if key in seen:
                     continue
                 seen.add(key)
-                pairs.append((chosen, rejected))
+                pairs.append((chosen, rejected, selection_source))
     return pairs
 
 
@@ -305,6 +423,7 @@ def _meta_record(
     scene_payload: Dict[str, object],
     chosen: Dict[str, object],
     rejected: Dict[str, object],
+    selection_source: str,
     goal_labels: Optional[np.ndarray],
 ) -> Dict[str, object]:
     chosen_idx = int(chosen["candidate_idx"])
@@ -335,6 +454,7 @@ def _meta_record(
         "chosen_cluster_id": int(chosen.get("cluster_id", -1)),
         "rejected_cluster_id": int(rejected.get("cluster_id", -1)),
         "pair_type": _pair_type(chosen, rejected),
+        "selection_source": selection_source,
         "score_gap": score_gap,
         "failure_type": failure_type,
         "dim_label": dim_label,
@@ -366,6 +486,9 @@ def main() -> None:
     parser.add_argument("--min_good_total_score", type=float, default=7.0)
     parser.add_argument("--strict_same_group_min_score_gap", type=float, default=0.75)
     parser.add_argument("--strict_same_group_min_dim_drop", type=float, default=0.15)
+    parser.add_argument("--gt_near_unsafe_per_good", type=int, default=1)
+    parser.add_argument("--chosen_near_unsafe_per_good", type=int, default=1)
+    parser.add_argument("--unsafe_score_threshold", type=float, default=0.55)
     parser.add_argument("--max_scenarios", type=int, default=None)
     args = parser.parse_args()
 
@@ -375,6 +498,9 @@ def main() -> None:
         min_good_total_score=args.min_good_total_score,
         strict_same_group_min_score_gap=args.strict_same_group_min_score_gap,
         strict_same_group_min_dim_drop=args.strict_same_group_min_dim_drop,
+        gt_near_unsafe_per_good=args.gt_near_unsafe_per_good,
+        chosen_near_unsafe_per_good=args.chosen_near_unsafe_per_good,
+        unsafe_score_threshold=args.unsafe_score_threshold,
     )
 
     scored_files = sorted(Path(args.scored_dir).glob("*.json"))
@@ -398,6 +524,7 @@ def main() -> None:
     has_pair_goals = True
     meta_records: List[Dict[str, object]] = []
     pair_type_counts: Counter[str] = Counter()
+    selection_source_counts: Counter[str] = Counter()
     dim_label_counts: Counter[str] = Counter()
 
     pair_id = 0
@@ -406,11 +533,12 @@ def main() -> None:
         candidates, goal_labels, _ = _load_candidates_from_scene(scene_payload, args.candidates_dir)
         pairs = _scene_pairs(
             scene_payload=scene_payload,
+            candidate_trajs=candidates,
             top_good_per_cluster=args.top_good_per_cluster,
             subtle_bad_per_good=args.subtle_bad_per_good,
             config=mining_config,
         )
-        for chosen, rejected in pairs:
+        for chosen, rejected, selection_source in pairs:
             chosen_idx = int(chosen["candidate_idx"])
             rejected_idx = int(rejected["candidate_idx"])
             chosen_rows.append(candidates[chosen_idx])
@@ -422,6 +550,7 @@ def main() -> None:
                 scene_payload=scene_payload,
                 chosen=chosen,
                 rejected=rejected,
+                selection_source=selection_source,
                 goal_labels=goal_labels,
             )
             meta_records.append(record)
@@ -438,6 +567,7 @@ def main() -> None:
                 np.asarray(rejected_goal if rejected_goal is not None else [np.nan, np.nan], dtype=np.float32)
             )
             pair_type_counts.update([str(record["pair_type"])])
+            selection_source_counts.update([str(record["selection_source"])])
             dim_label_counts.update([str(record["dim_label"])])
             pair_id += 1
 
@@ -466,6 +596,7 @@ def main() -> None:
     print(f"Saved pair metadata to {meta_path}")
     print(f"Strict pair mining: {mining_config.strict_pair_mining}")
     print(f"Pair type counts: {dict(sorted(pair_type_counts.items()))}")
+    print(f"Selection source counts: {dict(sorted(selection_source_counts.items()))}")
     print(f"Dim label counts: {dict(sorted(dim_label_counts.items()))}")
     print("=" * 60)
 
