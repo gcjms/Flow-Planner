@@ -69,9 +69,23 @@ Scene (agents+lanes+ego) ──┐
 |---|---|---|
 | 条件载体 | `(x,y)` 2D 点 | `(T, 3)` 完整轨迹 |
 | vocab 规模 | 64 个点 | 128~256 个轨迹（先 128） |
-| 注入方式 | 广播到所有 P 个 token，每层都加 | TrajEncoder 出 anchor token，cross-attn 到 trajectory query |
+| 注入方式 | 加到 AdaLN condition，每层都参与 γ/β 调制 | **TrajEncoder 把轨迹压成 L≈4 个 anchor token；trajectory token 作为 Query 通过 cross-attention 从 anchor token 里主动取信息，output_proj 零初始化** |
 | 监督信号 | 单 GT → nearest goal 的 imitation | 多 anchor 同时打分（Hydra-MDP 风格 soft distillation） |
-| DPO pair | same-goal / cross-goal | same-anchor（细粒度风格）+ cross-anchor（粗粒度意图） |
+| DPO pair | same-goal / cross-goal | **主线：same-anchor（细粒度风格，沿用 DriveDPO hard-neg）**；cross-anchor 不作为主线（cross-goal 已证失败），仅在 same-anchor 信号不够时作为 **可选消融** |
+
+> **为什么不再用"加到 AdaLN condition"**
+> `feature/goal` 失败的根本原因是：goal embedding 作为 additive shift/scale 喂进 LayerNorm，
+> (a) 信号很弱——只影响激活缩放，不改变 token 间 attention 关系；
+> (b) 模型可以学到 γ 无视、β≈0，相当于门控关掉条件；
+> (c) MSE 训练天然"取平均"，弱信号被抹掉。
+> 换成 per-token 加法还是同样的病。Cross-attention 让 trajectory token 主动查询 anchor，
+> 信号直接改变 token 内容；softmax 逼着模型至少 attend 到某处，不会轻易 ignore。
+>
+> **为什么 cross-anchor DPO 不再是主线**
+> cross-goal 之所以失败，是因为 preference pair 两边同时耦合了"意图差异"和"质量差异"，
+> DPO loss 分不清到底在学哪一个。Anchor 只是把条件换了个名字，底层耦合没解决。
+> 稳妥做法是 Phase 3 **只做 same-anchor pair**（每个 anchor bucket 内部做 hard-neg 挖掘，
+> 这正是 DriveDPO 路线在 feature/goal 上实测 work 的那部分）。cross-anchor 等实验再说。
 
 ---
 
@@ -79,12 +93,12 @@ Scene (agents+lanes+ego) ──┐
 
 ### Phase 0 — 准备 & 离线产物（1-2 天）
 
-- [ ] P0-1 `cluster_goals.py` → `cluster_trajectories.py`（新建，老文件保留）
-  - 从训练集取完整 `(T=40, 3)` GT 轨迹
-  - PCA 降维（可选）→ KMeans (K=128)
-  - 产出 `anchor_vocab.npy`, shape `(128, 40, 3)`
+- [x] P0-1 `cluster_goals.py` → `cluster_trajectories.py`（新建，老文件保留）
+  - 从训练集取完整 `(T=80, 3)` GT 轨迹（T 对齐 `future_len=80`，不是最初写的 40）
+  - PCA 降维（可选，默认 pca_dim=32）→ KMeans (K=128)
+  - 产出 `anchor_vocab.npy`, shape `(128, 80, 3)`
 - [ ] P0-2 **离线 teacher 打分**：用现有 `risk/trajectory_scorer.py` 给每个 (scene, anchor) 打 multi-metric score，缓存成 `(scene_id, anchor_id) → score_dict`
-- [ ] P0-3 Anchor 可视化脚本 `visualize_anchors.py`（看 128 条 anchor 在 ego frame 下长什么样）
+- [x] P0-3 Anchor 可视化脚本 `visualize_anchors.py`（看 128 条 anchor 在 ego frame 下长什么样）
 - [ ] P0-4 `goal_vocab.npy` 标记 deprecated（加 README 注释），不删
 
 **Exit criteria**：`anchor_vocab.npy` 生成，可视化通过（覆盖直行/左转/右转/变道/停车），teacher 打分 cache 生成在一个训练子集上。
@@ -93,17 +107,18 @@ Scene (agents+lanes+ego) ──┐
 
 目标：跑通最小可用版本，先 work 再优化。
 
-- [ ] P1-1 **AnchorPredictor**：`goal_predictor.py` 原地改成 `anchor_predictor.py`，输入 scene_feat，输出 K=128 logits + imitation probability（第一版保持单头，metric heads 放到 Phase 2）
-- [ ] P1-2 **TrajEncoder**（新模块）：把 `(T, 3)` anchor 编码成 1~8 个 token，简单 MLP+PE 起步
-- [ ] P1-3 **decoder.py 改造**：
-  - 去掉 `goal_dim=2, goal_proj(Linear(2,hidden))` 分支
-  - 加 `anchor_tokens` 作为 cross-attn key/value（不再广播加到每个 token）
-  - 保留零初始化策略，`cfg_flags=0` 时 zero-out anchor tokens
-- [ ] P1-4 **flow_planner.py 改造**：
-  - `_get_goal_for_gt` → `_get_anchor_for_gt`（nearest anchor lookup，距离用轨迹 L2）
-  - `forward_inference` 接受 `anchor_id` 或 `anchor_traj`
-- [ ] P1-5 **训练入口**：`train_anchor_predictor.py`（对标 `train_goal_predictor.py`），loss 只含 imitation CE
-- [ ] P1-6 **最小 eval**：在 `eval_multidim_utils.py` 里加 `choose_anchor(mode="none"/"predicted"/"oracle")`，跑一轮 smoke test
+- [x] P1-1 **AnchorPredictor**：`goal_predictor.py` 原地改成 `anchor_predictor.py`，输入 scene_feat，输出 K=128 logits + imitation probability（第一版保持单头，metric heads 放到 Phase 2）
+- [x] P1-2 **TrajEncoder**（新模块）：`AnchorTokenEncoder` 把 `(B, T, 3)` anchor 通过 learnable query + 单层 cross-attn 压成 `(B, L, H)`（L=4）
+- [x] P1-3 **decoder.py 改造**：
+  - `goal_proj` 分支保留做 A/B（goal 和 anchor 互斥），Phase 3 末清理
+  - 新增 `AnchorCrossAttention`：trajectory token 作为 Q，anchor token 作为 K/V，在 DiT 之前做一次 cross-attn（output_proj 零初始化）
+  - `cfg_flags=0` 时 zero-out anchor tokens（CFG）
+  - anchor **不再参与 AdaLN 的 `y` 加法**，DiT 内部看不到 anchor
+- [x] P1-4 **flow_planner.py 改造**：
+  - 新增 `_get_anchor_index_for_gt` / `_get_anchor_for_gt`，nearest lookup 对齐"模型实际预测的那段"（`gt_future[:, -T_anchor:, :3]`）
+  - `forward_inference` 接受 `anchor_traj`（B,T,3），CFG 时 concat 零 anchor 实现无条件分支
+- [x] P1-5 **训练入口**：`train_anchor_predictor.py` 镜像 `train_goal_predictor.py`，自动 patch decoder 的 `anchor_state_dim/anchor_len/anchor_token_num/anchor_attn_heads`
+- [x] P1-6 **最小 eval**：`eval_multidim_utils.py::choose_anchor(none/route_anchor/predicted_anchor/oracle_anchor)` + `load_planner_model` 自动把 decoder 的 anchor 字段 patch 上
 
 **Exit criteria**：训练不崩、`oracle_anchor` 显著好于 `none`（closed-loop 碰撞率相对下降 > 20%）。如果 `oracle_anchor ≈ none`，先停下来 debug，不往后推。
 
@@ -120,13 +135,23 @@ Scene (agents+lanes+ego) ──┐
 
 ### Phase 3 — Anchor-Conditioned DPO（3-5 天）
 
-- [ ] P3-1 `build_multi_pairs.py` 改造：pair 组里按 `anchor_id` 分桶
-  - same-anchor pair：同风格内的细粒度偏好（沿用 DriveDPO hard-neg 策略）
-  - cross-anchor pair：跨风格的粗粒度偏好（给 chosen/rejected 打明显不同的 anchor 标签）
+**主线只做 same-anchor pair**。cross-goal 在 feature/goal 上已证失败（preference pair 两边
+同时耦合意图差异和质量差异，loss 学不出纯粹的质量排序），cross-anchor 底层耦合没解决。
+
+- [ ] P3-1 `build_multi_pairs.py` 改造：pair **只在 same anchor_id bucket 内部构建**
+  - 每个 anchor 桶内用 DriveDPO hard-neg 策略挖 chosen/rejected
+  - 不同 anchor 桶之间的样本**不配对**（避免重现 cross-goal 的信号冲突）
 - [ ] P3-2 `train_dpo.py` 的 `attach_goal_to_decoder_inputs` → `attach_anchor_to_decoder_inputs`，loss 与循环全部复用
-- [ ] P3-3 评测：cross-anchor pair 的 chosen preference 能被模型学到（policy preference prob 提升）
+- [ ] P3-3 评测：same-anchor pair 的 chosen preference 能被模型学到（policy preference prob 提升）
 
 **Exit criteria**：DPO 在 anchor 条件下 loss 正常收敛，offline preference accuracy > 0.65；closed-loop 指标优于 Phase 2 baseline。
+
+### Phase 3.5（可选消融）— cross-anchor DPO
+
+仅在 Phase 3 完成后，如果想验证"跨意图的粗粒度偏好是否真的能学得动"时才做：
+- 在 Phase 3 产出的 same-anchor DPO ckpt 基础上，额外加入少量 cross-anchor pair（小比例，1:10 以内）
+- 如果 offline preference accuracy 掉到 < 0.55 或 closed-loop 退化，说明 cross-anchor 信号依旧冲突 → 停掉
+- 如果反而提升，再调比例。**不作为默认路径**。
 
 ### Phase 4（可选）— Dynamic/Learnable Anchors（MTR 风格，2-3 周）
 
@@ -190,7 +215,7 @@ DPO 核心估时：`train_dpo.py` 小改 0.5d；其余 0d。
 
 | 文件 | 行数 | 分类 | 改动要点 | 估时 |
 |---|---|---|---|---|
-| `build_multi_pairs.py` | 514 | 🔧 | pair 分桶 key 从 goal_id 换 anchor_id；DriveDPO hard-neg 保留 | 1d |
+| `build_multi_pairs.py` | 514 | 🔧 | pair 分桶 key 从 goal_id 换 anchor_id；**主线只保留 same-anchor pair**（cross-anchor 归 Phase 3.5 消融）；DriveDPO hard-neg 保留 | 1d |
 | `train_soft_pref.py` | 661 | 🔧 | goal_labels → anchor_labels；scene-level soft KL 保留；**重要：这是 Hydra-MDP 思想的现成实现** | 1d |
 | `eval_multidim_utils.py` | 556 | 🔧 | `choose_goal_point` → `choose_anchor`；mode 枚举改名 | 1d |
 | `eval_multidim.py` | 129 | 🔧 | 调用点同步 | 0.3d |
@@ -242,10 +267,11 @@ DPO 核心估时：`train_dpo.py` 小改 0.5d；其余 0d。
 |---|---|---|---|
 | R1 | Anchor vocab 太稀疏，有些场景没有合理 anchor | 中 | Phase 0 可视化验证；必要时 K 调到 256 |
 | R2 | AnchorPredictor 过拟合 imitation，ignore metric heads | 中 | Phase 2 引入 `λ_soft` 调参；冻结 predictor 主干 |
-| R3 | cross-attn 注入太弱，`oracle_anchor ≈ none` 重演 | 中 | Phase 1 出口严格 gate；真出现就先做 injection 消融 |
+| R3 | cross-attn 注入太弱，`oracle_anchor ≈ none` 重演 | 低-中 | 已实装 `AnchorCrossAttention`（output_proj 零初始化），不再走 AdaLN additive；Phase 1 出口依旧严格 gate，真失败就做 injection 消融（加层数 / 改 token 数） |
 | R4 | Multi-target distillation 和单 GT imitation 冲突 | 低 | `λ_soft` warmup；先 imitation 预训练再加 soft |
-| R5 | DPO same-anchor pair 挖不够 | 中 | Phase 3 复用 build_multi_pairs 的 K=8 候选 |
+| R5 | DPO same-anchor pair 挖不够 | 中 | Phase 3 复用 build_multi_pairs 的 K=8 候选；不够就加 on-policy 候选扩桶 |
 | R6 | feature/anchor 与 feature/goal 后续合并/对比成本 | 低 | 保持 DPO infra 改动最小化；接口命名显式区分 goal/anchor |
+| R7 | 被污染的 cross-anchor 信号让 Phase 3 退化 | 低（因为不再主线做） | 主线只 same-anchor；cross-anchor 进 Phase 3.5 消融，掉性能立刻停 |
 
 ---
 

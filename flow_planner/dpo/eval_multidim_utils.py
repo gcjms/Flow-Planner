@@ -169,6 +169,24 @@ def load_planner_model(
         OmegaConf.update(cfg, "model.goal_vocab_path", goal_vocab_path, force_add=True)
     if anchor_vocab_path is not None:
         OmegaConf.update(cfg, "model.anchor_vocab_path", anchor_vocab_path, force_add=True)
+        # Patch the decoder so the anchor_encoder / anchor_cross_attn modules
+        # are actually instantiated. Otherwise decoder.anchor_state_dim defaults
+        # to 0 and the anchor input is silently ignored at inference, which
+        # would silently sabotage the oracle_anchor gate.
+        future_len = OmegaConf.select(cfg, "model.future_len")
+        if future_len is None:
+            raise ValueError(
+                "model.future_len missing from config; cannot derive anchor_len."
+            )
+        dec_anchor_state = OmegaConf.select(cfg, "model.model_decoder.anchor_state_dim")
+        if dec_anchor_state in (None, 0):
+            OmegaConf.update(cfg, "model.model_decoder.goal_dim", 0, force_add=True)
+            OmegaConf.update(cfg, "model.model_decoder.anchor_state_dim", 3, force_add=True)
+            OmegaConf.update(cfg, "model.model_decoder.anchor_len", int(future_len), force_add=True)
+            if OmegaConf.select(cfg, "model.model_decoder.anchor_token_num") is None:
+                OmegaConf.update(cfg, "model.model_decoder.anchor_token_num", 4, force_add=True)
+            if OmegaConf.select(cfg, "model.model_decoder.anchor_attn_heads") is None:
+                OmegaConf.update(cfg, "model.model_decoder.anchor_attn_heads", 8, force_add=True)
 
     model = instantiate(cfg.model)
 

@@ -17,88 +17,127 @@ import torch.nn as nn
 from timm.layers import Mlp
 from flow_planner.model.modules.decoder_modules import FinalLayer, PostFusion
 from flow_planner.model.model_utils.tool_func import sinusoidal_positional_encoding
-from flow_planner.model.model_utils.traj_tool import traj_chunking
 from flow_planner.model.modules.decoder_modules import RMSNorm, FeedForward, AdaptiveLayerNorm
 from flow_planner.model.flow_planner_model.global_attention import JointAttention
 
 
-class AnchorTrajEncoder(nn.Module):
-    """Encode a full-horizon anchor trajectory into per-action-token embeddings.
+class AnchorTokenEncoder(nn.Module):
+    """Encode a full-horizon anchor trajectory (B, T, 3) into a compact set of
+    ``L`` anchor tokens (B, L, hidden_dim) via learnable queries + cross-attention
+    over per-frame projections.
 
-    Why per-token instead of a single broadcast vector?
-      - The old goal path fed a single ``(B, 1, hidden)`` embedding to every action
-        token. That gives every slice of the predicted trajectory the *same*
-        hint, which is exactly the regime where the network "averages out"
-        different driving styles (see GOAL_DESIGN.md §"Goal 注入太强").
-      - An anchor carries a full (T, 3) shape. If we align the anchor's time
-        axis with the action-token chunking (same ``action_len`` / ``action_overlap``
-        used for ego trajectory), each action token gets the *slice* of anchor
-        it is supposed to refine. This matches MultiPath / MTR's "select-then-
-        refine-residual" intuition without introducing a new joint-attention
-        modality.
-
-    Forward:
-        anchor_traj (B, T, anchor_state_dim=3)  ->  (B, P, hidden_dim)
+    Why this design (vs. the earlier per-action-token MLP)？
+      - The previous `AnchorTrajEncoder` output (B, P, H) and was *added* to the
+        AdaLN condition for each action token. That is still the same
+        "broadcast-into-AdaLN" pattern that made endpoint-goal useless (weak
+        signal, easily ignored, mode collapse).
+      - Distilling the anchor into L (<< T) learnable tokens gives the
+        downstream trajectory tokens something to **cross-attend to**, which
+        matches the migration plan §2.2: "TrajEncoder 出 anchor token, cross-attn
+        到 trajectory query".
+      - L is independent of the action-token grid, so changing the model's
+        ``action_len`` / ``action_overlap`` doesn't require regenerating the
+        anchor vocabulary.
     """
 
     def __init__(
         self,
         anchor_state_dim: int,
-        action_len: int,
-        action_overlap: int,
-        action_num: int,
+        anchor_len: int,
         hidden_dim: int,
+        anchor_token_num: int = 4,
+        num_heads: int = 4,
         mlp_hidden: int = 128,
     ):
         super().__init__()
         self.anchor_state_dim = anchor_state_dim
-        self.action_len = action_len
-        self.action_overlap = action_overlap
-        self.action_num = action_num
-        self.window_in_dim = action_len * anchor_state_dim
+        self.anchor_len = anchor_len
+        self.anchor_token_num = anchor_token_num
 
-        # Per-window MLP: (action_len * anchor_state_dim) -> hidden
-        # Last layer zero-init so the anchor contribution starts at 0 and the
-        # model learns to trust anchors only as training progresses.
-        self.window_mlp = nn.Sequential(
-            nn.Linear(self.window_in_dim, mlp_hidden),
+        self.frame_proj = nn.Sequential(
+            nn.Linear(anchor_state_dim, mlp_hidden),
             nn.GELU(),
             nn.Linear(mlp_hidden, hidden_dim),
         )
-        nn.init.zeros_(self.window_mlp[-1].weight)
-        nn.init.zeros_(self.window_mlp[-1].bias)
+        self.frame_pe = nn.Parameter(torch.randn(anchor_len, hidden_dim) * 0.02)
+
+        self.query = nn.Parameter(torch.randn(anchor_token_num, hidden_dim) * 0.02)
+
+        self.q_norm = nn.LayerNorm(hidden_dim)
+        self.kv_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
+        )
+
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
 
     def forward(self, anchor_traj: torch.Tensor) -> torch.Tensor:
-        """Args:
-            anchor_traj: (B, T, anchor_state_dim)
-        Returns:
-            anchor_tokens: (B, action_num, hidden_dim)
-        """
+        """(B, T, anchor_state_dim) -> (B, L, hidden_dim)."""
         B, T, D = anchor_traj.shape
         if D != self.anchor_state_dim:
             raise ValueError(
                 f"Anchor state_dim mismatch: got {D}, expected {self.anchor_state_dim}"
             )
-
-        # Reuse the same chunking convention as the ego trajectory tokens so the
-        # anchor window i covers exactly the frames that action token i predicts.
-        windows = traj_chunking(anchor_traj, self.action_len, self.action_overlap)
-        if len(windows) == 0:
+        if T != self.anchor_len:
             raise ValueError(
-                "traj_chunking produced zero windows. Check anchor_len vs "
-                "(action_len, action_overlap). Typical setup: T=future_len."
+                f"Anchor length mismatch: got {T}, expected {self.anchor_len} "
+                f"(configured via FlowPlannerDecoder.anchor_len)."
             )
-        if len(windows) < self.action_num:
-            # Horizon shorter than future_len: pad missing windows with the last
-            # frame so downstream shapes stay consistent.
-            pad = [windows[-1]] * (self.action_num - len(windows))
-            windows = windows + pad
-        elif len(windows) > self.action_num:
-            windows = windows[: self.action_num]
 
-        stacked = torch.stack(windows, dim=1)       # (B, P, action_len, D)
-        flat = stacked.reshape(B, self.action_num, -1)  # (B, P, action_len*D)
-        return self.window_mlp(flat)                # (B, P, hidden_dim)
+        frames = self.frame_proj(anchor_traj) + self.frame_pe.unsqueeze(0)  # (B, T, H)
+        queries = self.query.unsqueeze(0).expand(B, -1, -1).contiguous()    # (B, L, H)
+
+        q_n = self.q_norm(queries)
+        kv_n = self.kv_norm(frames)
+        attn_out, _ = self.cross_attn(q_n, kv_n, kv_n, need_weights=False)
+        tokens = queries + attn_out                                         # residual
+        tokens = tokens + self.ffn(self.ffn_norm(tokens))
+        return tokens
+
+
+class AnchorCrossAttention(nn.Module):
+    """Single cross-attention layer: trajectory tokens (Q) attend to anchor
+    tokens (K/V). Output projection is **zero-initialized** so the anchor
+    contribution starts at zero; the model progressively learns to trust the
+    anchor as training advances. This is the core difference from the previous
+    AdaLN-additive injection — trajectory tokens *actively query* the anchor
+    instead of passively receiving a broadcast shift/scale.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.q_norm = nn.LayerNorm(hidden_dim)
+        self.kv_norm = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        traj_tokens: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Args:
+            traj_tokens:   (B, P, hidden_dim) — preproj'd trajectory action tokens (Q)
+            anchor_tokens: (B, L, hidden_dim) — encoded anchor tokens (K, V)
+        Returns:
+            updated trajectory tokens (B, P, hidden_dim) with anchor info added.
+        """
+        q = self.q_norm(traj_tokens)
+        kv = self.kv_norm(anchor_tokens)
+        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+        return traj_tokens + self.out_proj(attn_out)
 
 
 class FlowPlannerDecoder(nn.Module):
@@ -133,6 +172,8 @@ class FlowPlannerDecoder(nn.Module):
             goal_dim: int = 0,    # [LEGACY] goal point 维度: 0=不启用, 2=(x,y)
             anchor_state_dim: int = 0,  # trajectory anchor 单帧维度: 0=不启用, 3=(x,y,heading)
             anchor_len: int = 0,  # anchor 时序长度 T (应等于 future_len)；0=不启用
+            anchor_token_num: int = 4,  # 把 anchor 压成多少个 token 参与 cross-attn
+            anchor_attn_heads: int = 8, # trajectory -> anchor cross-attn 的 heads
             device: str = 'cuda',
             **planner_params      # 包含 action_len, state_dim, future_len, action_overlap 等
     ):
@@ -204,9 +245,11 @@ class FlowPlannerDecoder(nn.Module):
             nn.init.zeros_(self.goal_proj[-1].bias)
 
         # Trajectory Anchor Conditioning (Phase 1) — replaces endpoint goal with a
-        # full (T, 3) template. anchor_state_dim=0 means disabled.
+        # full (T, 3) template **injected via cross-attention** (per migration
+        # plan §2.2). anchor_state_dim=0 means disabled.
         self.anchor_state_dim = anchor_state_dim
         self.anchor_len = anchor_len
+        self.anchor_token_num = anchor_token_num
         if anchor_state_dim > 0 and goal_dim > 0:
             raise ValueError(
                 "goal_dim and anchor_state_dim are mutually exclusive. "
@@ -217,12 +260,15 @@ class FlowPlannerDecoder(nn.Module):
                 raise ValueError(
                     "When anchor_state_dim > 0, anchor_len must be set (= future_len)."
                 )
-            self.anchor_encoder = AnchorTrajEncoder(
+            self.anchor_encoder = AnchorTokenEncoder(
                 anchor_state_dim=anchor_state_dim,
-                action_len=planner_params['action_len'],
-                action_overlap=planner_params['action_overlap'],
-                action_num=self.action_num,
+                anchor_len=anchor_len,
                 hidden_dim=hidden_dim,
+                anchor_token_num=anchor_token_num,
+            )
+            self.anchor_cross_attn = AnchorCrossAttention(
+                hidden_dim=hidden_dim,
+                num_heads=anchor_attn_heads,
             )
         
         # Action 位置编码: 让模型区分第 0, 1, 2, ... 个 action token
@@ -328,7 +374,19 @@ class FlowPlannerDecoder(nn.Module):
 
         # 轨迹预投影
         x = self.preproj(x)  # (B, P, hidden_dim)
-        
+
+        # ===== Anchor cross-attention injection =====
+        # Anchor 条件通过 cross-attention 注入到轨迹 token (而不是像 goal 一样
+        # 加到 AdaLN 的条件里)。trajectory token 作为 Query，anchor token 作为
+        # Key/Value，主动去"读" anchor 的信息。output_proj 零初始化，保证训练早期
+        # 不改变行为；cfg_flags=0 的样本直接 zero-out anchor_tokens，实现 CFG。
+        if self.anchor_state_dim > 0 and model_extra.get('anchor_traj') is not None:
+            anchor_traj = model_extra['anchor_traj'].float()      # (B, T, anchor_state_dim)
+            anchor_tokens = self.anchor_encoder(anchor_traj)       # (B, L, hidden_dim)
+            anchor_mask = cfg_flags.float().view(B, 1, 1)          # (B, 1, 1)
+            anchor_tokens = anchor_tokens * anchor_mask
+            x = self.anchor_cross_attn(x, anchor_tokens)           # (B, P, hidden_dim)
+
         # ===== Step C: 准备多模态输入 =====
         # 将轨迹 token 作为第三个模态加入
         encodings.append(x)       # [agents_enc, lanes_enc, traj_enc]
@@ -339,19 +397,14 @@ class FlowPlannerDecoder(nn.Module):
         routes_cond = routes_cond.unsqueeze(1)                  # (B, 1, hidden_dim)
         action_pe = self.action_pe.unsqueeze(0).repeat(B, 1, 1) # (B, P, hidden_dim)
 
-        # Conditioning embedding: goal (legacy, (B,1,H) broadcast) OR
-        # anchor (new, per-action-token (B,P,H)). Exactly one is active.
+        # Legacy goal conditioning: 2D endpoint (B,1,H) additive into AdaLN.
+        # Anchor 路径不走这里 (已经通过 cross-attention 注入 x 了)。
         cond_embedding = 0
         if self.goal_dim > 0 and model_extra.get('goal_point') is not None:
             gp = model_extra['goal_point'].float()                # (B, 2)
             cond_embedding = self.goal_proj(gp).unsqueeze(1)      # (B, 1, hidden_dim)
             goal_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)
             cond_embedding = cond_embedding * goal_mask
-        elif self.anchor_state_dim > 0 and model_extra.get('anchor_traj') is not None:
-            anchor_traj = model_extra['anchor_traj'].float()      # (B, T, anchor_state_dim)
-            cond_embedding = self.anchor_encoder(anchor_traj)     # (B, P, hidden_dim)
-            anchor_mask = cfg_flags.float().unsqueeze(-1).unsqueeze(-1)
-            cond_embedding = cond_embedding * anchor_mask
 
         # Combined condition y: used by FinalLayer's AdaLN modulation.
         y = time_cond + routes_cond + action_pe + cfg_embedding + cond_embedding  # (B, P, hidden_dim)
@@ -366,7 +419,7 @@ class FlowPlannerDecoder(nn.Module):
             routes_cond=routes_cond,      # (B, 1, hidden_dim)
             action_encoding=action_pe,    # (B, P, hidden_dim) — 仅用于 trajectory 模态
             cfg_embedding=cfg_embedding,  # (B, 1, hidden_dim) — 仅用于 trajectory 模态
-            goal_embedding=cond_embedding,  # (B,1,H) goal OR (B,P,H) anchor — same slot
+            goal_embedding=cond_embedding,  # (B,1,H) legacy goal; 0 for anchor
             attn_dist=attn_dist           # (B, N, N) 距离矩阵用于 attention bias
         )
         
@@ -564,18 +617,20 @@ class FlowPlannerDiT(nn.Module):
         routes_cond = None,     # (B, 1, hidden_dim) 路由条件
         action_encoding = None, # (B, P, hidden_dim) action 位置编码
         cfg_embedding = None,   # (B, 1, hidden_dim) CFG 嵌入
-        goal_embedding = 0,     # (B,1,H) goal / (B,P,H) anchor / 0 — trajectory 条件槽
+        goal_embedding = 0,     # (B,1,H) legacy goal only; 0 when using anchor
         attn_dist = None,       # (B, N, N) 距离矩阵
     ):
         """
         完整 DiT 前向传播。
-        
+
         为每个模态构建各自的条件向量:
           - agents / lanes 的条件: time + routes
-          - trajectory 的条件: time + routes + action_pe + cfg + (goal OR anchor)
-        
-        ``goal_embedding`` 这个形参名保留是为了兼容，但实际同一槽位既承载
-        老的 (B,1,H) goal 也承载新的 (B,P,H) anchor，二选一。加法广播能自然处理。
+          - trajectory 的条件: time + routes + action_pe + cfg + goal (legacy)
+
+        ``goal_embedding`` 只承载 legacy 的 2D endpoint goal（(B,1,H) 加法广播）。
+        Trajectory anchor **不走这条 AdaLN 路径** — 它在
+        ``FlowPlannerDecoder.forward`` 里已经通过 cross-attention 写入 trajectory
+        token，DiT 内部看到的 traj_enc 已包含 anchor 信息。
         """
         other_modality_conds = [time_cond + routes_cond] * (len(modality_tokens) - 1)
         ego_traj_conds = [time_cond + routes_cond + action_encoding + cfg_embedding + goal_embedding]

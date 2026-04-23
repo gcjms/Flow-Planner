@@ -172,19 +172,23 @@ class FlowPlanner(DiffusionADPlanner):
         idx = find_nearest_goal_torch(raw_point, vocab)  # (B,)
         return vocab[idx]  # (B, 2)
 
-    def _get_anchor_for_gt(self, data: NuPlanDataSample):
-        """Find the nearest anchor trajectory for each GT future in the batch.
+    def _get_anchor_index_for_gt(self, data: NuPlanDataSample):
+        """Return the nearest-anchor index (B,) for each GT future.
 
-        Returns:
-            anchor_traj: (B, T, 3) float tensor on ``self.device``, or ``None``
-            if the anchor vocab is not configured.
+        Aligned to the **last** ``T_anchor`` frames of ``data.ego_future``,
+        which matches what the model actually predicts (see
+        ``ModelInputProcessor`` using ``ego_future[..., -future_len:, :3]``).
+        This also tolerates raw ego_future being longer than ``T_anchor``
+        without asserting, as long as it has at least ``T_anchor`` frames.
+
+        Returns ``None`` if the anchor vocab is not configured.
         """
         if self._anchor_vocab_tensor is None:
             return None
         from flow_planner.goal.anchor_utils import find_nearest_anchor_torch
 
-        vocab = self._anchor_vocab_tensor.to(self.device)  # (K, T, 3)
-        K, T_anchor, _ = vocab.shape
+        vocab = self._anchor_vocab_tensor.to(self.device)  # (K, T_anchor, 3)
+        _, T_anchor, _ = vocab.shape
 
         gt_future = data.ego_future  # (B, T_future, D); D >= 3
         if gt_future.shape[-1] < 3:
@@ -192,17 +196,26 @@ class FlowPlanner(DiffusionADPlanner):
                 f"ego_future needs at least 3 channels (x, y, heading); got "
                 f"{gt_future.shape[-1]}. The anchor path requires heading."
             )
-
         T_future = gt_future.shape[1]
-        if T_anchor != T_future:
+        if T_future < T_anchor:
             raise ValueError(
-                f"Anchor horizon T={T_anchor} must match data.ego_future T={T_future}. "
-                f"Regenerate anchor_vocab.npy with --traj_len={T_future}."
+                f"ego_future T={T_future} is shorter than anchor horizon T={T_anchor}. "
+                f"Regenerate anchor_vocab.npy with --traj_len={T_future} or extend "
+                "the dataset future window."
             )
 
-        gt_traj = gt_future[:, :T_anchor, :3].float().to(self.device)  # (B, T, 3)
-        idx = find_nearest_anchor_torch(gt_traj, vocab)                # (B,)
-        return vocab[idx]                                              # (B, T, 3)
+        # Align to the LAST T_anchor frames (same slice the model actually predicts).
+        gt_traj = gt_future[:, -T_anchor:, :3].float().to(self.device)  # (B, T_anchor, 3)
+        return find_nearest_anchor_torch(gt_traj, vocab)                # (B,)
+
+    def _get_anchor_for_gt(self, data: NuPlanDataSample):
+        """Return the nearest anchor trajectory (B, T_anchor, 3) for each GT
+        future in the batch, or ``None`` if the anchor vocab is not configured.
+        """
+        idx = self._get_anchor_index_for_gt(data)
+        if idx is None:
+            return None
+        return self._anchor_vocab_tensor.to(idx.device)[idx]  # (B, T_anchor, 3)
 
     def forward_train(self, data: NuPlanDataSample):
         '''

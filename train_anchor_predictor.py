@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--anchor-state-dim", type=int, default=3,
+                        help="Anchor per-frame state dim (3 for x,y,heading).")
+    parser.add_argument("--anchor-token-num", type=int, default=4,
+                        help="Number of anchor summary tokens for cross-attn.")
+    parser.add_argument("--anchor-attn-heads", type=int, default=8,
+                        help="Cross-attention heads for trajectory -> anchor.")
     return parser.parse_args()
 
 
@@ -74,15 +80,37 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def load_planner(cfg_path: str, ckpt_path: str, anchor_vocab_path: str, device: str):
+def load_planner(
+    cfg_path: str,
+    ckpt_path: str,
+    anchor_vocab_path: str,
+    device: str,
+    anchor_state_dim: int = 3,
+    anchor_token_num: int = 4,
+    anchor_attn_heads: int = 8,
+):
     cfg = load_composed_config(cfg_path)
     OmegaConf.update(cfg, "data.dataset.train.future_downsampling_method", "uniform", force_add=True)
     OmegaConf.update(cfg, "data.dataset.train.predicted_neighbor_num", 0, force_add=True)
-    # Attach anchor vocab to the backbone so predictor can read it.
+
+    # ---- Wire anchor conditioning into BOTH the top-level planner and the
+    # decoder. Without patching the decoder fields the anchor_encoder /
+    # anchor_cross_attn modules are never instantiated and anchor_traj inputs
+    # are silently ignored at inference. ----
     OmegaConf.update(cfg, "model.anchor_vocab_path", anchor_vocab_path, force_add=True)
-    # And make sure legacy goal_vocab is NOT set (mutually exclusive guard in __init__).
     if OmegaConf.select(cfg, "model.goal_vocab_path") is not None:
         OmegaConf.update(cfg, "model.goal_vocab_path", None, force_add=True)
+
+    future_len = OmegaConf.select(cfg, "model.future_len")
+    if future_len is None:
+        raise ValueError("model.future_len missing from config; cannot derive anchor_len.")
+
+    OmegaConf.update(cfg, "model.model_decoder.goal_dim", 0, force_add=True)
+    OmegaConf.update(cfg, "model.model_decoder.anchor_state_dim", anchor_state_dim, force_add=True)
+    OmegaConf.update(cfg, "model.model_decoder.anchor_len", int(future_len), force_add=True)
+    OmegaConf.update(cfg, "model.model_decoder.anchor_token_num", anchor_token_num, force_add=True)
+    OmegaConf.update(cfg, "model.model_decoder.anchor_attn_heads", anchor_attn_heads, force_add=True)
+
     model = instantiate(cfg.model)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -165,6 +193,9 @@ def main() -> None:
         args.planner_ckpt,
         args.anchor_vocab_path,
         args.device,
+        anchor_state_dim=args.anchor_state_dim,
+        anchor_token_num=args.anchor_token_num,
+        anchor_attn_heads=args.anchor_attn_heads,
     )
     model = AnchorPredictor(
         planner_backbone=planner,

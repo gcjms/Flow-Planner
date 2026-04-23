@@ -92,9 +92,10 @@ python visualize_anchors.py \
 2. `flow_planner/goal/anchor_predictor.py`
    - `AnchorPredictor`：复用 `GoalPredictor` 的 scene feature 抽取，只换 label/classification 维度 = K
 3. `flow_planner/model/flow_planner_model/decoder.py`
-   - 新增 `AnchorTrajEncoder`：把 `(B, T, 3)` anchor 切成 P 个与 action token 对齐的 window，MLP → `(B, P, hidden)`
-   - `FlowPlannerDecoder.__init__` 新增 `anchor_state_dim`, `anchor_len` 两个参数（和 `goal_dim` 互斥）
-   - `forward` 里用 `anchor_traj` 替代 `goal_point`；注入方式改为 **逐 action token** 而非 broadcast
+   - 新增 `AnchorTokenEncoder`：`(B, T, 3)` → L 个 learnable query + 单层 cross-attn 得到 `(B, L, hidden)` anchor tokens（L=4）
+   - 新增 `AnchorCrossAttention`：trajectory token 作 Q，anchor token 作 K/V，output_proj 零初始化
+   - `FlowPlannerDecoder.__init__` 新增 `anchor_state_dim` / `anchor_len` / `anchor_token_num` / `anchor_attn_heads`（和 `goal_dim` 互斥）
+   - `forward` 在 DiT 之前做 **一次 cross-attention** 把 anchor 信息写入 trajectory token；anchor 不再进入 AdaLN 的 `y` 加法路径（goal 的 AdaLN additive 仅作为 legacy 保留）
 4. `flow_planner/model/flow_planner_model/flow_planner.py`
    - `__init__` 新增 `anchor_vocab_path`，加载 `(K, T, 3)` 到 `_anchor_vocab_tensor`
    - 新增 `_get_anchor_for_gt` → 供 AnchorPredictor 和 `forward_train` 取 label / 注入条件
@@ -110,25 +111,38 @@ python visualize_anchors.py \
 
 ### 2.2 Planner 配置调整
 
-原 `goal_vocab_path` 配置保持不变。你需要在 model 配置里加：
+提供了两层 config：
+
+1. **model-level**：`flow_planner/script/model/flow_planner_anchor.yaml`
+   — 只负责 FlowPlanner 的模型结构（encoder / decoder / anchor 相关字段），供其他 top-level config 用 `defaults: - model: flow_planner_anchor` 引用。
+2. **top-level**：`flow_planner/script/anchor_finetune.yaml`
+   — 把 `model / data / core / optimizer / scheduler / ema` 全部组合好，**这是** `train_anchor_predictor.py`、
+   `finetune_anchor_planner.py`、`flow_planner.dpo.eval_multidim` 都要传入的那个 `--planner-config`。
+   它的 `pretrained_checkpoint / save_dir / project_root` 按需 override。
+
+关键字段（都由 `flow_planner_anchor.yaml` 写死）：
 
 ```yaml
-# conf/planner.yaml (示意，按实际字段名补)
 model:
   _target_: flow_planner.model.flow_planner_model.flow_planner.FlowPlanner
-  # ...既有字段...
-  anchor_vocab_path: /root/autodl-tmp/anchor_runs/anchor_vocab.npy   # 新增
-  goal_vocab_path: null                                               # 必须置空，二选一
+  anchor_vocab_path: ${project_root}/anchor_vocab.npy   # 新增
+  # goal_vocab_path 不设 → 为 null
   model_decoder:
-    _target_: flow_planner.model.flow_planner_model.decoder.FlowPlannerDecoder
-    # ...既有字段...
     goal_dim: 0                     # 关闭老 goal 通路
     anchor_state_dim: 3             # 开启 anchor (x, y, heading)
-    anchor_len: 80                  # 必须 = future_len
+    anchor_len: ${..future_len}     # 必须 = future_len
+    anchor_token_num: 4             # 压缩成 4 个 anchor summary token
+    anchor_attn_heads: 8            # trajectory -> anchor cross-attn 的 heads
 ```
 
-> 代码里设置了三重 guard：`(goal_vocab_path, anchor_vocab_path)` 互斥、`(goal_dim, anchor_state_dim)` 互斥、
+> 代码里设置了多重 guard：`(goal_vocab_path, anchor_vocab_path)` 互斥、`(goal_dim, anchor_state_dim)` 互斥、
 > `anchor_state_dim>0` 时 `anchor_len>0` 必填。配错的话启动就会 raise，不会默默跑错。
+>
+> **重要**：`train_anchor_predictor.py`、`finetune_anchor_planner.py` 和
+> `flow_planner/dpo/eval_multidim_utils.py::load_planner_model` 都会**自动**把 `model.model_decoder` 下的
+> `anchor_state_dim / anchor_len / anchor_token_num / anchor_attn_heads` 给 patch 上（基于 `anchor_vocab_path`
+> + `future_len`）。即使 `--planner-config` 指向一个不含这些字段的旧 top-level config（如 `goal_finetune.yaml`），
+> 也不会因为缺字段而静默失效。但首选还是 `flow_planner/script/anchor_finetune.yaml`。
 
 ### 2.3 冷启动 smoke test（5 分钟内跑完）
 
@@ -142,38 +156,38 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from flow_planner.dpo.config_utils import load_composed_config
 
-cfg_path = "conf/planner.yaml"
+cfg_path = "flow_planner/script/anchor_finetune.yaml"
 cfg = load_composed_config(cfg_path)
+# Override the vocab path to where you actually saved it (optional if your
+# anchor_finetune.yaml's project_root already resolves to the right place).
 OmegaConf.update(cfg, "model.anchor_vocab_path",
                  "/root/autodl-tmp/anchor_runs/anchor_vocab.npy",
                  force_add=True)
-OmegaConf.update(cfg, "model.goal_vocab_path", None, force_add=True)
-OmegaConf.update(cfg, "model.model_decoder.goal_dim", 0, force_add=True)
-OmegaConf.update(cfg, "model.model_decoder.anchor_state_dim", 3, force_add=True)
-OmegaConf.update(cfg, "model.model_decoder.anchor_len", 80, force_add=True)
+
 model = instantiate(cfg.model).cuda().eval()
 print("model built:", type(model).__name__,
-      "anchor vocab shape:", model._anchor_vocab_tensor.shape)
-
-# Fake batch with a single scene
-# (replace with a real data sample if you have one; smoke test can stop here)
+      "anchor vocab:", tuple(model._anchor_vocab_tensor.shape),
+      "has_anchor_encoder:", hasattr(model.model_decoder, "anchor_encoder"),
+      "has_anchor_cross_attn:", hasattr(model.model_decoder, "anchor_cross_attn"))
 print("OK")
 PY
 ```
 
-预期 stdout：
+预期 stdout（关键是 `has_anchor_encoder: True` 和 `has_anchor_cross_attn: True`）：
 ```
-model built: FlowPlanner anchor vocab shape: torch.Size([128, 80, 3])
+model built: FlowPlanner anchor vocab: (128, 80, 3) has_anchor_encoder: True has_anchor_cross_attn: True
 OK
 ```
 
-如果 `model_decoder` 抱怨 `anchor_encoder` 找不到模块 — 检查你更新了 `decoder.py`，以及 config 里 `_target_` 指向仍是同一个类。
+若 `has_anchor_encoder: False` — 你传入的 top-level config 走的是 `flow_planner` / `flow_planner_goal` 的 model，
+没走 `flow_planner_anchor`。要么换成 `flow_planner/script/anchor_finetune.yaml`，要么在 cfg override 里显式设
+`model.model_decoder.anchor_state_dim=3`、`model.model_decoder.anchor_len=${model.future_len}` 等字段。
 
 ### 2.4 AnchorPredictor 训练
 
 ```bash
 python train_anchor_predictor.py \
-    --planner-config conf/planner.yaml \
+    --planner-config flow_planner/script/anchor_finetune.yaml \
     --planner-ckpt   /root/autodl-tmp/ckpts/flowplanner_no_goal.pth \
     --anchor-vocab-path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
     --train-data-dir  /root/autodl-tmp/nuplan_npz \
@@ -194,25 +208,43 @@ python train_anchor_predictor.py \
 1. `anchor_vocab` 里有"同一方向但速度不同"的近重复簇，CE 分不清 → 调小 K 或提高 `heading_weight`。
 2. Planner backbone 冻结导致 scene feature 不适配 anchor label → 加 `--unfreeze-backbone`。
 
-### 2.5 联合训练 FlowPlanner + anchor 注入（可选，Phase 1 的硬核环节）
+### 2.5 联合训练 FlowPlanner + anchor 注入（Phase 1 硬核环节，**必跑**）
 
-Phase 1 的 Exit Criteria 允许直接从"已有 no-goal planner ckpt + 冻结 anchor predictor"走开路评估（见 §2.6），
-如果走到这一步说明你想看"Flow 生成时真正用 anchor 去 refine"的效果。
+**为什么必跑**：我们新加的 `AnchorTokenEncoder` + `AnchorCrossAttention` 在 no-goal ckpt 里完全不存在权重，
+加载时是随机初始化的 + `anchor_cross_attn.out_proj` 被**零初始化**。这意味着在 finetune 之前，
+anchor 对模型输出的贡献精确等于 0；你直接跑 §2.6 的 `oracle_anchor` 和 `none` 指标会一模一样。
+跑完这一步以后，`oracle_anchor` 才会把 anchor 真正用起来。
 
-**方案 A：从 scratch 训**（最干净，推荐）
-- 用标准训练脚本 `train.py`（老的），config 按 §2.2 设置为 anchor 模式即可。
-- 学习率、batch size 同 no-goal baseline；条件 zero-init 保证早期稳定。
+直接用仓库里的专用脚本（teacher-force oracle anchor）：
 
-**方案 B：finetune no-goal ckpt**
-- `strict=False` 加载 no-goal 权重。`anchor_encoder` 的权重是新的（missing keys），会被 zero-init。
-- 建议 10-20 epoch 小 lr (2e-5) fine-tune。
+```bash
+python finetune_anchor_planner.py \
+    --planner-config flow_planner/script/anchor_finetune.yaml \
+    --planner-ckpt   /root/autodl-tmp/ckpts/flowplanner_no_goal.pth \
+    --anchor-vocab-path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
+    --train-data-dir  /root/autodl-tmp/nuplan_npz \
+    --train-data-list /root/autodl-tmp/nuplan_npz/train_list.json \
+    --val-data-dir    /root/autodl-tmp/nuplan_npz \
+    --val-data-list   /root/autodl-tmp/nuplan_npz/val_list.json \
+    --save-dir        /root/autodl-tmp/anchor_runs/planner_ft_run1 \
+    --epochs 10 --batch-size 32 --lr 2e-5 --decoder-lr-mult 0.1 \
+    --max-train-samples 80000
+```
 
-训练期间关键 metric：
+脚本的默认 lr 分组（可通过 CLI 调）：
+- `anchor_encoder + anchor_cross_attn`：`--lr`（默认 2e-5）
+- 其余 `model_decoder`：`--lr * --decoder-lr-mult`（默认 0.1x）
+- `model_encoder`：**冻结**（`--encoder-lr-mult` 默认 0；若强行解冻会让 AnchorPredictor 的 scene feature 漂走，慎用）
+
+训练期间关键 diagnostic（脚本每个 epoch 会打印）：
+
 | Metric | 期望 |
 |---|---|
 | `ego_planning_loss` | 和 no-goal baseline 相当；anchor 不应该让 loss 变高 |
-| `consistency_loss` | 不变（与 anchor 无关） |
-| anchor zero-init 的 L2 | 前 1-2 个 epoch 应持续增长（模型开始使用 anchor） |
+| `consistency_loss` | 基本不变（与 anchor 无关） |
+| `anchor_out_proj_abs_mean_end` | **必须从 0 开始持续增长**；如果跑完 10 epoch 还接近 0，说明 anchor 路径没收到梯度 |
+
+**跑完这一步产出的 ckpt**（`planner_anchor_best.pth`）就是 §2.6 里各个 `--ckpt_path` 要指向的那个。
 
 ### 2.6 Open-loop 多维评估（Phase 1 核心 gate）
 
@@ -269,10 +301,11 @@ CLI 已经在本分支加好 `--anchor_vocab_path`, `--anchor_mode`, `--anchor_p
 | comfort_score | Z | ~Z | ~Z | 舒适度不能显著劣化 |
 
 如果 `oracle_anchor ≈ none`：
-1. 确认 `anchor_traj` 进到了 decoder：在 `forward_train` 打印 `decoder_model_extra.keys()` 看有没有 `anchor_traj`。
-2. 确认 `AnchorTrajEncoder` 的 last-layer 权重非零：训练若干 step 后 `decoder.anchor_encoder.window_mlp[-1].weight.abs().mean()` 应 > 0。
-3. CFG 概率太高：unconditioned 占比 50% 可能过高，试 `cfg_prob=0.2`。
-4. 本质问题：anchor 没有足够区分力，回到 §1.1 调 K。
+1. **没跑 §2.5 finetune** — 最常见。预训 ckpt 里 `anchor_cross_attn.out_proj` 零初始化，不 finetune 永远是 0 贡献。先跑 §2.5。
+2. finetune 跑了但 `anchor_out_proj_abs_mean_end` 仍接近 0：检查 `decoder.anchor_cross_attn.out_proj.weight.abs().mean()` 以及 `decoder.anchor_encoder` 参数的 `grad` 有没有被生成；很可能是 param group 没把它收进去（看 finetune 脚本启动时打印的 `[param-group] ... n_params=...` 是否合理）。
+3. 确认 `anchor_traj` 进到了 decoder：在 `forward_train` 打印 `decoder_model_extra.keys()` 看有没有 `anchor_traj`。
+4. CFG 概率太高：unconditioned 占比 30% 在 finetune 早期可能过高，试 `cfg_prob=0.1` 跑 1 个 epoch 看 out_proj 是否更快脱离 0。
+5. 本质问题：anchor 没有足够区分力，回到 §1.1 调 K。
 
 ---
 
@@ -285,9 +318,12 @@ CLI 已经在本分支加好 `--anchor_vocab_path`, `--anchor_mode`, `--anchor_p
 - [ ] `stats.png` endpoint 距离分布合理
 
 ### 3.2 Phase 1 Smoke
-- [ ] `flow_planner.model.flow_planner_model.decoder.AnchorTrajEncoder` 可 import
+- [ ] `flow_planner.model.flow_planner_model.decoder.AnchorTokenEncoder` 可 import
+- [ ] `flow_planner.model.flow_planner_model.decoder.AnchorCrossAttention` 可 import
 - [ ] `FlowPlanner.__init__` 接受 `anchor_vocab_path` 不报错
 - [ ] `model._anchor_vocab_tensor.shape == (K, 80, 3)`
+- [ ] `model.model_decoder.anchor_encoder` 和 `model.model_decoder.anchor_cross_attn` 均存在
+- [ ] `model.model_decoder.anchor_cross_attn.out_proj.weight.abs().max() == 0`（零初始化）
 - [ ] `model(data, mode='train')` 前向不崩
 - [ ] `model(data, mode='inference', anchor_traj=anchor)` 前向不崩
 - [ ] CFG replication 正确：`use_cfg=True` 时 `anchor_traj` 被拼成 `(2B, T, 3)`

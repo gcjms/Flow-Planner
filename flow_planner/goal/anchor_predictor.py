@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from flow_planner.goal.anchor_utils import find_nearest_anchor_torch
 
 
 class AnchorPredictor(nn.Module):
@@ -97,15 +96,18 @@ class AnchorPredictor(nn.Module):
         return features
 
     def get_anchor_labels(self, data) -> torch.Tensor:
-        """Nearest-anchor indices for a batch (used as classification target)."""
-        anchor_traj = self.backbone._get_anchor_for_gt(data)
-        if anchor_traj is None:
+        """Nearest-anchor indices for a batch (used as classification target).
+
+        Delegates to the backbone's index lookup so we don't do
+        ``find_nearest(find_nearest(gt))`` (which was idempotent but wasted a
+        full (B, K) distance matrix every step).
+        """
+        indices = self.backbone._get_anchor_index_for_gt(data)
+        if indices is None:
             raise ValueError(
                 "anchor vocabulary is required to build training labels "
-                "(backbone._get_anchor_for_gt returned None)"
+                "(backbone._get_anchor_index_for_gt returned None)"
             )
-        vocab = self.backbone._anchor_vocab_tensor.to(anchor_traj.device)
-        indices = find_nearest_anchor_torch(anchor_traj, vocab)
         return indices
 
     def forward(self, data) -> torch.Tensor:
