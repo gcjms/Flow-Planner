@@ -1,0 +1,36 @@
+---
+description: Always read and update the anchor work log for this project
+alwaysApply: true
+---
+
+# Anchor 分支工作日志规则
+
+本仓库当前主开发分支是 `feature/anchor`。该分支的**所有实验结果、架构决策、bug 修复、下一步计划**都必须沉淀到：
+
+**`docs/ANCHOR_WORK_LOG.md`**
+
+这份文件同时作为**组内汇报 + 论文素材**，不能丢。
+
+## 每次新对话开工前
+
+1. **先读** `docs/ANCHOR_WORK_LOG.md` 最新内容，理解当前进度、最近一次实验数据、悬而未决的问题
+2. 如果还没读就给出建议，会给出错误的路线判断
+
+## 每次交互产生以下情况之一时，必须更新这份日志
+
+- 用户报告了新的实验数字（carlo metrics, collision rate, progress, route 等）→ 追加到"实验记录"表
+- 修了一个 bug → 写进"已修复问题清单"
+- 做了架构决策（换模块、改注入方式、改 loss、改配置）→ 写进"关键决策记录"
+- 产出了新的脚本 / 文档 / 配置 → 写进"关键代码文件索引"
+- 跑完了一个阶段的 exit criteria → 在对应 Phase 打勾
+- 明确了下一步做什么 → 更新"下一步 TODO"
+
+## 更新方式
+
+- **追加优于重写**：新信息尾部加日期小节，不要覆盖老内容
+- **数字必须有上下文**：collision 5.8% 必须写明在哪个 ckpt、哪个 eval mode、多少场景
+- **保留失败**：失败的实验和错误路径也要留着，论文的 ablation 和审稿问答会用到
+
+## 同步
+
+日志更新完成后提醒用户：如果还没 commit，建议一起 commit，避免跨机器丢。
