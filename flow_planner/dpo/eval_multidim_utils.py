@@ -111,7 +111,9 @@ def _unwrap_state_dict(ckpt: Any) -> Dict[str, Any]:
             "ema_state_dict",
             "state_dict",
             "model_state_dict",
+            "anchor_predictor_state_dict",
             "goal_predictor_state_dict",
+            "model",
         ):
             value = ckpt.get(key)
             if isinstance(value, dict):
@@ -121,10 +123,27 @@ def _unwrap_state_dict(ckpt: Any) -> Dict[str, Any]:
     if not isinstance(state_dict, dict):
         raise TypeError(f"Expected checkpoint dict, got {type(state_dict)!r}")
 
-    for prefix in ("module.", "model.", "goal_predictor."):
+    for prefix in ("module.", "model.", "goal_predictor.", "anchor_predictor."):
         if state_dict and all(k.startswith(prefix) for k in state_dict):
             state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
 
+    return state_dict
+
+
+def _extract_predictor_head_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize predictor checkpoints to a clean ``head.*`` state dict.
+
+    ``train_goal_predictor.py`` / ``train_anchor_predictor.py`` save
+    ``payload["model"] = predictor.state_dict()`` which contains both
+    ``backbone.*`` and ``head.*`` keys. At eval time the planner backbone is
+    supplied separately, so we only want the predictor head weights.
+    """
+    if any(k.startswith("head.") for k in state_dict):
+        return {
+            k[len("head."):]: v
+            for k, v in state_dict.items()
+            if k.startswith("head.")
+        }
     return state_dict
 
 
@@ -222,15 +241,8 @@ def load_goal_predictor_model(
     )
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = _unwrap_state_dict(ckpt)
-
-    if any(k.startswith(("backbone.", "head.")) for k in state_dict):
-        predictor_state = {
-            k: v for k, v in state_dict.items() if not k.startswith("backbone.")
-        }
-        missing, unexpected = predictor.load_state_dict(predictor_state, strict=False)
-    else:
-        missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
+    state_dict = _extract_predictor_head_state_dict(_unwrap_state_dict(ckpt))
+    missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
 
     if missing:
         logger.warning("Goal predictor missing %d keys: %s", len(missing), missing[:5])
@@ -273,15 +285,8 @@ def load_anchor_predictor_model(
     )
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = _unwrap_state_dict(ckpt)
-
-    if any(k.startswith(("backbone.", "head.")) for k in state_dict):
-        predictor_state = {
-            k: v for k, v in state_dict.items() if not k.startswith("backbone.")
-        }
-        missing, unexpected = predictor.load_state_dict(predictor_state, strict=False)
-    else:
-        missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
+    state_dict = _extract_predictor_head_state_dict(_unwrap_state_dict(ckpt))
+    missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
 
     if missing:
         logger.warning("Anchor predictor missing %d keys: %s", len(missing), missing[:5])

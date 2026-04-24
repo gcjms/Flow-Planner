@@ -258,8 +258,8 @@ cd /root/Flow-Planner
 
 # 先保存一个公用 manifest，确保三个 run 看同一批场景
 python -m flow_planner.dpo.eval_multidim \
-    --config_path conf/planner.yaml \
-    --ckpt_path   /root/autodl-tmp/ckpts/flowplanner_anchor_ft.pth \
+    --config_path flow_planner/script/anchor_finetune.yaml \
+    --ckpt_path   /root/autodl-tmp/anchor_runs/planner_ft_run1/planner_anchor_best.pth \
     --anchor_vocab_path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
     --scene_dir   /root/autodl-tmp/nuplan_npz \
     --write_scene_manifest /root/autodl-tmp/anchor_runs/eval_manifest.json \
@@ -269,8 +269,8 @@ python -m flow_planner.dpo.eval_multidim \
 
 # predicted_anchor (同一 manifest，同一 ckpt)
 python -m flow_planner.dpo.eval_multidim \
-    --config_path conf/planner.yaml \
-    --ckpt_path   /root/autodl-tmp/ckpts/flowplanner_anchor_ft.pth \
+    --config_path flow_planner/script/anchor_finetune.yaml \
+    --ckpt_path   /root/autodl-tmp/anchor_runs/planner_ft_run1/planner_anchor_best.pth \
     --anchor_vocab_path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
     --anchor_predictor_ckpt /root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth \
     --scene_dir   /root/autodl-tmp/nuplan_npz \
@@ -278,10 +278,27 @@ python -m flow_planner.dpo.eval_multidim \
     --anchor_mode predicted_anchor \
     --output_json /root/autodl-tmp/anchor_runs/eval_predicted.json
 
+# predicted_anchor_rerank (top3 候选 + 在线启发式 rerank；不使用 GT 未来参与选择)
+python -m flow_planner.dpo.eval_multidim \
+    --config_path flow_planner/script/anchor_finetune.yaml \
+    --ckpt_path   /root/autodl-tmp/anchor_runs/planner_ft_run1/planner_anchor_best.pth \
+    --anchor_vocab_path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
+    --anchor_predictor_ckpt /root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth \
+    --scene_dir   /root/autodl-tmp/nuplan_npz \
+    --scene_manifest /root/autodl-tmp/anchor_runs/eval_manifest.json \
+    --anchor_mode predicted_anchor_rerank \
+    --predicted_anchor_top_k 3 \
+    --rerank_collision_weight 40 \
+    --rerank_ttc_weight 20 \
+    --rerank_route_weight 25 \
+    --rerank_comfort_weight 10 \
+    --rerank_progress_weight 0 \
+    --output_json /root/autodl-tmp/anchor_runs/eval_predicted_rerank_top3.json
+
 # oracle_anchor (同一 manifest，同一 ckpt)
 python -m flow_planner.dpo.eval_multidim \
-    --config_path conf/planner.yaml \
-    --ckpt_path   /root/autodl-tmp/ckpts/flowplanner_anchor_ft.pth \
+    --config_path flow_planner/script/anchor_finetune.yaml \
+    --ckpt_path   /root/autodl-tmp/anchor_runs/planner_ft_run1/planner_anchor_best.pth \
     --anchor_vocab_path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
     --scene_dir   /root/autodl-tmp/nuplan_npz \
     --scene_manifest /root/autodl-tmp/anchor_runs/eval_manifest.json \
@@ -289,8 +306,13 @@ python -m flow_planner.dpo.eval_multidim \
     --output_json /root/autodl-tmp/anchor_runs/eval_oracle.json
 ```
 
-CLI 已经在本分支加好 `--anchor_vocab_path`, `--anchor_mode`, `--anchor_predictor_ckpt`
-这 3 个参数，不需要再改 argparse。
+CLI 已经在本分支加好 `--anchor_vocab_path`, `--anchor_mode`, `--anchor_predictor_ckpt`，
+以及 `predicted_anchor_rerank` 所需的 `--predicted_anchor_top_k` / `--rerank_*` 参数。
+
+> 兼容性说明：`load_anchor_predictor_model()` 现在会正确读取
+> `train_anchor_predictor.py` / `train_goal_predictor.py` 保存的 `payload["model"]`
+> 格式 checkpoint，并且只加载 predictor 的 `head.*` 权重；如果之前看到
+> `Anchor predictor missing 6 keys / unexpected 9 keys`，请更新到当前 commit 后重跑。
 
 **Phase 1 Exit Criteria**（严格 gate，达不到就停下来 debug，不推 Phase 2）：
 
