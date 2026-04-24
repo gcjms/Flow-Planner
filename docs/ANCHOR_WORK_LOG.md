@@ -9,9 +9,9 @@
 ## 0. TL;DR（给自己看的一段话）
 
 - **做什么**：把 Flow Planner 的条件接口从 **2D goal 点** 换成 **完整轨迹 anchor**（Hydra-MDP / MultiPath 风格），解决 goal 线 `oracle_goal ≈ none`、mode collapse、cross-goal DPO 学不动这三个问题。
-- **当前状态**：Phase 0/1 打通，`oracle_anchor` 已显著好于 `none`（架构 work），**Phase 1 exit criteria 已满足**。
-- **当前瓶颈**：`oracle_anchor` (1.6%) vs `predicted_anchor` (5.8%) 有 3.6× 碰撞率 gap，这是 **exposure bias / predictor ↔ planner 协同** 问题，属于 Phase 2 要解决的事。
-- **下一步**：(1) rerank 权重调优  (2) oracle-top-k rerank ablation 定位瓶颈在 predictor 还是 planner  (3) Phase 2 scheduled anchor sampling + multi-target distillation。
+- **当前状态**：Phase 0/1 工程链路已打通，`oracle_anchor` 证明架构本身可用；但新增的 **raw `flowplanner_no_goal.pth` baseline = `2.0% / 0.3275 / 0.8547`** 表明当前 `predicted_anchor` / rerank 版本**还没有真正超过原始 FlowPlanner**。
+- **当前瓶颈**：不只是 `oracle_anchor` (1.6%) vs `predicted_anchor` (5.8%) 的 3.6× gap；还多了一个更现实的问题：**raw no-goal baseline 2.0% 明显优于当前 predicted 5.8% / 5.4%**，说明 anchor finetune + predictor 这条线上还存在明显回归或协同问题。
+- **下一步**：(1) 跑 `oracle_anchor_rerank` 定位锅在 predictor 还是 planner  (2) 分析为什么 `planner_ft_run1 + anchor_mode none` 会从 raw baseline `2.0%` 退到 `7.2%`  (3) 再决定 Phase 2 先做 scheduled anchor sampling 还是 predictor metric heads。
 
 ---
 
@@ -40,6 +40,12 @@
 | `predicted_anchor` vs `none` collision 相对下降 | > 10% | **19%**（7.2% → 5.8%）✅ |
 | 同场景 top-5 轨迹 minFDE 分散度 | > 2× baseline | 未测 |
 | DPO chosen/rejected gap 学得动 | 是 | Phase 3 未开始 |
+
+> 注：上表里的 `none = 7.2% / 0.35 / 0.85` 是 **`planner_ft_run1/planner_anchor_best.pth` 在 `anchor_mode none`** 下的内部对照。
+> 2026-04-25 新补跑的 **官方原始 `flowplanner_no_goal.pth + anchor_mode none`** 为 `2.0% / 0.3275 / 0.8547`。
+> 因此对外汇报时必须区分：
+> - **内部对照**：anchor finetune 后关掉 anchor
+> - **外部基线**：原始 FlowPlanner（更公平）
 
 ---
 
@@ -118,9 +124,11 @@
 ### 3.4 评测
 | 文件 | 作用 |
 |---|---|
-| `flow_planner/dpo/eval_multidim.py` | 主评测入口；支持 `none / route_anchor / predicted_anchor / oracle_anchor / predicted_anchor_rerank` |
-| `flow_planner/dpo/eval_multidim_utils.py` | 模型加载 + anchor 选择 + rerank 上下文构建；**已修 loader bug** |
-| `run_anchor_raw_no_goal_eval.sh` | AutoDL 一键补跑 **官方 `flowplanner_no_goal.pth` + `anchor_mode none`**；优先复用已有 manifest，若不存在则自动创建固定 500-scene manifest |
+| `flow_planner/dpo/eval_multidim.py` | 主评测入口；支持 `none / route_anchor / predicted_anchor / oracle_anchor / predicted_anchor_rerank / oracle_anchor_rerank` |
+| `flow_planner/dpo/eval_multidim_utils.py` | 模型加载 + anchor 选择 + rerank 上下文构建；**已修 loader bug**，并已支持 `oracle_anchor_rerank`；日志输出统一改为 `conditioning`，避免 `goal_mode:none` 误导 |
+| `run_anchor_eval_common.sh` | AutoDL 部署共用 helper：统一路径、manifest 复用、summary 打印 |
+| `run_anchor_raw_no_goal_eval.sh` | AutoDL 一键补跑 **官方 `flowplanner_no_goal.pth` + `anchor_mode none`** |
+| `run_anchor_eval_suite.sh` | AutoDL 总控脚本：按同一 manifest 跑 `raw_no_goal / planner_ft_none / predicted_anchor / rerank A / oracle / oracle_rerank`，也支持只跑子集 |
 
 ### 3.5 文档
 | 文件 | 作用 |
@@ -133,6 +141,34 @@
 ---
 
 ## 4. 实验记录（append-only，按时间倒序）
+
+### 2026-04-25 — Raw no-goal baseline（`flowplanner_no_goal.pth + anchor_mode none`）
+
+**Checkpoint**：`/root/autodl-tmp/ckpts/flowplanner_no_goal.pth`
+**脚本**：`run_anchor_raw_no_goal_eval.sh`
+**数据集**：500 scenes
+**结果来源**：用户回传。若按脚本默认执行，则优先复用已有 `eval_manifest.json`。
+
+| 模式 | collision | progress | route |
+|---|---|---|---|
+| `raw_no_goal_baseline` | **2.0%** | **0.3275** | **0.8547** |
+
+**关键解读**：
+1. **这是目前最重要的新基线**：原始 FlowPlanner 的 collision `2.0%`，远好于 `planner_ft_run1 + anchor_mode none` 的 `7.2%`。
+2. **当前 predicted 线还没超过原始模型**：
+   - `predicted_anchor top1` = `5.8% / 0.3710 / 0.8408`
+   - `predicted_anchor_rerank A` = `5.8% / 0.3833 / 0.8595`
+   - `predicted_anchor_rerank C` = `5.4% / 0.3771 / 0.8372`
+   在 collision 维度都明显差于 raw baseline `2.0%`。
+3. **`oracle_anchor` 只比 raw baseline 略好一点**：`1.6%` vs `2.0%`，说明 anchor 架构上限是有增益的，但当前 predicted pipeline 还没有把这个增益兑现出来。
+4. **新的研究问题出现了**：除了 predictor/planner 协同外，还要解释为什么 `planner_ft_run1 + none` 会相对 raw baseline 明显退化。
+
+### 2026-04-25 — P1 诊断工具落地（`oracle_anchor_rerank`）
+
+- 已在 `eval_multidim.py` / `eval_multidim_utils.py` 加入 `oracle_anchor_rerank`
+- 实现方式：从 GT future 在 anchor vocab 中取 **top-k 最近邻 anchor** 作为候选池；planner 分别生成轨迹后，复用现有 `TrajectoryScorer` rerank
+- 作用：**排除 predictor 因素**，只测 planner 对“非 top-1 但仍接近 GT 的 anchor”是否鲁棒
+- 状态：**代码已就绪，结果待跑**
 
 ### 2026-04-25 — Top-3 rerank 权重扫描（A / B / C）
 
@@ -241,6 +277,7 @@
   1. `_unwrap_state_dict` 新增认 `"model"` 和 `"anchor_predictor_state_dict"`
   2. 新增 `_extract_predictor_head_state_dict`，只保留 `head.*` 权重（backbone 由 load_planner 负责）
 - **影响**：修完 collision 58% → 5.8%，**证明架构本身完全 work**
+- **重要备注**：commit `a047873` 的 message 写成了 `fix state num match bug`，但实际 diff 修的是 **predictor checkpoint loader**，不是模型 `state_dim/state_num` 维度错误；而且这套 loader 修复同时覆盖 `load_goal_predictor_model()` 和 `load_anchor_predictor_model()`，因此**旧 goal predictor 线理论上也可能中招过同类错加载**。
 
 ### B6. `_get_anchor_for_gt` shape alignment 脆弱
 - **症状**：某些场景 anchor 对齐错帧
@@ -257,7 +294,22 @@
 
 ## 6. 当前瓶颈分析
 
-### 6.1 oracle vs predicted 的 3.6× collision gap
+### 6.1 原始 FlowPlanner baseline 改变了参照系
+
+| 模式 | collision | progress | route |
+|---|---|---|---|
+| raw `flowplanner_no_goal.pth` + `none` | **2.0%** | 0.3275 | 0.8547 |
+| `planner_ft_run1` + `none` | 7.2% | 0.35 | 0.85 |
+| `predicted_anchor` top1 | 5.8% | 0.3710 | 0.8408 |
+| `predicted_anchor_rerank` A | 5.8% | 0.3833 | 0.8595 |
+| `oracle_anchor` | **1.6%** | 0.347 | 0.837 |
+
+这说明：
+1. **过去把 `planner_ft none` 当 baseline 的说法只能做内部对照**，不能再当“原始 FlowPlanner baseline”。
+2. **当前 predicted 系统在 collision 上仍输给原始模型**；即便 rerank 到 C，最好也只是 `5.4%`。
+3. **anchor 架构不是没用**，因为 `oracle_anchor=1.6%` 仍优于 raw baseline `2.0%`；但目前训练/推理链路还没把这个潜力稳定转化成 deployable 改善。
+
+### 6.2 oracle vs predicted 的 3.6× collision gap
 
 | 模式 | collision |
 |---|---|
@@ -269,14 +321,14 @@
 1. **Predictor ↔ Planner 协同不完美**：top-1 ≠ 最近邻 anchor，会差几名
 2. **Exposure bias**：planner 训练时只见过完美 anchor，推理时稍有偏差就容易出问题
 
-### 6.2 为什么 rerank 当前没完全解决
+### 6.3 为什么 rerank 当前没完全解决
 
 - `TrajectoryScorer` **不做权重归一化**，而是直接 `sum(weight_i * score_i)`；因此看的是**相对比例**，不是绝对数值。
 - 当前 top-3 sweep 表明：**A (`80,15,5,0,0`) 是最好的默认折中点**，它相对 top1 不伤 collision，却能同时抬高 route 和 progress。
 - **C (`100,0,0,0,0`) 只能当纯安全诊断**：它说明 top-3 候选池里按 collision 选，最好也就到 `5.4%`，仍然远高于 oracle `1.6%`。
 - **B (`40,20,15,25,0`) 证明 comfort 不能当安全代理**：高 comfort 权重会偏好平顺动作，但闭环里急刹/急避有时正是正确避撞动作。
 
-### 6.3 关键诊断实验（待做）
+### 6.4 关键诊断实验（待做）
 
 **Oracle top-k rerank**：从 GT 邻居 top-k anchor 里选（oracle candidate pool），看 rerank 会不会比 oracle top-1 差。
 - 如果 oracle top-k rerank ≈ oracle top-1 → planner 对不同 anchor 都鲁棒 → 瓶颈在 predictor 排序
@@ -292,10 +344,11 @@
 - [x] **P0 进一步结论**：rerank 只能带来小幅修正，无法关闭 `predicted` vs `oracle` 的主要 gap，所以下一步必须做 P1 诊断
 
 ### P1 — 诊断（半天）
-- [ ] 在 `eval_multidim.py` 增加 `oracle_anchor_rerank` 模式（从 oracle 邻居 top-k 里 rerank）
+- [x] 在 `eval_multidim.py` 增加 `oracle_anchor_rerank` 模式（从 oracle 邻居 top-k 里 rerank）
 - [ ] 跑 oracle top-k rerank，定位瓶颈位置（见 §6.3）
-- [ ] 单独补跑 **官方原始 `flowplanner_no_goal.pth` + `anchor_mode none`**，把它和 `planner_ft_run1 + anchor_mode none` 分开记，避免后续汇报混淆“原始 baseline”和“anchor finetune 后关掉 anchor 的 baseline”
+- [x] 单独补跑 **官方原始 `flowplanner_no_goal.pth` + `anchor_mode none`**，结果：`2.0% / 0.3275 / 0.8547`
 - [x] 已补 AutoDL 脚本：`run_anchor_raw_no_goal_eval.sh`
+- [ ] 分析为什么 `planner_ft_run1 + none` 从 raw baseline `2.0%` 退化到 `7.2%`
 
 ### P2 — Phase 2 开工（3–5 天）
 - [ ] Scheduled anchor sampling：finetune 时以概率 p 喂 predictor top-1 替代 oracle，p 从 0 ramp 到 0.3~0.5
@@ -353,6 +406,24 @@ python -m flow_planner.dpo.eval_multidim \
     --rerank_progress_weight 0.0
 ```
 
+### Eval：P1 `oracle_anchor_rerank`
+```bash
+python -m flow_planner.dpo.eval_multidim \
+    --config_path flow_planner/script/anchor_finetune.yaml \
+    --ckpt_path /root/autodl-tmp/anchor_runs/planner_ft_run1/planner_anchor_best.pth \
+    --anchor_vocab_path /root/autodl-tmp/anchor_runs/anchor_vocab.npy \
+    --scene_dir /root/autodl-tmp/nuplan_npz \
+    --scene_manifest /root/autodl-tmp/anchor_runs/eval_manifest.json \
+    --anchor_mode oracle_anchor_rerank \
+    --predicted_anchor_top_k 3 \
+    --rerank_collision_weight 80 \
+    --rerank_ttc_weight 15 \
+    --rerank_route_weight 5 \
+    --rerank_comfort_weight 0 \
+    --rerank_progress_weight 0.0 \
+    --output_json /root/autodl-tmp/anchor_runs/eval_oracle_rerank.json
+```
+
 ### 对照组
 - `--anchor_mode none` → 无条件 baseline
 - `--anchor_mode oracle_anchor` → 用 GT 最近邻 anchor（上限）
@@ -373,6 +444,16 @@ RAW_CKPT=/root/autodl-tmp/ckpts/flowplanner_no_goal.pth \
 ANCHOR_VOCAB_PATH=/root/autodl-tmp/anchor_runs/anchor_vocab.npy \
 MANIFEST_PATH=/root/autodl-tmp/anchor_runs/eval_manifest.json \
 bash run_anchor_raw_no_goal_eval.sh
+```
+
+### 一次跑完整 anchor 对照组（推荐部署入口）
+```bash
+bash run_anchor_eval_suite.sh
+```
+
+只跑子集也行，例如：
+```bash
+bash run_anchor_eval_suite.sh raw_no_goal planner_ft_none oracle_anchor_rerank
 ```
 
 ---

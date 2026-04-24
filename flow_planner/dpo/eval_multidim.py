@@ -101,6 +101,7 @@ def main():
             "predicted_anchor",
             "predicted_anchor_rerank",
             "oracle_anchor",
+            "oracle_anchor_rerank",
         ],
         help="Trajectory-anchor conditioning mode. Mutually exclusive with goal_mode.",
     )
@@ -108,14 +109,14 @@ def main():
         "--anchor_predictor_ckpt",
         type=str,
         default=None,
-        help="Checkpoint of a trained AnchorPredictor (required when --anchor_mode=predicted_anchor).",
+        help="Checkpoint of a trained AnchorPredictor (required for predicted_anchor / predicted_anchor_rerank).",
     )
     parser.add_argument(
         "--predicted_anchor_top_k",
         type=int,
         default=3,
-        help="Only used by --anchor_mode=predicted_anchor_rerank: "
-             "take predictor top-k anchors, run planner for each, then rerank.",
+        help="Used by --anchor_mode=predicted_anchor_rerank / oracle_anchor_rerank: "
+             "take top-k anchor candidates, run planner for each, then rerank.",
     )
     parser.add_argument("--rerank_collision_weight", type=float, default=40.0)
     parser.add_argument("--rerank_ttc_weight", type=float, default=20.0)

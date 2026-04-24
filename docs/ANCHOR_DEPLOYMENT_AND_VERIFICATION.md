@@ -314,6 +314,22 @@ CLI 已经在本分支加好 `--anchor_vocab_path`, `--anchor_mode`, `--anchor_p
 > 格式 checkpoint，并且只加载 predictor 的 `head.*` 权重；如果之前看到
 > `Anchor predictor missing 6 keys / unexpected 9 keys`，请更新到当前 commit 后重跑。
 
+如果不想在另一台机器手拼命令，可以直接用根目录脚本：
+
+```bash
+# 原始 raw baseline（flowplanner_no_goal.pth + anchor_mode none）
+bash run_anchor_raw_no_goal_eval.sh
+
+# 一次跑完整对照组（raw_no_goal / planner_ft_none / predicted / rerank A / oracle / oracle_rerank）
+bash run_anchor_eval_suite.sh
+
+# 也支持只跑子集
+bash run_anchor_eval_suite.sh raw_no_goal planner_ft_none oracle_anchor_rerank
+```
+
+> 这些脚本的 summary 输出已经统一改成 `conditioning: anchor / ...` 风格，不再打印
+> 容易误导人的 `goal_mode: none`。
+
 **Phase 1 Exit Criteria**（严格 gate，达不到就停下来 debug，不推 Phase 2）：
 
 | 指标 | `none` baseline | `predicted_anchor` | `oracle_anchor` | 通过条件 |

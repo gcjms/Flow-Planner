@@ -7,6 +7,7 @@ Trajectory Anchor Utilities (Phase 1)
 关键设计：
 - 距离度量用 **weighted L2 over (x, y, cos_h, sin_h)**，避免角度环绕 (±π)。
 - ``find_nearest_anchor*`` 接受 GT 轨迹 (B, T, 3) 找最近 anchor。
+- ``find_topk_nearest_anchors`` 返回 GT 轨迹在 vocab 里的 top-k 最近 anchor。
 - ``select_diverse_anchors`` 做 farthest-point sampling，用于 DPO 候选挖掘。
 - ``select_anchor_from_route`` 给无 GT 的在线场景提供纯几何 fallback。
 """
@@ -84,6 +85,39 @@ def find_nearest_anchor(
     )                                                             # (B, K)
     idx = dists.argmin(axis=1)
     return int(idx[0]) if single else idx
+
+
+def find_topk_nearest_anchors(
+    trajs: np.ndarray,
+    vocab: np.ndarray,
+    top_k: int,
+    heading_weight: float = 5.0,
+) -> np.ndarray:
+    """Find the top-k nearest anchor indices for each input trajectory (numpy)."""
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+
+    single = (trajs.ndim == 2)
+    if single:
+        trajs = trajs[None, ...]
+    if trajs.shape[1:] != vocab.shape[1:]:
+        raise ValueError(
+            f"Traj shape {trajs.shape} and vocab shape {vocab.shape} must share (T, 3)."
+        )
+
+    top_k = min(int(top_k), int(vocab.shape[0]))
+    traj_feats = _expand_features_np(trajs, heading_weight)       # (B, T*4)
+    vocab_feats = _expand_features_np(vocab, heading_weight)      # (K, T*4)
+    dists = np.linalg.norm(
+        traj_feats[:, None, :] - vocab_feats[None, :, :],
+        axis=-1,
+    )                                                             # (B, K)
+
+    topk_idx = np.argpartition(dists, kth=top_k - 1, axis=1)[:, :top_k]
+    topk_dists = np.take_along_axis(dists, topk_idx, axis=1)
+    order = np.argsort(topk_dists, axis=1)
+    topk_idx = np.take_along_axis(topk_idx, order, axis=1)
+    return topk_idx[0] if single else topk_idx
 
 
 def find_nearest_anchor_torch(

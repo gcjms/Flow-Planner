@@ -16,6 +16,7 @@ from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.anchor_predictor import AnchorPredictor
 from flow_planner.goal.anchor_utils import (
     find_nearest_anchor,
+    find_topk_nearest_anchors,
     load_anchor_vocab,
     select_anchor_from_route,
 )
@@ -306,7 +307,8 @@ def resolve_anchor_vocab(model, anchor_vocab_path: Optional[str] = None) -> np.n
     if getattr(model, "_anchor_vocab", None) is not None:
         return np.asarray(model._anchor_vocab, dtype=np.float32)
     raise ValueError(
-        "Anchor vocabulary is required for route_anchor/predicted_anchor/oracle_anchor. "
+        "Anchor vocabulary is required for route_anchor/predicted_anchor/"
+        "predicted_anchor_rerank/oracle_anchor/oracle_anchor_rerank. "
         "Pass --anchor_vocab_path or use a config with model.anchor_vocab_path."
     )
 
@@ -592,11 +594,39 @@ def _build_rerank_context(
     return neighbors_future, route
 
 
-def infer_reranked_anchor_trajectory(
+def _get_oracle_topk_anchor_trajs(
+    scene_data: Dict[str, np.ndarray],
+    anchor_vocab: np.ndarray,
+    top_k: int,
+    device: str,
+) -> torch.Tensor:
+    """Return GT-nearest top-k anchor templates as ``(1, k, T, 3)``."""
+    ego_future = scene_data.get("ego_agent_future")
+    if ego_future is None:
+        raise RuntimeError(
+            "oracle_anchor_rerank requires scene NPZ to contain 'ego_agent_future'"
+        )
+
+    ego_future_arr = np.asarray(ego_future, dtype=np.float32)
+    T = anchor_vocab.shape[1]
+    if ego_future_arr.ndim < 2 or ego_future_arr.shape[0] < T or ego_future_arr.shape[-1] < 3:
+        raise RuntimeError(
+            f"oracle_anchor_rerank: ego_agent_future shape {ego_future_arr.shape} "
+            f"incompatible with anchor vocab horizon T={T} (needs (>=T, >=3))"
+        )
+
+    gt_traj = ego_future_arr[:T, :3]
+    topk_idx = np.asarray(
+        find_topk_nearest_anchors(gt_traj, anchor_vocab, top_k=top_k),
+        dtype=np.int64,
+    )
+    return torch.from_numpy(anchor_vocab[topk_idx]).unsqueeze(0).to(device)
+
+
+def _infer_reranked_anchor_trajectory_from_candidates(
     model,
     data: NuPlanDataSample,
-    anchor_predictor: AnchorPredictor,
-    top_k: int = 3,
+    anchor_trajs: torch.Tensor,
     use_cfg: bool = True,
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
@@ -607,25 +637,16 @@ def infer_reranked_anchor_trajectory(
     progress_weight: float = 0.0,
     collision_dist: float = 2.0,
 ) -> np.ndarray:
-    """Top-k anchor ablation for Phase 1:
-
-    1. Predictor proposes k anchor templates.
-    2. Planner generates one trajectory for each anchor.
-    3. TrajectoryScorer reranks those trajectories using route/safety heuristics.
-
-    This directly tests whether the current failure is mostly "candidate ranking"
-    rather than "candidate generation".
-    """
+    """Generate one trajectory per candidate anchor, then rerank them."""
     from flow_planner.risk.trajectory_scorer import TrajectoryScorer
 
-    prediction = anchor_predictor.predict_topk(data, top_k=top_k)
-    anchor_trajs = prediction["anchor_trajs"]  # (B, k, T, 3)
     if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
-        raise RuntimeError("Anchor predictor did not return usable top-k anchors")
+        raise RuntimeError("Anchor rerank requires a non-empty candidate set shaped (B, k, T, 3)")
 
     candidate_trajs = []
+    anchor_device = getattr(model, "device", data.ego_current.device)
     for k_idx in range(anchor_trajs.shape[1]):
-        candidate_anchor = anchor_trajs[:, k_idx, :, :].to(data.ego_current.device)
+        candidate_anchor = anchor_trajs[:, k_idx, :, :].to(anchor_device)
         candidate_traj = infer_single_trajectory(
             model,
             data,
@@ -659,6 +680,92 @@ def infer_reranked_anchor_trajectory(
     )
     best_idx = int(scores.argmax().item())
     return candidate_trajs[best_idx]
+
+
+def infer_reranked_anchor_trajectory(
+    model,
+    data: NuPlanDataSample,
+    anchor_predictor: AnchorPredictor,
+    top_k: int = 3,
+    use_cfg: bool = True,
+    cfg_weight: float = 1.8,
+    bon_seed: int = -1,
+    collision_weight: float = 40.0,
+    ttc_weight: float = 20.0,
+    route_weight: float = 25.0,
+    comfort_weight: float = 10.0,
+    progress_weight: float = 0.0,
+    collision_dist: float = 2.0,
+) -> np.ndarray:
+    """Top-k anchor ablation for Phase 1:
+
+    1. Predictor proposes k anchor templates.
+    2. Planner generates one trajectory for each anchor.
+    3. TrajectoryScorer reranks those trajectories using route/safety heuristics.
+
+    This directly tests whether the current failure is mostly "candidate ranking"
+    rather than "candidate generation".
+    """
+    prediction = anchor_predictor.predict_topk(data, top_k=top_k)
+    anchor_trajs = prediction["anchor_trajs"]  # (B, k, T, 3)
+    if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
+        raise RuntimeError("Anchor predictor did not return usable top-k anchors")
+    return _infer_reranked_anchor_trajectory_from_candidates(
+        model,
+        data,
+        anchor_trajs=anchor_trajs,
+        use_cfg=use_cfg,
+        cfg_weight=cfg_weight,
+        bon_seed=bon_seed,
+        collision_weight=collision_weight,
+        ttc_weight=ttc_weight,
+        route_weight=route_weight,
+        comfort_weight=comfort_weight,
+        progress_weight=progress_weight,
+        collision_dist=collision_dist,
+    )
+
+
+def infer_oracle_reranked_anchor_trajectory(
+    model,
+    data: NuPlanDataSample,
+    scene_data: Dict[str, np.ndarray],
+    anchor_vocab: np.ndarray,
+    top_k: int = 3,
+    use_cfg: bool = True,
+    cfg_weight: float = 1.8,
+    bon_seed: int = -1,
+    collision_weight: float = 40.0,
+    ttc_weight: float = 20.0,
+    route_weight: float = 25.0,
+    comfort_weight: float = 10.0,
+    progress_weight: float = 0.0,
+    collision_dist: float = 2.0,
+) -> np.ndarray:
+    """Oracle rerank ablation: use GT-nearest top-k anchors as the candidate pool."""
+    if anchor_vocab is None:
+        raise ValueError("oracle_anchor_rerank requires an anchor vocabulary")
+
+    anchor_trajs = _get_oracle_topk_anchor_trajs(
+        scene_data=scene_data,
+        anchor_vocab=anchor_vocab,
+        top_k=top_k,
+        device=getattr(model, "device", data.ego_current.device),
+    )
+    return _infer_reranked_anchor_trajectory_from_candidates(
+        model,
+        data,
+        anchor_trajs=anchor_trajs,
+        use_cfg=use_cfg,
+        cfg_weight=cfg_weight,
+        bon_seed=bon_seed,
+        collision_weight=collision_weight,
+        ttc_weight=ttc_weight,
+        route_weight=route_weight,
+        comfort_weight=comfort_weight,
+        progress_weight=progress_weight,
+        collision_dist=collision_dist,
+    )
 
 
 def evaluate_trajectory(
@@ -790,26 +897,48 @@ def run_multidim_evaluation(
                 goal_vocab=goal_vocab,
                 goal_predictor=goal_predictor,
             )
-            if anchor_mode == "predicted_anchor_rerank":
+            if anchor_mode in ("predicted_anchor_rerank", "oracle_anchor_rerank"):
                 if goal_point is not None:
-                    raise ValueError("predicted_anchor_rerank is anchor-only; goal_mode must be 'none'")
-                if anchor_predictor is None:
-                    raise ValueError("predicted_anchor_rerank requires an anchor predictor checkpoint")
-                pred_traj = infer_reranked_anchor_trajectory(
-                    model,
-                    data,
-                    anchor_predictor=anchor_predictor,
-                    top_k=predicted_anchor_top_k,
-                    use_cfg=use_cfg,
-                    cfg_weight=cfg_weight,
-                    bon_seed=bon_seed,
-                    collision_weight=rerank_collision_weight,
-                    ttc_weight=rerank_ttc_weight,
-                    route_weight=rerank_route_weight,
-                    comfort_weight=rerank_comfort_weight,
-                    progress_weight=rerank_progress_weight,
-                    collision_dist=collision_dist,
-                )
+                    raise ValueError(
+                        f"{anchor_mode} is anchor-only; goal_mode must be 'none'"
+                    )
+                if anchor_mode == "predicted_anchor_rerank":
+                    if anchor_predictor is None:
+                        raise ValueError(
+                            "predicted_anchor_rerank requires an anchor predictor checkpoint"
+                        )
+                    pred_traj = infer_reranked_anchor_trajectory(
+                        model,
+                        data,
+                        anchor_predictor=anchor_predictor,
+                        top_k=predicted_anchor_top_k,
+                        use_cfg=use_cfg,
+                        cfg_weight=cfg_weight,
+                        bon_seed=bon_seed,
+                        collision_weight=rerank_collision_weight,
+                        ttc_weight=rerank_ttc_weight,
+                        route_weight=rerank_route_weight,
+                        comfort_weight=rerank_comfort_weight,
+                        progress_weight=rerank_progress_weight,
+                        collision_dist=collision_dist,
+                    )
+                else:
+                    pred_traj = infer_oracle_reranked_anchor_trajectory(
+                        model,
+                        data,
+                        scene_data=scene_data,
+                        anchor_vocab=anchor_vocab,
+                        top_k=predicted_anchor_top_k,
+                        use_cfg=use_cfg,
+                        cfg_weight=cfg_weight,
+                        bon_seed=bon_seed,
+                        collision_weight=rerank_collision_weight,
+                        ttc_weight=rerank_ttc_weight,
+                        route_weight=rerank_route_weight,
+                        comfort_weight=rerank_comfort_weight,
+                        progress_weight=rerank_progress_weight,
+                        collision_dist=collision_dist,
+                    )
             else:
                 anchor_traj = choose_anchor(
                     anchor_mode=anchor_mode,
@@ -867,7 +996,18 @@ def run_multidim_evaluation(
             f"First failure: {first_error}"
         )
 
+    conditioning_family = (
+        "anchor" if anchor_mode != "none"
+        else ("goal" if goal_mode != "none" else "none")
+    )
+    conditioning_mode = (
+        anchor_mode if anchor_mode != "none"
+        else (goal_mode if goal_mode != "none" else "none")
+    )
+
     summary = {
+        "conditioning_family": conditioning_family,
+        "conditioning_mode": conditioning_mode,
         "goal_mode": goal_mode,
         "anchor_mode": anchor_mode,
         "use_cfg": bool(use_cfg),
@@ -892,8 +1032,11 @@ def log_summary(summary: Dict[str, float], ckpt_path: str) -> None:
     logger.info("=" * 60)
     logger.info("SUMMARY - Multi-Dimensional Open-Loop Evaluation")
     logger.info("  Checkpoint: %s", ckpt_path)
-    logger.info("  goal_mode: %s", summary["goal_mode"])
-    logger.info("  anchor_mode: %s", summary.get("anchor_mode", "none"))
+    logger.info(
+        "  conditioning: %s / %s",
+        summary.get("conditioning_family", "none"),
+        summary.get("conditioning_mode", "none"),
+    )
     logger.info("  use_cfg: %s", summary["use_cfg"])
     logger.info("  cfg_weight: %.3f", summary["cfg_weight"])
     logger.info("  Scenes requested: %d", summary["scenes_requested"])
