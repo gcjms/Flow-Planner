@@ -95,7 +95,13 @@ def main():
         "--anchor_mode",
         type=str,
         default="none",
-        choices=["none", "route_anchor", "predicted_anchor", "oracle_anchor"],
+        choices=[
+            "none",
+            "route_anchor",
+            "predicted_anchor",
+            "predicted_anchor_rerank",
+            "oracle_anchor",
+        ],
         help="Trajectory-anchor conditioning mode. Mutually exclusive with goal_mode.",
     )
     parser.add_argument(
@@ -103,6 +109,23 @@ def main():
         type=str,
         default=None,
         help="Checkpoint of a trained AnchorPredictor (required when --anchor_mode=predicted_anchor).",
+    )
+    parser.add_argument(
+        "--predicted_anchor_top_k",
+        type=int,
+        default=3,
+        help="Only used by --anchor_mode=predicted_anchor_rerank: "
+             "take predictor top-k anchors, run planner for each, then rerank.",
+    )
+    parser.add_argument("--rerank_collision_weight", type=float, default=40.0)
+    parser.add_argument("--rerank_ttc_weight", type=float, default=20.0)
+    parser.add_argument("--rerank_route_weight", type=float, default=25.0)
+    parser.add_argument("--rerank_comfort_weight", type=float, default=10.0)
+    parser.add_argument(
+        "--rerank_progress_weight",
+        type=float,
+        default=0.0,
+        help="Default 0.0 on purpose: first ablation should not reward aggressive forward rush.",
     )
     parser.add_argument(
         "--output_json",
@@ -131,9 +154,12 @@ def main():
     anchor_predictor = None
     if args.anchor_mode != "none":
         anchor_vocab = resolve_anchor_vocab(model, args.anchor_vocab_path)
-        if args.anchor_mode == "predicted_anchor":
+        if args.anchor_mode in ("predicted_anchor", "predicted_anchor_rerank"):
             if args.anchor_predictor_ckpt is None:
-                raise ValueError("--anchor_mode=predicted_anchor requires --anchor_predictor_ckpt")
+                raise ValueError(
+                    "--anchor_mode=predicted_anchor / predicted_anchor_rerank "
+                    "requires --anchor_predictor_ckpt"
+                )
             anchor_predictor = load_anchor_predictor_model(
                 model, args.anchor_predictor_ckpt, device=args.device
             )
@@ -151,6 +177,12 @@ def main():
         anchor_mode=args.anchor_mode,
         anchor_vocab=anchor_vocab,
         anchor_predictor=anchor_predictor,
+        predicted_anchor_top_k=args.predicted_anchor_top_k,
+        rerank_collision_weight=args.rerank_collision_weight,
+        rerank_ttc_weight=args.rerank_ttc_weight,
+        rerank_route_weight=args.rerank_route_weight,
+        rerank_comfort_weight=args.rerank_comfort_weight,
+        rerank_progress_weight=args.rerank_progress_weight,
         scene_manifest=args.scene_manifest,
         manifest_seed=args.manifest_seed,
         scene_manifest_out=args.write_scene_manifest,
@@ -173,6 +205,12 @@ def main():
                 "anchor_vocab_path": args.anchor_vocab_path,
                 "anchor_mode": args.anchor_mode,
                 "anchor_predictor_ckpt": args.anchor_predictor_ckpt,
+                "predicted_anchor_top_k": args.predicted_anchor_top_k,
+                "rerank_collision_weight": args.rerank_collision_weight,
+                "rerank_ttc_weight": args.rerank_ttc_weight,
+                "rerank_route_weight": args.rerank_route_weight,
+                "rerank_comfort_weight": args.rerank_comfort_weight,
+                "rerank_progress_weight": args.rerank_progress_weight,
             },
         )
 

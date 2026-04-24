@@ -556,6 +556,106 @@ def infer_single_trajectory(
     return normalize_prediction(prediction)
 
 
+def _build_rerank_context(
+    data: NuPlanDataSample,
+    future_steps: int,
+):
+    """Build lightweight online-available context for trajectory reranking.
+
+    We intentionally avoid GT future here: use neighbor past -> constant-velocity
+    extrapolation plus route polyline, matching the deployment-style heuristic used
+    by ``FlowPlanner.forward_inference(num_candidates>1)``.
+    """
+    from flow_planner.risk.trajectory_scorer import TrajectoryScorer
+
+    neighbors_future = None
+    if hasattr(data, "neighbor_past") and data.neighbor_past is not None and data.neighbor_past.numel() > 0:
+        neighbor_past = data.neighbor_past[0] if data.neighbor_past.dim() == 4 else data.neighbor_past
+        neighbors_future = TrajectoryScorer.extrapolate_neighbor_future(
+            neighbor_past,
+            future_steps=future_steps,
+            dt=0.1,
+        )
+        if neighbors_future is not None:
+            neighbors_future = neighbors_future.cpu()
+
+    route = None
+    if hasattr(data, "routes") and data.routes is not None and data.routes.numel() > 0:
+        route_data = data.routes[0] if data.routes.dim() == 4 else data.routes
+        route = route_data[:, :, :2].reshape(-1, 2).cpu()
+
+    return neighbors_future, route
+
+
+def infer_reranked_anchor_trajectory(
+    model,
+    data: NuPlanDataSample,
+    anchor_predictor: AnchorPredictor,
+    top_k: int = 3,
+    use_cfg: bool = True,
+    cfg_weight: float = 1.8,
+    bon_seed: int = -1,
+    collision_weight: float = 40.0,
+    ttc_weight: float = 20.0,
+    route_weight: float = 25.0,
+    comfort_weight: float = 10.0,
+    progress_weight: float = 0.0,
+    collision_dist: float = 2.0,
+) -> np.ndarray:
+    """Top-k anchor ablation for Phase 1:
+
+    1. Predictor proposes k anchor templates.
+    2. Planner generates one trajectory for each anchor.
+    3. TrajectoryScorer reranks those trajectories using route/safety heuristics.
+
+    This directly tests whether the current failure is mostly "candidate ranking"
+    rather than "candidate generation".
+    """
+    from flow_planner.risk.trajectory_scorer import TrajectoryScorer
+
+    prediction = anchor_predictor.predict_topk(data, top_k=top_k)
+    anchor_trajs = prediction["anchor_trajs"]  # (B, k, T, 3)
+    if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
+        raise RuntimeError("Anchor predictor did not return usable top-k anchors")
+
+    candidate_trajs = []
+    for k_idx in range(anchor_trajs.shape[1]):
+        candidate_anchor = anchor_trajs[:, k_idx, :, :].to(data.ego_current.device)
+        candidate_traj = infer_single_trajectory(
+            model,
+            data,
+            use_cfg=use_cfg,
+            cfg_weight=cfg_weight,
+            bon_seed=bon_seed,
+            anchor_traj=candidate_anchor,
+        )
+        candidate_trajs.append(candidate_traj)
+
+    traj_tensor = torch.from_numpy(np.stack(candidate_trajs, axis=0)).float()
+    neighbors_future, route = _build_rerank_context(
+        data,
+        future_steps=traj_tensor.shape[1],
+    )
+    scorer = TrajectoryScorer(
+        collision_weight=collision_weight,
+        ttc_weight=ttc_weight,
+        route_weight=route_weight,
+        comfort_weight=comfort_weight,
+        progress_weight=progress_weight,
+        collision_threshold=collision_dist,
+        ttc_threshold=3.0,
+        dt=0.1,
+        verbose=False,
+    )
+    scores = scorer.score_trajectories(
+        traj_tensor,
+        neighbors=neighbors_future,
+        route=route,
+    )
+    best_idx = int(scores.argmax().item())
+    return candidate_trajs[best_idx]
+
+
 def evaluate_trajectory(
     traj: np.ndarray,
     neighbor_future_gt: np.ndarray,
@@ -631,6 +731,12 @@ def run_multidim_evaluation(
     anchor_mode: str = "none",
     anchor_vocab: Optional[np.ndarray] = None,
     anchor_predictor: Optional[AnchorPredictor] = None,
+    predicted_anchor_top_k: int = 3,
+    rerank_collision_weight: float = 40.0,
+    rerank_ttc_weight: float = 20.0,
+    rerank_route_weight: float = 25.0,
+    rerank_comfort_weight: float = 10.0,
+    rerank_progress_weight: float = 0.0,
     scene_manifest: Optional[str] = None,
     manifest_seed: Optional[int] = None,
     scene_manifest_out: Optional[str] = None,
@@ -679,23 +785,44 @@ def run_multidim_evaluation(
                 goal_vocab=goal_vocab,
                 goal_predictor=goal_predictor,
             )
-            anchor_traj = choose_anchor(
-                anchor_mode=anchor_mode,
-                scene_data=scene_data,
-                data=data,
-                device=device,
-                anchor_vocab=anchor_vocab,
-                anchor_predictor=anchor_predictor,
-            )
-            pred_traj = infer_single_trajectory(
-                model,
-                data,
-                use_cfg=use_cfg,
-                cfg_weight=cfg_weight,
-                bon_seed=bon_seed,
-                goal_point=goal_point,
-                anchor_traj=anchor_traj,
-            )
+            if anchor_mode == "predicted_anchor_rerank":
+                if goal_point is not None:
+                    raise ValueError("predicted_anchor_rerank is anchor-only; goal_mode must be 'none'")
+                if anchor_predictor is None:
+                    raise ValueError("predicted_anchor_rerank requires an anchor predictor checkpoint")
+                pred_traj = infer_reranked_anchor_trajectory(
+                    model,
+                    data,
+                    anchor_predictor=anchor_predictor,
+                    top_k=predicted_anchor_top_k,
+                    use_cfg=use_cfg,
+                    cfg_weight=cfg_weight,
+                    bon_seed=bon_seed,
+                    collision_weight=rerank_collision_weight,
+                    ttc_weight=rerank_ttc_weight,
+                    route_weight=rerank_route_weight,
+                    comfort_weight=rerank_comfort_weight,
+                    progress_weight=rerank_progress_weight,
+                    collision_dist=collision_dist,
+                )
+            else:
+                anchor_traj = choose_anchor(
+                    anchor_mode=anchor_mode,
+                    scene_data=scene_data,
+                    data=data,
+                    device=device,
+                    anchor_vocab=anchor_vocab,
+                    anchor_predictor=anchor_predictor,
+                )
+                pred_traj = infer_single_trajectory(
+                    model,
+                    data,
+                    use_cfg=use_cfg,
+                    cfg_weight=cfg_weight,
+                    bon_seed=bon_seed,
+                    goal_point=goal_point,
+                    anchor_traj=anchor_traj,
+                )
             scene_metrics = evaluate_trajectory(
                 pred_traj,
                 neighbor_future_gt=_require_scene_key(scene_data, "neighbor_agents_future"),
