@@ -143,6 +143,17 @@
 
 ## 4. 实验记录（append-only，按时间倒序）
 
+### 2026-04-25 — Scheduled sampling 部署脚本修正（自动生成 data list）
+
+**背景**：用户 AutoDL 上当前数据形态是 `train_dataset` / `val_dataset` 目录，昨晚 eval suite 能跑是因为 eval 只需要 `scene_dir` + manifest；scheduled sampling 属于训练流程，继承 `finetune_anchor_planner.py` 的 `--train-data-list / --val-data-list` 输入。
+
+**修正**：
+- `run_anchor_scheduled_sampling.sh` 默认优先识别 `/root/autodl-tmp/train_dataset` 和 `/root/autodl-tmp/val_dataset`
+- 如果没有显式设置 `TRAIN_DATA_LIST / VAL_DATA_LIST`，脚本会扫描目录下 `.npz`，自动生成 `/root/autodl-tmp/anchor_runs/generated_lists/train_list.json` 和 `val_list.json`
+- 若默认 eval 的 `/root/autodl-tmp/nuplan_npz` 不存在，训练后的 eval 会自动使用 `VAL_DATA_DIR` 作为 `SCENE_DIR`
+
+**结论**：`train_list.json / val_list.json` 不是额外标注文件，只是训练 loader 要的文件名清单；eval 不需要它们，训练需要但可以自动生成。
+
 ### 2026-04-25 — Full eval suite（同一 manifest + `BON_SEED=3402`）
 
 **设置**：

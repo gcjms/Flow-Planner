@@ -13,13 +13,13 @@
 |---|---|
 | 分支 | `feature/anchor`，相对 `feature/goal` 多出 `anchor_*` 代码 |
 | 原 planner 权重 | 一个 `no-goal` 或 `goal` 时代训出来的 ckpt (对应 `future_len=80`) |
-| 训练数据 | nuPlan NPZ + `train_list.json` / `val_list.json` |
+| 训练数据 | nuPlan NPZ；训练脚本需要 JSON 文件清单，但 `run_anchor_scheduled_sampling.sh` 会从 `.npz` 自动生成 |
 | Python 环境 | 和旧 DPO 流水线一致（torch、sklearn、tqdm、hydra-core、omegaconf、matplotlib） |
 | 硬件 | Phase 0 聚类 CPU 即可；Phase 1 训练单 GPU (RTX 3090/4090/A10/A100) |
 
 下文所有路径按用户习惯的 AutoDL 布局写：
 - 代码根：`/root/Flow-Planner`
-- 数据：`/root/autodl-tmp/nuplan_npz`
+- 数据：`/root/autodl-tmp/nuplan_npz`，或拆成 `/root/autodl-tmp/train_dataset` + `/root/autodl-tmp/val_dataset`
 - 输出根：`/root/autodl-tmp/anchor_runs`
 
 请根据你的环境替换。
@@ -339,6 +339,11 @@ bash run_anchor_scheduled_sampling.sh 0.3
 # p_max=0.5：更强混入 predictor top1 anchor
 bash run_anchor_scheduled_sampling.sh 0.5
 ```
+
+如果 AutoDL 上只有 `train_dataset/val_dataset` 两个目录、没有
+`train_list.json/val_list.json`，这个脚本会自动扫描目录里的 `.npz` 并写到
+`/root/autodl-tmp/anchor_runs/generated_lists/`。这只影响训练 loader；昨晚的
+eval suite 是直接按 `scene_dir` 抽场景，所以本来就不需要这两个 list。
 
 脚本会先从 `flowplanner_no_goal.pth` 开始 finetune，然后把生成的
 `planner_anchor_best.pth` 自动送进 eval suite，跑

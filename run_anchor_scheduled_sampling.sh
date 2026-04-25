@@ -22,6 +22,56 @@ source "$SCRIPT_DIR/run_anchor_eval_common.sh"
 
 anchor_eval_init
 
+anchor_first_existing_dir() {
+  for candidate in "$@"; do
+    if [ -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$1"
+}
+
+anchor_ensure_npz_list() {
+  local data_dir="$1"
+  local list_path="$2"
+  local split_name="$3"
+
+  if [ -f "$list_path" ]; then
+    return 0
+  fi
+
+  echo "No ${split_name} data list found at $list_path; generating it from $data_dir"
+  mkdir -p "$(dirname "$list_path")"
+  DATA_DIR="$data_dir" LIST_PATH="$list_path" SPLIT_NAME="$split_name" python - <<'PY'
+import json
+import os
+
+data_dir = os.environ["DATA_DIR"]
+list_path = os.environ["LIST_PATH"]
+split_name = os.environ["SPLIT_NAME"]
+
+files = []
+for root, _, filenames in os.walk(data_dir):
+    for filename in filenames:
+        if filename.endswith(".npz"):
+            rel = os.path.relpath(os.path.join(root, filename), data_dir)
+            files.append(rel.replace(os.sep, "/"))
+
+files.sort()
+if not files:
+    raise SystemExit(
+        f"No .npz files found under {data_dir}; set {split_name.upper()}_DATA_LIST "
+        "to an existing JSON list if your data uses another layout."
+    )
+
+with open(list_path, "w", encoding="utf-8") as f:
+    json.dump(files, f, ensure_ascii=False)
+
+print(f"wrote {len(files)} entries to {list_path}")
+PY
+}
+
 P_TAG="$(python - "$P_MAX" <<'PY'
 import sys
 p = float(sys.argv[1])
@@ -29,10 +79,13 @@ print(str(p).replace(".", "p"))
 PY
 )"
 
-TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-/root/autodl-tmp/nuplan_npz}"
-TRAIN_DATA_LIST="${TRAIN_DATA_LIST:-/root/autodl-tmp/nuplan_npz/train_list.json}"
-VAL_DATA_DIR="${VAL_DATA_DIR:-/root/autodl-tmp/nuplan_npz}"
-VAL_DATA_LIST="${VAL_DATA_LIST:-/root/autodl-tmp/nuplan_npz/val_list.json}"
+DEFAULT_TRAIN_DATA_DIR="$(anchor_first_existing_dir /root/autodl-tmp/train_dataset /root/autodl-tmp/nuplan_npz)"
+DEFAULT_VAL_DATA_DIR="$(anchor_first_existing_dir /root/autodl-tmp/val_dataset /root/autodl-tmp/val_dataseet "$DEFAULT_TRAIN_DATA_DIR")"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-$DEFAULT_TRAIN_DATA_DIR}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-$DEFAULT_VAL_DATA_DIR}"
+GENERATED_LIST_DIR="${GENERATED_LIST_DIR:-/root/autodl-tmp/anchor_runs/generated_lists}"
+TRAIN_DATA_LIST="${TRAIN_DATA_LIST:-$GENERATED_LIST_DIR/train_list.json}"
+VAL_DATA_LIST="${VAL_DATA_LIST:-$GENERATED_LIST_DIR/val_list.json}"
 SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/anchor_runs/planner_ft_sched_p${P_TAG}}"
 EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -49,8 +102,13 @@ anchor_require_file "$ANCHOR_VOCAB_PATH"
 anchor_require_file "$ANCHOR_PREDICTOR_CKPT"
 anchor_require_dir "$TRAIN_DATA_DIR"
 anchor_require_dir "$VAL_DATA_DIR"
-anchor_require_file "$TRAIN_DATA_LIST"
-anchor_require_file "$VAL_DATA_LIST"
+anchor_ensure_npz_list "$TRAIN_DATA_DIR" "$TRAIN_DATA_LIST" train
+anchor_ensure_npz_list "$VAL_DATA_DIR" "$VAL_DATA_LIST" val
+
+if [ "$SCENE_DIR" = "/root/autodl-tmp/nuplan_npz" ] && [ ! -d "$SCENE_DIR" ]; then
+  SCENE_DIR="$VAL_DATA_DIR"
+  export SCENE_DIR
+fi
 
 mkdir -p "$SAVE_DIR"
 
