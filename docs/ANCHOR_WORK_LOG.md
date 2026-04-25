@@ -9,9 +9,9 @@
 ## 0. TL;DR（给自己看的一段话）
 
 - **做什么**：把 Flow Planner 的条件接口从 **2D goal 点** 换成 **完整轨迹 anchor**（Hydra-MDP / MultiPath 风格），解决 goal 线 `oracle_goal ≈ none`、mode collapse、cross-goal DPO 学不动这三个问题。
-- **当前状态**：Phase 0/1 工程链路已打通，`oracle_anchor` 证明架构本身可用；但新增的 **raw `flowplanner_no_goal.pth` baseline = `2.0% / 0.3275 / 0.8547`** 表明当前 `predicted_anchor` / rerank 版本**还没有真正超过原始 FlowPlanner**。
-- **当前瓶颈**：不只是 `oracle_anchor` (1.6%) vs `predicted_anchor` (5.8%) 的 3.6× gap；还多了一个更现实的问题：**raw no-goal baseline 2.0% 明显优于当前 predicted 5.8% / 5.4%**，说明 anchor finetune + predictor 这条线上还存在明显回归或协同问题。
-- **下一步**：(1) 跑 `oracle_anchor_rerank` 定位锅在 predictor 还是 planner  (2) 分析为什么 `planner_ft_run1 + anchor_mode none` 会从 raw baseline `2.0%` 退到 `7.2%`  (3) 再决定 Phase 2 先做 scheduled anchor sampling 还是 predictor metric heads。
+- **当前状态**：Phase 0/1 工程链路已打通，`oracle_anchor` 证明架构本身可用；但同 manifest/同 seed 的 full suite 显示 **raw baseline = `2.4% / 0.3282 / 0.8513`**，当前 `predicted_anchor_top1 / rerank_a = 6.2%`，还没有超过原始 FlowPlanner。
+- **当前瓶颈**：`oracle_anchor=2.0%` 明显好于 `predicted_anchor=6.2%`；且 `oracle_anchor_rerank=2.8%` 说明即使不经过 predictor，planner 对 near-oracle 但非 top-1 anchor 也会退化，瓶颈优先指向 planner robustness / exposure bias。
+- **下一步**：已实现 **scheduled anchor sampling** 代码与 AutoDL 脚本；先跑 `p_max=0.3` 和 `p_max=0.5` 两组，观察 predicted collision 是否从 `6.2%` 明显下降、`oracle_anchor_rerank` 是否更接近 `oracle_anchor`。
 
 ---
 
@@ -129,6 +129,7 @@
 | `run_anchor_eval_common.sh` | AutoDL 部署共用 helper：统一路径、manifest 复用、summary 打印 |
 | `run_anchor_raw_no_goal_eval.sh` | AutoDL 一键补跑 **官方 `flowplanner_no_goal.pth` + `anchor_mode none`** |
 | `run_anchor_eval_suite.sh` | AutoDL 总控脚本：按同一 manifest 跑 `raw_no_goal / planner_ft_none / predicted_anchor / rerank A / oracle / oracle_rerank`，也支持只跑子集 |
+| `run_anchor_scheduled_sampling.sh` | AutoDL 一键训练 scheduled anchor sampling，并自动跑关键 eval suite |
 
 ### 3.5 文档
 | 文件 | 作用 |
@@ -141,6 +142,30 @@
 ---
 
 ## 4. 实验记录（append-only，按时间倒序）
+
+### 2026-04-25 — Full eval suite（同一 manifest + `BON_SEED=3402`）
+
+**设置**：
+- 500 scenes
+- 同一份 `eval_manifest.json`
+- 固定 `BON_SEED=3402`
+- 脚本：`run_anchor_eval_suite.sh`
+
+| case | collision | progress | route |
+|---|---|---|---|
+| `raw_no_goal_baseline` | **2.4%** | 0.3282 | 0.8513 |
+| `planner_ft_none` | **6.4%** | 0.3549 | 0.8583 |
+| `predicted_anchor_top1` | **6.2%** | 0.3715 | 0.8417 |
+| `predicted_anchor_rerank_a` | **6.2%** | 0.3818 | 0.8595 |
+| `oracle_anchor` | **2.0%** | 0.3459 | 0.8396 |
+| `oracle_anchor_rerank` | **2.8%** | 0.3634 | 0.8595 |
+
+**正式解读**：
+1. **anchor 架构本身有效**：`oracle_anchor` 相比 `planner_ft_none` 从 `6.4% → 2.0%`，说明 finetuned planner 确实在利用 anchor 信息。
+2. **当前 predicted pipeline 还没超过原始 FlowPlanner**：`predicted_anchor_top1 / rerank_a` 都在 `6.2%`，明显差于 raw baseline `2.4%`。
+3. **P1 已给出方向性结论**：`oracle_anchor_rerank` 从 `2.0%` 退到 `2.8%`，而这一步**完全不经过 predictor**，说明 planner 对“非 top-1 但仍接近 GT 的 anchor”并不鲁棒，问题不只是 predictor 排序。
+4. **rerank 的作用是二级指标整理，不是关 gap 主武器**：`predicted_anchor_rerank_a` 没改善 collision（仍 `6.2%`），但把 progress/route 提到 `0.3818 / 0.8595`。
+5. **当前最可信的下一步优先级**：先做 **planner robustness / exposure bias**（scheduled anchor sampling），再做 predictor metric heads。
 
 ### 2026-04-25 — Raw no-goal baseline（`flowplanner_no_goal.pth + anchor_mode none`）
 
@@ -298,28 +323,29 @@
 
 | 模式 | collision | progress | route |
 |---|---|---|---|
-| raw `flowplanner_no_goal.pth` + `none` | **2.0%** | 0.3275 | 0.8547 |
-| `planner_ft_run1` + `none` | 7.2% | 0.35 | 0.85 |
-| `predicted_anchor` top1 | 5.8% | 0.3710 | 0.8408 |
-| `predicted_anchor_rerank` A | 5.8% | 0.3833 | 0.8595 |
-| `oracle_anchor` | **1.6%** | 0.347 | 0.837 |
+| raw `flowplanner_no_goal.pth` + `none` | **2.4%** | 0.3282 | 0.8513 |
+| `planner_ft_run1` + `none` | 6.4% | 0.3549 | 0.8583 |
+| `predicted_anchor` top1 | 6.2% | 0.3715 | 0.8417 |
+| `predicted_anchor_rerank` A | 6.2% | 0.3818 | 0.8595 |
+| `oracle_anchor` | **2.0%** | 0.3459 | 0.8396 |
 
 这说明：
 1. **过去把 `planner_ft none` 当 baseline 的说法只能做内部对照**，不能再当“原始 FlowPlanner baseline”。
-2. **当前 predicted 系统在 collision 上仍输给原始模型**；即便 rerank 到 C，最好也只是 `5.4%`。
-3. **anchor 架构不是没用**，因为 `oracle_anchor=1.6%` 仍优于 raw baseline `2.0%`；但目前训练/推理链路还没把这个潜力稳定转化成 deployable 改善。
+2. **当前 predicted 系统在 collision 上仍输给原始模型**；当前同 manifest/同 seed 最好也只是 `6.2%`。
+3. **anchor 架构不是没用**，因为 `oracle_anchor=2.0%` 仍优于 raw baseline `2.4%`；但目前训练/推理链路还没把这个潜力稳定转化成 deployable 改善。
 
-### 6.2 oracle vs predicted 的 3.6× collision gap
+### 6.2 oracle vs predicted 的 gap 依然显著
 
 | 模式 | collision |
 |---|---|
-| oracle_anchor | 1.6% |
-| predicted_anchor top1 | 5.8% |
+| oracle_anchor | 2.0% |
+| predicted_anchor top1 | 6.2% |
 
 这个 gap **不是因为** predictor 没训好（top3 accuracy 已经 99%）。
 这个 gap **来自**：
 1. **Predictor ↔ Planner 协同不完美**：top-1 ≠ 最近邻 anchor，会差几名
 2. **Exposure bias**：planner 训练时只见过完美 anchor，推理时稍有偏差就容易出问题
+3. **P1 新证据偏向 planner 侧**：`oracle_anchor_rerank` = `2.8%`，明显差于 `oracle_anchor` = `2.0%`，即使 predictor 完全被移除，planner 对近邻但非 top-1 的 anchor 仍会退化
 
 ### 6.3 为什么 rerank 当前没完全解决
 
@@ -345,13 +371,22 @@
 
 ### P1 — 诊断（半天）
 - [x] 在 `eval_multidim.py` 增加 `oracle_anchor_rerank` 模式（从 oracle 邻居 top-k 里 rerank）
-- [ ] 跑 oracle top-k rerank，定位瓶颈位置（见 §6.3）
+- [x] 跑 oracle top-k rerank，结果：`oracle_anchor 2.0%` vs `oracle_anchor_rerank 2.8%`，说明 planner 对 near-oracle 但非 top-1 anchor 仍有明显退化
 - [x] 单独补跑 **官方原始 `flowplanner_no_goal.pth` + `anchor_mode none`**，结果：`2.0% / 0.3275 / 0.8547`
 - [x] 已补 AutoDL 脚本：`run_anchor_raw_no_goal_eval.sh`
-- [ ] 分析为什么 `planner_ft_run1 + none` 从 raw baseline `2.0%` 退化到 `7.2%`
+- [ ] 分析为什么 `planner_ft_run1 + none` 在同 manifest/同 seed 下仍从 raw baseline `2.4%` 退化到 `6.4%`
 
 ### P2 — Phase 2 开工（3–5 天）
-- [ ] Scheduled anchor sampling：finetune 时以概率 p 喂 predictor top-1 替代 oracle，p 从 0 ramp 到 0.3~0.5
+- [x] **先做 Scheduled anchor sampling（当前唯一最高优先级）**：在 `finetune_anchor_planner.py` 中，不再永远喂 oracle anchor；而是以概率 `p` 喂 predictor top-1，`p` 从 0 线性 ramp 到 0.3~0.5
+- [x] Scheduled sampling AutoDL 部署脚本：`run_anchor_scheduled_sampling.sh`
+- [ ] Scheduled sampling 第一轮实验设计：只做 2 个短跑版本
+  - run S1：`p_max = 0.3`
+  - run S2：`p_max = 0.5`
+  - 两个 run 都复用当前 `planner_ft_run1` 配置与数据规模，先验证方向，不追求一次性训满
+- [ ] Scheduled sampling 第一轮验收：
+  - `predicted_anchor_top1` collision 相比当前 `6.2%` 明显下降
+  - `oracle_anchor_rerank` 更接近 `oracle_anchor`
+  - 若 `planner_ft_none` 进一步恶化，则需要同时重新平衡 unconditional path
 - [ ] `train_soft_pref.py` 改造：goal_labels → anchor_labels，scene-level soft KL 保留
 - [ ] AnchorPredictor 加 metric heads（dis / dac / safety / progress / comfort）
 - [ ] Phase 0 teacher 打分 cache 生成（`risk/trajectory_scorer.py`）
@@ -455,6 +490,22 @@ bash run_anchor_eval_suite.sh
 ```bash
 bash run_anchor_eval_suite.sh raw_no_goal planner_ft_none oracle_anchor_rerank
 ```
+
+### Phase 2: Scheduled Anchor Sampling
+```bash
+# S1: 温和混入 predictor top1 anchor
+bash run_anchor_scheduled_sampling.sh 0.3
+
+# S2: 更强混入 predictor top1 anchor
+bash run_anchor_scheduled_sampling.sh 0.5
+```
+
+每个 run 会先训练，再自动用新 ckpt 跑：
+- `planner_ft_none`
+- `predicted_anchor_top1`
+- `predicted_anchor_rerank_a`
+- `oracle_anchor`
+- `oracle_anchor_rerank`
 
 ---
 

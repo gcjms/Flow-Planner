@@ -234,7 +234,11 @@ class FlowPlanner(DiffusionADPlanner):
         # Conditioning: pick goal (legacy) or anchor (Phase 1) BEFORE normalization.
         # Exactly one branch is active (vocab constructors enforce exclusivity).
         goal_point = self._get_goal_for_gt(data)
-        anchor_traj = self._get_anchor_for_gt(data)
+        anchor_traj = getattr(data, "anchor_traj_override", None)
+        if anchor_traj is None:
+            anchor_traj = self._get_anchor_for_gt(data)
+        else:
+            anchor_traj = anchor_traj.to(self.device).float()
 
         roll_dice = torch.rand((B, 1))
         cfg_flags = (roll_dice > self.cfg_prob).to(torch.int32).to(self.device) # NOTE: 1 for conditioned (unmasked), 0 for unconditioned (masked)

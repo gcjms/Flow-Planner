@@ -18,7 +18,10 @@ architecturally capable of consuming an anchor but ignores it completely:
     oracle_anchor metrics == none metrics
 
 This script takes a short continued-training pass that teacher-forces the
-oracle (GT-nearest) anchor on every batch. During this window:
+oracle (GT-nearest) anchor on every batch by default. It can optionally enable
+scheduled anchor sampling, where a linearly increasing fraction of samples use
+the trained AnchorPredictor's top-1 anchor instead of the oracle anchor. During
+this window:
 
     - anchor_encoder learns to produce useful anchor-summary tokens
     - anchor_cross_attn.out_proj grows away from zero
@@ -69,6 +72,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from flow_planner.data.utils.collect import collect_batch
+from flow_planner.dpo.eval_multidim_utils import (
+    _extract_predictor_head_state_dict,
+    _unwrap_state_dict,
+)
+from flow_planner.goal.anchor_predictor import AnchorPredictor
 
 # Re-use the patching + ckpt-loading helper that already handles decoder
 # anchor-field injection (goal_dim=0 / anchor_state_dim=3 / anchor_len / ...).
@@ -132,6 +140,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-state-dim", type=int, default=3)
     parser.add_argument("--anchor-token-num", type=int, default=4)
     parser.add_argument("--anchor-attn-heads", type=int, default=8)
+
+    # Scheduled anchor sampling (Phase 2 robustness probe)
+    parser.add_argument("--anchor-predictor-ckpt", default=None,
+                        help="AnchorPredictor checkpoint used when scheduled "
+                             "sampling replaces oracle anchors with predictor top-1.")
+    parser.add_argument("--scheduled-sampling-p-max", type=float, default=0.0,
+                        help="Maximum probability of replacing an oracle anchor "
+                             "with predictor top-1 during finetuning. 0 disables it.")
+    parser.add_argument("--scheduled-sampling-ramp-epochs", type=float, default=None,
+                        help="Linearly ramp replacement probability to p_max over "
+                             "this many epochs. Defaults to --epochs.")
+    parser.add_argument("--predictor-hidden-dim", type=int, default=256)
+    parser.add_argument("--predictor-dropout", type=float, default=0.1)
 
     return parser.parse_args()
 
@@ -213,6 +234,105 @@ def compute_total_loss(loss_dict: dict, weights: dict) -> torch.Tensor:
     return total
 
 
+def load_anchor_predictor_for_sampling(
+    planner: nn.Module,
+    ckpt_path: str,
+    device: str,
+    hidden_dim: int = 256,
+    dropout: float = 0.1,
+) -> AnchorPredictor:
+    """Load a predictor head without freezing the planner being finetuned."""
+    predictor = AnchorPredictor(
+        planner_backbone=planner,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        freeze_backbone=False,
+    )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = _extract_predictor_head_state_dict(_unwrap_state_dict(ckpt))
+    missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[warn] scheduled predictor missing {len(missing)} keys: {missing[:5]}")
+    if unexpected:
+        print(f"[warn] scheduled predictor unexpected {len(unexpected)} keys: {unexpected[:5]}")
+
+    predictor = predictor.to(device)
+    for p in predictor.head.parameters():
+        p.requires_grad_(False)
+    predictor.head.eval()
+    return predictor
+
+
+def scheduled_sampling_probability(
+    global_step: int,
+    total_steps: int,
+    p_max: float,
+    ramp_steps: int,
+) -> float:
+    if p_max <= 0.0 or total_steps <= 0:
+        return 0.0
+    if ramp_steps <= 0:
+        return float(p_max)
+    progress = min(1.0, max(0.0, global_step / float(ramp_steps)))
+    return float(p_max) * progress
+
+
+@torch.no_grad()
+def predict_top1_anchor_traj(
+    predictor: AnchorPredictor,
+    batch,
+) -> torch.Tensor:
+    """Predict top-1 anchors while temporarily putting the shared backbone in eval mode."""
+    backbone = predictor.backbone
+    was_training = backbone.training
+    backbone.eval()
+    predictor.head.eval()
+    try:
+        prediction = predictor.predict_topk(batch, top_k=1)
+    finally:
+        if was_training:
+            backbone.train()
+    return prediction["anchor_trajs"][:, 0, :, :].detach()
+
+
+def apply_scheduled_anchor_override(
+    planner: nn.Module,
+    batch,
+    predictor: AnchorPredictor | None,
+    probability: float,
+) -> dict:
+    """Attach ``batch.anchor_traj_override`` with oracle/predicted mixed anchors."""
+    B = batch.ego_current.shape[0]
+    stats = {
+        "scheduled_probability": float(probability),
+        "scheduled_samples": 0,
+        "scheduled_total": int(B),
+    }
+
+    if probability <= 0.0:
+        if hasattr(batch, "anchor_traj_override"):
+            delattr(batch, "anchor_traj_override")
+        return stats
+    if predictor is None:
+        raise RuntimeError(
+            "--scheduled-sampling-p-max > 0 requires --anchor-predictor-ckpt"
+        )
+
+    replace_mask = torch.rand((B,), device=batch.ego_current.device) < probability
+    stats["scheduled_samples"] = int(replace_mask.sum().item())
+    if stats["scheduled_samples"] == 0:
+        if hasattr(batch, "anchor_traj_override"):
+            delattr(batch, "anchor_traj_override")
+        return stats
+
+    oracle_anchor = planner._get_anchor_for_gt(batch).to(batch.ego_current.device).float()
+    predicted_anchor = predict_top1_anchor_traj(predictor, batch).to(oracle_anchor.device).float()
+    mixed_anchor = oracle_anchor.clone()
+    mixed_anchor[replace_mask] = predicted_anchor[replace_mask]
+    batch.anchor_traj_override = mixed_anchor
+    return stats
+
+
 def format_metrics(metrics: dict) -> str:
     parts = []
     for k in ("total_loss", "ego_planning_loss", "consistency_loss"):
@@ -281,6 +401,8 @@ def main() -> None:
             "planner._anchor_vocab_tensor is None; anchor_vocab_path did not "
             "propagate into the model. Check load_planner patching."
         )
+    if args.scheduled_sampling_p_max < 0.0 or args.scheduled_sampling_p_max > 1.0:
+        raise ValueError("--scheduled-sampling-p-max must be in [0, 1]")
 
     # ---- Data ----
     train_set = build_dataset(cfg, args.train_data_dir, args.train_data_list,
@@ -321,10 +443,35 @@ def main() -> None:
         "consistency_loss": args.consistency_loss_weight,
     }
 
+    scheduled_predictor = None
+    if args.scheduled_sampling_p_max > 0.0:
+        if args.anchor_predictor_ckpt is None:
+            raise ValueError(
+                "--scheduled-sampling-p-max > 0 requires --anchor-predictor-ckpt"
+            )
+        scheduled_predictor = load_anchor_predictor_for_sampling(
+            planner,
+            args.anchor_predictor_ckpt,
+            args.device,
+            hidden_dim=args.predictor_hidden_dim,
+            dropout=args.predictor_dropout,
+        )
+        print(
+            "[scheduled-sampling] enabled "
+            f"p_max={args.scheduled_sampling_p_max:.3f} "
+            f"predictor_ckpt={args.anchor_predictor_ckpt}"
+        )
+
     # ---- Train loop ----
     history = []
     best_val = float("inf")
     best_path = Path(args.save_dir) / "planner_anchor_best.pth"
+    global_step = 0
+    total_steps = max(1, args.epochs * len(train_loader))
+    ramp_epochs = args.scheduled_sampling_ramp_epochs
+    if ramp_epochs is None:
+        ramp_epochs = float(args.epochs)
+    ramp_steps = int(max(0, ramp_epochs) * len(train_loader))
 
     for epoch in range(1, args.epochs + 1):
         planner.train()
@@ -337,10 +484,28 @@ def main() -> None:
         epoch_totals = {"total_loss": [], "ego_planning_loss": [],
                         "consistency_loss": []}
         out_proj_norms = []
+        scheduled_probs = []
+        scheduled_samples = 0
+        scheduled_total = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
         for batch in progress:
             batch = batch.to(args.device)
+            sampling_p = scheduled_sampling_probability(
+                global_step=global_step,
+                total_steps=total_steps,
+                p_max=args.scheduled_sampling_p_max,
+                ramp_steps=ramp_steps,
+            )
+            sched_stats = apply_scheduled_anchor_override(
+                planner,
+                batch,
+                scheduled_predictor,
+                sampling_p,
+            )
+            scheduled_probs.append(sched_stats["scheduled_probability"])
+            scheduled_samples += sched_stats["scheduled_samples"]
+            scheduled_total += sched_stats["scheduled_total"]
             _, loss_dict = planner(batch, mode="train")
             total = compute_total_loss(loss_dict, weights)
 
@@ -368,7 +533,9 @@ def main() -> None:
             progress.set_postfix(
                 loss=f"{total.item():.3f}",
                 out_proj=f"{out_proj_norms[-1]:.2e}",
+                sched=f"{sampling_p:.2f}",
             )
+            global_step += 1
 
         scheduler.step()
 
@@ -389,13 +556,22 @@ def main() -> None:
                    if "name" in g},
             "anchor_out_proj_abs_mean_end": out_proj_norms[-1]
             if out_proj_norms else 0.0,
+            "scheduled_sampling": {
+                "p_max": float(args.scheduled_sampling_p_max),
+                "p_mean": float(np.mean(scheduled_probs)) if scheduled_probs else 0.0,
+                "sample_fraction": float(scheduled_samples / max(scheduled_total, 1)),
+                "samples": int(scheduled_samples),
+                "total": int(scheduled_total),
+            },
         }
         history.append(record)
 
         print(
             f"[epoch {epoch}] train {format_metrics(train_metrics)} | "
             f"val {format_metrics(val_metrics)} | "
-            f"out_proj={record['anchor_out_proj_abs_mean_end']:.2e}"
+            f"out_proj={record['anchor_out_proj_abs_mean_end']:.2e} | "
+            f"sched_p_mean={record['scheduled_sampling']['p_mean']:.3f} "
+            f"sched_frac={record['scheduled_sampling']['sample_fraction']:.3f}"
         )
 
         # Save latest + best.

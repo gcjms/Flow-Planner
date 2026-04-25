@@ -330,6 +330,20 @@ bash run_anchor_eval_suite.sh raw_no_goal planner_ft_none oracle_anchor_rerank
 > 这些脚本的 summary 输出已经统一改成 `conditioning: anchor / ...` 风格，不再打印
 > 容易误导人的 `goal_mode: none`。
 
+Phase 2 的 scheduled anchor sampling 用这个入口：
+
+```bash
+# p_max=0.3：温和混入 predictor top1 anchor
+bash run_anchor_scheduled_sampling.sh 0.3
+
+# p_max=0.5：更强混入 predictor top1 anchor
+bash run_anchor_scheduled_sampling.sh 0.5
+```
+
+脚本会先从 `flowplanner_no_goal.pth` 开始 finetune，然后把生成的
+`planner_anchor_best.pth` 自动送进 eval suite，跑
+`planner_ft_none / predicted_anchor / predicted_anchor_rerank_a / oracle_anchor / oracle_anchor_rerank`。
+
 **Phase 1 Exit Criteria**（严格 gate，达不到就停下来 debug，不推 Phase 2）：
 
 | 指标 | `none` baseline | `predicted_anchor` | `oracle_anchor` | 通过条件 |
