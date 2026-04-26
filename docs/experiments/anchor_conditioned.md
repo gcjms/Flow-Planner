@@ -606,3 +606,27 @@
   - Generate a larger selector dataset, preferably 2k train scenes, and train a candidate-aware reranker that sees scene features plus candidate anchor/trajectory features.
   - Keep the learned selector top1 as a positive but not final result.
   - Do not replace the current production rerank_a with selector+rerank until it beats 3.15% collision on the 2k manifest.
+
+## Glossary note: DPO pair types and flow-matching log-prob 20260426
+
+- `mixed v2 DPO` means the preference dataset contains two kinds of same-anchor pairs at the same time:
+  - `same_anchor_collision`: chosen is a safe trajectory, rejected is a collided trajectory under the same scene and same anchor. This is the clearest preference label.
+  - `same_anchor_quality`: both candidates are safe, but one has a higher structured score than the other. This is weaker because the rejected trajectory may still be acceptable; it should not be treated as equally strong as a collision failure.
+  - Purpose: test whether combining clear safety pairs and softer safe-vs-safe quality pairs can train a useful planner preference signal.
+- `collision-only DPO` means we throw away all safe-vs-safe quality pairs and train only on `same_anchor_collision` pairs.
+  - Purpose: isolate the cleanest signal. If this works but mixed fails, the safe-vs-safe labels are probably noisy. If this also fails, the bottleneck is more likely the DPO objective / log-prob estimate itself.
+  - Result: collision-only reached only about random pair accuracy, so cleaner labels alone were not enough.
+- `DPO acc` here is not driving accuracy or trajectory accuracy. It is pairwise preference accuracy:
+  - For each pair, compute whether the model assigns a larger relative likelihood / DPO margin to `chosen` than to `rejected`.
+  - Around 50% means the model is basically not distinguishing the preferred trajectory from the rejected trajectory.
+  - Below 50% can happen with noisy estimates or if updates push in the wrong/noisy direction.
+- `continuous flow-matching log-prob` explanation:
+  - Flow Planner is a continuous trajectory generator trained with flow matching / diffusion-like denoising, not a normal classifier over a small discrete set.
+  - DPO needs a number like `log pi_theta(trajectory | scene, condition)` so it can say whether chosen is more likely than rejected.
+  - For a continuous flow-matching model, this log-prob is only approximated through the denoising/flow-matching loss on a candidate trajectory, often with sampled noise/timesteps.
+  - That estimate can be noisy and very close for two similar trajectories, especially when both use the same anchor.
+  - In our experiments, chosen/rejected margins stayed near zero, so the training objective could not reliably tell which candidate should win.
+- Practical interpretation:
+  - The weak result does not mean anchor conditioning is useless. Oracle anchor and predicted-anchor rerank show the anchor candidate space has value.
+  - It means planner-level DPO using the current continuous trajectory log-prob estimate is not yet a reliable preference learner.
+  - This is why the later selector experiment moves preference learning to a discrete anchor/candidate selection problem, where probabilities are cleaner and easier to train.
