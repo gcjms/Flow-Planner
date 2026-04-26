@@ -165,3 +165,11 @@
 - Status:
   - Started on 2026-04-26 17:43 CST.
   - Results pending.
+
+## Anchor-DPO implementation note
+
+- Existing train_dpo.py supports generic chosen/rejected pairs and optional goal fields, but it does not yet consume anchor-specific fields.
+- For real anchor-DPO, preference data must carry the anchor condition used for each pair, e.g. anchor_trajs or chosen_anchor_trajs/rejected_anchor_trajs.
+- Same-anchor DPO should use the same anchor_traj for chosen and rejected, then pass that anchor_traj into decoder inputs during DPO loss computation.
+- Without this change, training with anchor-generated pairs would become ordinary DPO under scene context, not anchor-conditioned DPO.
+- Immediate coding task: add anchor fields to PreferenceDataset/collate_preferences and add attach_anchor_to_decoder_inputs mirroring the existing goal path.
