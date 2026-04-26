@@ -981,3 +981,18 @@ train500 selector 的 2k val 结果：
   - 这个图直观说明 anchor-level selector 只是在 scene 级选择更可能产生安全轨迹的 anchor；同一个 anchor 下仍可能有好/坏采样差异，因此后续 candidate-level selector 有必要。
 - Next:
   - 保留该图作为 anchor-DPO 动机图候选；下一步设计 candidate-level selector，直接对 scene+anchor+trajectory 打分。
+
+## Experiment: 20260426 night closeout: sample-size diagnostic and tomorrow plan
+
+- Goal:
+  - 睡前确认 anchor-DPO 下一步是否继续扫 anchor-selector 超参，还是转向 candidate-level selector；同时客观检查当前样本量是否太小。
+- Data:
+  - 使用 train2k softpref candidates: 2000 train scenes，每个 scene 为 top3 anchors x 每个 anchor 3 samples，共 18000 candidate trajectories。
+- Method:
+  - 不训练新模型，只统计 candidate pool 的 safety upper bound / oracle bound；统计 scene 内 safe candidate 覆盖、rank0 anchor safe 覆盖、best-score candidate collision，以及 anchor group all-safe/all-collide 比例。
+- Results:
+  - raw candidate collision=8.44%; scene split=1518 all-safe / 458 mixed / 24 all-collide; 98.8% scenes have at least one safe candidate; candidate oracle best-score collision=1.2%; best-mean-anchor+best-sample collision=1.2%; rank0 any-safe=97.0%, rank0 all-collide=3.0%; 6000 anchor groups: any-safe=96.32%, all-safe=85.75%, all-collide=3.68%; score gap mean=1.317, median=0.215; mixed safe-vs-best-collision gap mean=5.005, median=4.984.
+- Interpretation:
+  - 样本量确实偏小：2000 scenes / 18000 candidates 只够方向判断和 pilot，不足以支撑 paper-facing robust conclusion。但候选池有明显潜力：candidate oracle 1.2% collision 明显低于 anchor-selector-DPO 和 hand rerank 的 3.15%，说明瓶颈主要在 selector 没有充分利用同一 scene 下多条 candidate，而不是 planner 完全生成不出安全轨迹。
+- Next:
+  - 明天 TODO: 1) anchor 细节只维护在 feature/anchor，不再进 main；2) 实现 candidate-level dataset，读取 scored_dir + candidate npz，构造 same-scene candidate pairs，优先 collision/mixed pairs，避免 safe-vs-safe 小 gap 强行偏好；3) 实现 candidate-level selector v0: scene feature + anchor id/embedding + trajectory feature -> candidate score；4) 先跑 100-200 scenes smoke；5) 再跑 train2k pilot 并评估 2k manifest，对比 original top1 / soft selector / collision-only anchor-selector-DPO / hand rerank_a；6) 只有 pilot 有正信号才扩大 candidate generation。
