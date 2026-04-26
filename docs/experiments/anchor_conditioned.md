@@ -417,3 +417,37 @@
 - Interpretation:
   - Treat the `1958` record as a failed launch attempt only.
   - Treat the `2001` run as the valid v2 DPO pilot.
+
+## Update: anchor-DPO pair semantics concern 20260426
+
+- User concern: safe-vs-safe pairs may be noisy because both trajectories can be acceptable. Hard DPO on these pairs may incorrectly push a usable safe trajectory as `rejected`.
+- Current generator behavior confirmed:
+  - If same-anchor candidates contain safe and collided trajectories: choose best safe vs worst collided, label `same_anchor_collision`.
+  - If all candidates are safe: choose max-quality vs min-quality when `quality_gap >= min_quality_gap`, label `same_anchor_quality`.
+  - Quality uses `safe_bonus = 100 * (1 - collided)`, so collision pairs have score gaps around 100 and naturally pass `min_score_gap=0.15`; the 0.15 threshold mainly filters safe-vs-safe quality pairs.
+- Train2k v2 score-gap distribution:
+  - `same_anchor_collision`: 567 pairs, gap min 99.5767, median 100.0292, max 100.5446.
+  - `same_anchor_quality`: 3210 pairs, gap min 0.0500, median 0.1005, p75 0.1498, p90 0.2245, max 0.8520.
+  - With `min_score_gap=0.15`, kept 1367 pairs = 567 collision + 800 quality.
+- Valid v2 mixed-pair training result:
+  - Run: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train2k_gap0p15_v2_e2_20260426_2001`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_dpo_train2k_gap0p15_v2_e2_20260426_2001.log`
+  - Epoch 1: loss 0.7459, acc 47.79%, delta -0.0003.
+  - Epoch 2: loss 0.7458, acc 44.85%, delta -0.0008.
+  - Per-label epoch 2: collision acc 44.86%, quality acc 44.85%.
+  - Interpretation: weak/near-random; do not treat this as a positive anchor-DPO result.
+- Collision-only ablation:
+  - Filtered preference file: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train2k_collision_only_v2_20260426_2010.npz`
+  - Filter: `dim_labels == same_anchor_collision`, 567 pairs.
+  - Invalid launch: `anchor_dpo_train2k_collision_only_v2_e2_20260426_2010` imported non-anchor model code because `PYTHONPATH=/root/autodl-tmp/Flow-Planner-anchor-runtime` was missing. It has `INVALID.txt`; do not use it.
+  - Valid run: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train2k_collision_only_v2_e2_20260426_2015`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_dpo_train2k_collision_only_v2_e2_20260426_2015.log`
+  - Correct runtime check: model loaded 15.187M params; LoRA includes anchor encoder/cross-attn modules; 75 LoRA layers.
+  - Epoch 1: loss 0.7458, acc 50.00%, delta -0.0002.
+  - Epoch 2: loss 0.7458, acc 51.61%, delta 0.0001.
+  - Interpretation: cleaner labels alone did not produce a strong DPO signal; current DPO objective/log-prob estimate is barely distinguishing chosen vs rejected under same anchor.
+- Decision:
+  - Safe-vs-safe hard pairs should not be used as equal-strength formal DPO labels yet.
+  - Treat current anchor-DPO as diagnostic, not deployment-ready.
+  - Next priority is to inspect why DPO log-prob deltas are almost zero under same-anchor collision pairs before scaling more data.
+  - Candidate fixes: stronger/less noisy DPO signal, more samples per anchor, larger collision-pair set, gap/confidence-weighted or soft preference for safe-vs-safe pairs, and explicit eval only after train deltas become meaningful.
