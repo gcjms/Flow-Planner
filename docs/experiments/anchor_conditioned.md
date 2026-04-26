@@ -376,3 +376,32 @@
 - Decision rule:
   - If pair yield and score-gap distribution look healthy, create an explicit filtered `.npz` and run a v2 DPO pilot.
   - If yield is weak or mostly ambiguous quality pairs, improve pair selection before training.
+
+## Experiment: anchor_dpo_train2k_gap0p15_v2_e2_20260426
+
+- Goal: 在 runtime v2 修复后，用更大的 train2k same-anchor preference set 跑第二版 DPO pilot，验证更稳定的 DPO loss 和更多 pair 是否能产生更可信的提升。
+- Pair source:
+  - Raw preference file: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train2k_v2_20260426_1921.npz`
+  - Raw pairs: 3777 from 2000 train scenes, 0 failures
+  - Labels: `same_anchor_collision` 567, `same_anchor_quality` 3210
+  - Anchor ranks: rank0 1192, rank1 1263, rank2 1322
+  - Score gap: min 0.0500, median 0.1143, mean 15.1240, p75 0.2126, p90 99.9807, max 100.5446
+- Filter for training:
+  - Use `--min_score_gap 0.15` in runtime v2 `PreferenceDataset`.
+  - Effective pairs: 1367, including collision 567 and quality 800.
+- Train setup:
+  - Runtime: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Script: `python -m flow_planner.dpo.train_dpo`
+  - Base planner: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Anchor vocab: `/root/autodl-tmp/anchor_runs/anchor_vocab.npy`
+  - Scene dir: `/root/autodl-tmp/train_dataset`
+  - Output dir: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train2k_gap0p15_v2_e2_20260426_1958`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_dpo_train2k_gap0p15_v2_e2_20260426_1958.log`
+  - epochs: 2, batch_size: 8, lr: 1e-5, beta: 0.1, sft_weight: 0.05, num_t_samples: 4, lora_rank: 4, lora_alpha: 16
+- Status:
+  - Started on 2026-04-26 19:58 CST.
+  - PID at launch: 24227.
+  - Running at record time.
+- Decision rule:
+  - If train accuracy/delta becomes meaningfully better than v1 and 500 quick eval improves predicted_anchor_rerank without hurting oracle, then run 2k eval.
+  - If still near-random or hurts quick eval, stop DPO scaling and focus on selector/reranker/predictor quality.
