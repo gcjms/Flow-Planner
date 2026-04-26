@@ -232,3 +232,70 @@
 - Decision:
   - Scale pair mining to a larger fixed subset next, starting from 500 scenes or 2k scenes depending on runtime budget.
   - Do not treat smoke LoRA output as a deployable checkpoint.
+
+## Experiment: anchor_dpo_train500_gap0p15_pilot_20260426
+
+- Goal: 验证 same-anchor preference pair 能否真正接到 anchor-conditioned DPO 训练，并快速判断小规模 DPO 是否可能改善 anchor 部署评测。
+- Setup:
+  - Pair generator: `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/generate_anchor_same_anchor_pairs.py`
+  - Base planner: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Predictor: `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+  - Pair source split: train, `/root/autodl-tmp/train_dataset`
+  - Train manifest: `/root/autodl-tmp/anchor_runs/generated_lists/train_list.json`
+  - Pair mining subset: 500 train scenes
+  - Pair mining config: `top_k=3`, `samples_per_anchor=3`, same scene + same predicted anchor only
+- Pair mining artifacts:
+  - Raw preference file: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train500_20260426_1830.npz`
+  - Filtered preference file: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train500_gap0p15_20260426_1830.npz`
+- Pair mining results:
+  - Raw pairs: 924 pairs from 437 / 500 scenes, 0 failures
+  - Raw labels: `same_anchor_quality` 800, `same_anchor_collision` 124
+  - Anchor ranks: rank0 290, rank1 308, rank2 326
+  - Filter used for pilot: keep all collision pairs plus quality pairs with `score_gap >= 0.15`
+  - Filtered pairs: 321 pairs, including `same_anchor_quality` 197 and `same_anchor_collision` 124
+- DPO train setup:
+  - Script: `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/train_dpo.py`
+  - Preference path: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train500_gap0p15_20260426_1830.npz`
+  - Output dir: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train500_gap0p15_e2_20260426_1840`
+  - Epochs: 2
+  - Batch size: 8
+  - `num_t_samples=4`, `beta=0.1`, `sft_weight=0.05`, `lr=1e-5`, `lora_rank=4`, `lora_alpha=16`
+- DPO train result:
+  - Epoch 1: loss 0.7464, accuracy 46.56%, delta -0.0076
+  - Epoch 2: loss 0.7460, accuracy 51.88%, delta -0.0010
+  - Best train accuracy: 51.88%
+  - Saved merged model: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train500_gap0p15_e2_20260426_1840/model_dpo_merged.pth`
+  - Saved clean merged model with LoRA side keys stripped: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train500_gap0p15_e2_20260426_1840/model_dpo_merged_stripped.pth`
+- Code review notes during pilot:
+  - Original merged checkpoint retained 150 LoRA side keys, causing eval `unexpected keys` warnings. A stripped checkpoint was created for follow-up eval; this is a checkpoint-format issue, not evidence that DPO weights were ignored.
+  - Weight diff check against rho=0.5 base planner found 72 changed floating-point tensors; the largest relative change was in `model_decoder.anchor_cross_attn.out_proj.weight`.
+  - Runtime `train_dpo.py` currently exposes `--min_score_gap`, but the dataset loader does not actually apply it. This did not affect the pilot because filtering was done into a separate `.npz`, but it must be fixed before relying on CLI filtering.
+  - Runtime `dpo_loss.py` currently samples independent flow-matching noise/timesteps for policy and reference log-probs. This is valid as a noisy estimator but unnecessarily high variance; next DPO training should share sampled noise/t between policy/reference for the same trajectory.
+  - Runtime code changes are still in the anchor runtime snapshot and patch artifacts, not yet formally migrated into the `anchor` branch.
+- 500-scene quick eval setup:
+  - Eval output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_dpo_train500_gap0p15_e2_500_20260426_1848`
+  - Scene dir: `/root/autodl-tmp/val_dataset`
+  - Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest.json`
+  - Eval scenes: 500
+  - Cases: planner_ft_none, predicted_anchor_top1, predicted_anchor_rerank_a, oracle_anchor
+- 500-scene quick eval results:
+  - planner_ft_none: collision_rate 5.60, avg_progress 0.3512, avg_route 0.8536
+  - predicted_anchor_top1: collision_rate 3.40, avg_progress 0.3350, avg_route 0.8516
+  - predicted_anchor_rerank_a: collision_rate 3.20, avg_progress 0.3400, avg_route 0.8653
+  - oracle_anchor: collision_rate 2.00, avg_progress 0.3256, avg_route 0.8472
+- 500-scene comparison against rho=0.5 non-DPO planner on same manifest:
+  - planner_ft_none improved from 7.40 to 5.60 collision_rate.
+  - predicted_anchor_top1 regressed slightly from 3.20 to 3.40 collision_rate.
+  - predicted_anchor_rerank_a improved from 4.60 to 3.20 collision_rate.
+  - oracle_anchor improved from 2.20 to 2.00 collision_rate.
+- Interim conclusion:
+  - The pilot is technically successful and shows a small positive signal for rerank/oracle, but training accuracy is near random and top1 did not improve.
+  - This is not enough to justify a large DPO run yet.
+  - It is enough to justify a 2k fixed-manifest replication before deciding whether to scale pair mining/training.
+- 2k replication status:
+  - Started on 2026-04-26 18:50 CST.
+  - Eval output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_dpo_train500_gap0p15_e2_2k_20260426_1852`
+  - Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`
+  - Checkpoint: `model_dpo_merged_stripped.pth`
+  - Cases: planner_ft_none, predicted_anchor_top1, predicted_anchor_rerank_a, oracle_anchor
+  - Status at record time: running.
