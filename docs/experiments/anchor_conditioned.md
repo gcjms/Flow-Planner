@@ -299,3 +299,32 @@
   - Checkpoint: `model_dpo_merged_stripped.pth`
   - Cases: planner_ft_none, predicted_anchor_top1, predicted_anchor_rerank_a, oracle_anchor
   - Status at record time: running.
+
+## Results: anchor_dpo_train500_gap0p15_eval_2k_20260426
+
+- Status: completed on 2026-04-26 19:11 CST.
+- Eval output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_dpo_train500_gap0p15_e2_2k_20260426_1852`
+- Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`
+- Checkpoint: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train500_gap0p15_e2_20260426_1840/model_dpo_merged_stripped.pth`
+- Eval scenes: 2000
+- Results:
+  - planner_ft_none: collision_rate 5.15, avg_progress 0.3419, avg_route 0.8609
+  - predicted_anchor_top1: collision_rate 4.10, avg_progress 0.3238, avg_route 0.8545
+  - predicted_anchor_rerank_a: collision_rate 3.10, avg_progress 0.3282, avg_route 0.8738
+  - oracle_anchor: collision_rate 2.20, avg_progress 0.3138, avg_route 0.8559
+- Comparison against rho=0.5 non-DPO 2k eval:
+  - planner_ft_none: 5.45 -> 5.15 collision_rate, small improvement.
+  - predicted_anchor_top1: 4.20 -> 4.10 collision_rate, negligible improvement.
+  - predicted_anchor_rerank_a: 3.15 -> 3.10 collision_rate, essentially tied.
+  - oracle_anchor: 2.20 -> 2.20 collision_rate, tied.
+- Conclusion:
+  - The anchor-DPO path is technically working and did not break anchor-conditioned inference.
+  - On 2k fixed validation scenes, this 321-pair pilot only gives marginal changes; the apparent 500-scene rerank gain was mostly variance.
+  - This pilot is not strong enough to justify scaling DPO training as-is.
+  - Current best deployment candidate remains rho=0.5 + predicted_anchor_rerank_a.
+  - The oracle gap remains: predicted_anchor_rerank_a 3.10 vs oracle_anchor 2.20 collision_rate.
+- Decision:
+  - Do not launch a large anchor-DPO training run from the current 321-pair setup.
+  - Before the next DPO run, fix the DPO implementation issues found during review: apply `min_score_gap` filtering correctly, strip LoRA side keys when saving merged checkpoints, and reduce DPO loss variance by sharing sampled flow-matching noise/timesteps between policy and reference for each trajectory.
+  - After the code fix, mine a larger train-split same-anchor preference set, likely 2k train scenes first, then train/eval a second pilot.
+  - Continue treating rerank/selector as a high-priority path, because top-k predicted anchors are already more useful than top1 alone.
