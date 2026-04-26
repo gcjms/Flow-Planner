@@ -66,6 +66,89 @@ DPO 需要比较 `chosen` 和 `rejected` 哪个更像模型会生成的轨迹，
 
 ### 0.5 第四层：为什么转向 learned anchor selector
 
+
+#### 0.5.1 当前 v1：anchor-level soft selector
+
+当前已经实现和评测的是 `anchor-level soft selector`，不是最终 DPO。模型仍然是 `AnchorPredictor`：输入 scene，输出整个 anchor vocab 上的 logits / scores。
+
+形式上是：
+
+```text
+scene -> selector -> score(anchor_1), score(anchor_2), ...
+```
+
+数据生成过程：
+
+1. 对每个 scene，用当前 predictor 提出 top3 anchors。
+2. 每个 anchor 让 planner 采样 3 条轨迹，所以每个 scene 有 9 条 candidate trajectories。
+3. 用 safety / route / progress 等 structured metrics 给 9 条 candidate 打分。
+4. 把同一个 anchor 下的 candidate 分数聚合成一个 anchor score，例如 mean / max。
+5. 把 anchor scores 转成 soft target：
+
+```text
+q(anchor | scene) = softmax(anchor_score / temperature)
+```
+
+训练目标是 soft cross entropy，不是 DPO：
+
+```text
+loss = - sum_anchor q(anchor | scene) * log p_selector(anchor | scene)
+```
+
+含义：这版 selector 不再只模仿 GT 最近 anchor，而是尝试偏向那些能让 planner 生成更安全、更合理轨迹的 anchor。
+
+#### 0.5.2 下一步：selector-DPO，不再用 planner continuous log-prob
+
+下一步真正的 selector-DPO 不应该再使用 planner 的连续轨迹 likelihood：
+
+```text
+log pi_planner(trajectory | scene, anchor)
+```
+
+而应该把 DPO 放在 selector 自己的离散 score 上：
+
+```text
+s_theta(scene, anchor)
+```
+
+构造 pair 的方式是：
+
+```text
+chosen anchor = 生成候选中更安全 / structured score 更高的 anchor
+rejected anchor = 更危险 / structured score 更低的 anchor
+```
+
+DPO loss 写在 selector score 差上：
+
+```text
+loss_dpo = -log sigmoid(
+  beta * (
+    (s_theta(scene, chosen) - s_theta(scene, rejected))
+    - (s_ref(scene, chosen) - s_ref(scene, rejected))
+  )
+)
+```
+
+这里 `s_ref` 是原始 predictor / frozen selector 的 score，用于限制模型不要偏离太远。这样学到的是：在同一个 scene 下，selector 应该给 chosen anchor 更高分，给 rejected anchor 更低分。
+
+这个设计的关键点是：DPO 比较的是离散 anchor/candidate score，而不是连续 planner trajectory log-prob。这样可以避开当前 flow-matching log-prob 对候选排序不敏感的问题。
+
+#### 0.5.3 再下一层：candidate-level selector
+
+`anchor-level selector` 只看：
+
+```text
+scene -> anchor score
+```
+
+`candidate-level selector` 会进一步看：
+
+```text
+scene + anchor + generated candidate trajectory -> preference score
+```
+
+这更接近最终目标：同一个 scene 下有多条候选轨迹，模型自己判断哪条更好。手写 `predicted_anchor_rerank_a` 只作为 teacher / diagnostic baseline / ablation，不作为最终方法或创新点。最终部署希望用 learned selector / learned preference scorer 给候选打分，而不是靠手写规则硬选。
+
 因为 planner-level likelihood 太弱，我转向离散 selector：让模型先学 `这个 scene 应该选哪个 anchor / candidate mode`。
 
 这不是手写 reranker。手写 `predicted_anchor_rerank_a` 只作为诊断工具，证明 top-k anchor pool 里确实有更好的候选。真正可能作为论文方法的是 learned selector / preference policy。
