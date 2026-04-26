@@ -451,3 +451,30 @@
   - Treat current anchor-DPO as diagnostic, not deployment-ready.
   - Next priority is to inspect why DPO log-prob deltas are almost zero under same-anchor collision pairs before scaling more data.
   - Candidate fixes: stronger/less noisy DPO signal, more samples per anchor, larger collision-pair set, gap/confidence-weighted or soft preference for safe-vs-safe pairs, and explicit eval only after train deltas become meaningful.
+
+## Design note: soft preference distillation from goal branch 20260426
+
+- Goal branch reference commit: `6356744 Wrap up goal-line: soft preference distill + DriveDPO-style hard negatives + anchor notes in GOAL_DESIGN`.
+- Relevant files in `origin/feature/goal`:
+  - `flow_planner/dpo/SOFT_PREF_DISTILL.md`
+  - `flow_planner/dpo/train_soft_pref.py`
+  - `flow_planner/dpo/build_multi_pairs.py`
+  - `flow_planner/goal/GOAL_DESIGN.md`
+- Key idea: replace pure `best vs worst` hard-pair learning with scene-level candidate distribution learning.
+  - Generate K candidates per scene.
+  - Score every candidate with structured metrics.
+  - Convert candidate scores into a teacher soft target distribution `q_i = softmax(u_i / T)`.
+  - Train policy candidate probabilities `p_theta(i) = softmax(log pi_theta(tau_i | condition_i))` with `KL(q || p_theta)` / cross entropy.
+  - Optional terms: teacher top-1 log-prob anchor and reference KL to control drift.
+- Goal implementation details:
+  - Teacher logit uses z-scored GT similarity plus z-scored structured scorer value: `u_i = gt_weight * z(gt_sim_i) + score_weight * z(score_i)`.
+  - `train_soft_pref.py` currently attaches `goal_labels` via `attach_goal_to_decoder_inputs`.
+  - `build_multi_pairs.py` also improves later hard DPO by selecting `strict_same_group`, `gt_near_unsafe`, `chosen_near_unsafe`, `same_group_soft`, `cross_group_soft`, and fallback hard failures.
+- Anchor adaptation required:
+  - Current anchor runtime `train_soft_pref.py` exists but is still goal-oriented; it does not yet consume `anchor_trajs` or call `attach_anchor_to_decoder_inputs`.
+  - Do not run it as-is for anchor soft preference.
+  - Need an anchor candidate artifact that preserves all candidates per scene, not only mined chosen/rejected pairs: trajectories, per-candidate anchor trajectory, anchor index/rank, metrics, and teacher score.
+  - Then implement anchor soft-pref loss over candidates under their own anchor condition.
+- Interpretation for current anchor-DPO issue:
+  - This is the right direction for safe-vs-safe ambiguity: do not force every acceptable safe trajectory to be a hard rejected sample.
+  - Use soft distribution / confidence weighting for quality differences, while keeping clear safe-vs-collided pairs as hard negatives later.
