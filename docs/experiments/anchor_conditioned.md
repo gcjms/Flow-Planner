@@ -930,3 +930,54 @@ train500 selector 的 2k val 结果：
   - future anchor experiments should be recorded through this helper or follow the same field order manually
 - Next:
   - use this script immediately after each training/eval run to append paper-reusable notes
+
+## Experiment: 20260426 selector-DPO ablation A: collision-only beta0.2 sft0.10
+
+- Goal:
+  - 验证更保守的 collision-only anchor-selector-DPO 是否能在保持安全性的同时恢复 progress/route。
+- Data:
+  - 使用 train2k softpref candidate scored_dir 构造 collision-only anchor pairs；固定 2k val manifest eval_manifest_2k_seed3402.json。
+- Method:
+  - 以 train2k soft-CE selector 为 init，以原始 anchor predictor 为 reference；DPO beta=0.2，SFT weight=0.10，epochs=10；部署时 predicted_anchor top1，不使用手写 rerank。
+- Artifacts:
+  - /root/autodl-tmp/anchor_runs/anchor_selector_dpo_collision_b0p2_sft0p10_e10_20260426_2315
+- Eval JSON results:
+  - `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_dpo_b0p2_sft0p10_2k_20260426_2320/predicted_anchor_top1_selector_dpo_b0p2_sft0p10/predicted_anchor_top1_selector_dpo_b0p2_sft0p10.json` -> collision 3.7500, progress 0.3133, route 0.8552, collision_score 0.1066, scenes 2000, failed 0
+- Interpretation:
+  - 负结果：collision=3.75%，不如前一版 collision-only selector-DPO 的 3.15%，progress=0.3133 也未恢复；说明这个保守项组合没有带来预期 tradeoff。
+- Next:
+  - 继续跑 beta/sft ablation，优先尝试更小 beta 或不同 SFT 权重，寻找安全与 progress/route 的折中。
+
+## Experiment: 20260426 selector-DPO ablation B: collision-only beta0.1 sft0.10
+
+- Goal:
+  - 验证更小 beta 的 collision-only anchor-selector-DPO 是否能接近 3.15% safety，同时恢复 progress/route。
+- Data:
+  - 使用 train2k softpref candidate scored_dir 构造 collision-only anchor pairs；固定 2k val manifest eval_manifest_2k_seed3402.json。
+- Method:
+  - 以 train2k soft-CE selector 为 init，以原始 anchor predictor 为 reference；DPO beta=0.1，SFT weight=0.10，epochs=10；部署时 predicted_anchor top1，不使用手写 rerank。
+- Artifacts:
+  - /root/autodl-tmp/anchor_runs/anchor_selector_dpo_collision_b0p1_sft0p10_e10_20260426_2325
+- Eval JSON results:
+  - `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_dpo_b0p1_sft0p10_2k_20260426_2330/predicted_anchor_top1_selector_dpo_b0p1_sft0p10/predicted_anchor_top1_selector_dpo_b0p1_sft0p10.json` -> collision 3.2500, progress 0.3166, route 0.8563, collision_score 0.1085, scenes 2000, failed 0
+- Interpretation:
+  - 折中结果：collision=3.25%，略差于原 collision-only selector-DPO 的 3.15%，但 progress=0.3166、route=0.8563 略有恢复；说明降低 beta 可以缓和安全/route-progress tradeoff，但提升幅度很小。
+- Next:
+  - 保留原 collision-only selector-DPO 作为当前 safety best；beta0.1+sft0.10 作为保守折中点。下一步优先做可视化和 candidate-level selector 设计，而不是继续盲目扫小超参。
+
+## Experiment: 20260426 anchor candidate visualization: complex mixed-collision scene
+
+- Goal:
+  - 给 anchor preference/selector-DPO 找一个可解释的复杂场景可视化，用于理解训练信号和后续论文图。
+- Data:
+  - 场景 us-ma-boston_0d5ec00a9c025a5f；来自 train2k softpref candidates；32 个有效邻车、70 条 lane；top3 anchors x 每个 anchor 3 samples，共 9 条 candidate。
+- Method:
+  - 从 scored candidates 中筛选 mixed-collision case：同一 scene 内既有 safe candidate 又有 collided candidates；选择最高分 safe 作为 chosen，最低分 collided 作为 rejected；使用 BEVRenderer 渲染 all-candidates 和 chosen-vs-rejected 两版。
+- Artifacts:
+  - /root/autodl-tmp/anchor_runs/visualizations/anchor_selector_case_20260426_2335
+- Results:
+  - 该 scene 中 9 条 candidates 有 8 条 collided、1 条 safe；chosen 为原始 candidate idx=5，score=6.67；rejected 为原始 candidate idx=3，score=1.34。
+- Interpretation:
+  - 这个图直观说明 anchor-level selector 只是在 scene 级选择更可能产生安全轨迹的 anchor；同一个 anchor 下仍可能有好/坏采样差异，因此后续 candidate-level selector 有必要。
+- Next:
+  - 保留该图作为 anchor-DPO 动机图候选；下一步设计 candidate-level selector，直接对 scene+anchor+trajectory 打分。
