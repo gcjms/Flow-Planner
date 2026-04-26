@@ -405,3 +405,15 @@
 - Decision rule:
   - If train accuracy/delta becomes meaningfully better than v1 and 500 quick eval improves predicted_anchor_rerank without hurting oracle, then run 2k eval.
   - If still near-random or hurts quick eval, stop DPO scaling and focus on selector/reranker/predictor quality.
+
+## Correction: anchor_dpo_train2k_gap0p15_v2 launch 20260426
+
+- The first launch record for `anchor_dpo_train2k_gap0p15_v2_e2_20260426_1958` is invalid because the non-interactive shell did not activate conda; log showed `nohup: failed to run command python: No such file or directory`.
+- Corrected launch:
+  - Output dir: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_train2k_gap0p15_v2_e2_20260426_2001`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_dpo_train2k_gap0p15_v2_e2_20260426_2001.log`
+  - PID at corrected launch: 24390
+  - Status: running; reached Epoch 1/2 with 170 steps per epoch.
+- Interpretation:
+  - Treat the `1958` record as a failed launch attempt only.
+  - Treat the `2001` run as the valid v2 DPO pilot.
