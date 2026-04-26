@@ -853,3 +853,63 @@ train500 selector 的 2k val 结果：
   - Scaling selector data from 500 to 2000 train scenes gives a small additional safety gain: 3.70% -> 3.55% collision.
   - Compared with the original predictor top1, learned selector reduces collision by 0.65 percentage points absolute, but still trades off progress.
   - It still does not beat original `predicted_anchor_rerank_a` collision 3.15%, so train2k selector is a positive learned-signal result, not the current best deployment method.
+
+## Experiment: selector-DPO all-pairs pilot 20260426
+
+- Goal: test whether putting DPO directly on discrete selector scores improves learned anchor selection beyond soft-CE selector.
+- Script: `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/train_anchor_selector_dpo.py`
+- Runtime code patch artifact should be saved before branch sync: `/root/autodl-tmp/anchor_runs/patches/anchor_selector_dpo_train_runtime.patch`
+- Pair construction:
+  - Source candidates: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir`
+  - Aggregation: mean score per anchor.
+  - Pair mode: all ordered anchor pairs with `score_gap >= 0.05`.
+  - Policy init: soft selector train2k `/root/autodl-tmp/anchor_runs/anchor_selector_train2k_mean_t0p5_lr3e5_e10_20260426_2227/anchor_selector_best.pth`
+  - Reference: original anchor predictor `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+- Training output:
+  - `/root/autodl-tmp/anchor_runs/anchor_selector_dpo_train2k_all_gap0p05_e10_20260426_2256`
+  - Pairs: 3020 total, 2416 train / 604 val.
+  - Labels: 2024 `anchor_quality`, 746 `anchor_collision`, 250 `anchor_collision_rate`.
+  - Training did learn the pair objective: val pair acc improved to about 61%, val margin about 0.29.
+- Deployment eval:
+  - Output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_dpo_train2k_all_2k_20260426_2300`
+  - Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`
+  - Result: collision 5.65%, progress 0.3516, route 0.8508.
+- Interpretation:
+  - This is a negative result for all-pairs selector-DPO.
+  - The model learned the offline pair labels, but deployment safety got much worse than original top1 4.20% and soft selector train2k 3.55%.
+  - Likely issue: all-pairs DPO over-weights `anchor_quality` / progress-like differences and treats weak safe-vs-safe preferences as hard pair constraints.
+  - Next action: switch to collision-only selector-DPO, using only the clearest safety pairs.
+
+## Experiment: selector-DPO collision-only pilot 20260426
+
+- Goal: after all-pairs selector-DPO failed in deployment safety, test whether DPO on only clean safety pairs can improve learned selector top1.
+- Script: `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/train_anchor_selector_dpo.py`
+- Patch artifact: `/root/autodl-tmp/anchor_runs/patches/anchor_selector_dpo_train_runtime.patch`
+- Pair construction:
+  - Source candidates: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir`
+  - Aggregation: mean score per anchor.
+  - Pair mode: all ordered anchor pairs with `score_gap >= 0.05`.
+  - Filter: `--require-collision-pair`, keeping only `anchor_collision` and `anchor_collision_rate` pairs.
+  - Policy init: soft selector train2k `/root/autodl-tmp/anchor_runs/anchor_selector_train2k_mean_t0p5_lr3e5_e10_20260426_2227/anchor_selector_best.pth`
+  - Reference: original anchor predictor `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+- Training output:
+  - `/root/autodl-tmp/anchor_runs/anchor_selector_dpo_train2k_collision_gap0p05_e10_20260426_2302`
+  - Pairs: 996 total, 797 train / 199 val.
+  - Labels: 746 `anchor_collision`, 250 `anchor_collision_rate`.
+  - Internal val pair acc: about 67%; val margin grows to about 0.62.
+- Deployment eval:
+  - Output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_dpo_collision_train2k_2k_20260426_2305`
+  - Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`
+  - Case: `predicted_anchor_top1_selector_dpo_collision_train2k`
+  - Result: collision 3.15%, progress 0.3150, route 0.8549, collision_score 0.1080, scenes 2000 / 2000.
+- Comparison on the same 2k manifest:
+  - Original `predicted_anchor_top1`: collision 4.20%, progress 0.3253, route 0.8548.
+  - Soft selector train2k top1: collision 3.55%, progress 0.3187, route 0.8545.
+  - Selector-DPO all-pairs top1: collision 5.65%, progress 0.3516, route 0.8508.
+  - Selector-DPO collision-only top1: collision 3.15%, progress 0.3150, route 0.8549.
+  - Original hand `predicted_anchor_rerank_a`: collision 3.15%, progress 0.3293, route 0.8738.
+- Interpretation:
+  - This is the first strong selector-DPO result: learned top1 selector matches the hand-rerank collision rate without using hand rerank at inference.
+  - The tradeoff is lower progress and route than hand-rerank, so it is not yet a strictly better deployment method.
+  - Important lesson: selector-DPO should use clean safety preference pairs first; all-pairs DPO with many weak quality pairs can hurt safety even if offline pair accuracy improves.
+  - Next direction: improve selector-DPO objective to recover progress/route, or move to candidate-level learned selector that can replace hand-rerank more directly.
