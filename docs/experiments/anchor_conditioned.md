@@ -742,3 +742,31 @@ train500 selector 的 2k val 结果：
   - The weak result does not mean anchor conditioning is useless. Oracle anchor and predicted-anchor rerank show the anchor candidate space has value.
   - It means planner-level DPO using the current continuous trajectory log-prob estimate is not yet a reliable preference learner.
   - This is why the later selector experiment moves preference learning to a discrete anchor/candidate selection problem, where probabilities are cleaner and easier to train.
+
+## Experiment: anchor selector train2k mean soft target 20260426
+
+- Goal: verify whether scaling the learned anchor selector from 500 train scenes to 2000 train scenes improves deployment collision on the fixed 2k val manifest.
+- Candidate generation:
+  - Output: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153.log`
+  - Result: 2000 / 2000 train scenes, 18000 candidates, 0 failures.
+  - Candidate structure: top3 predicted anchors per scene, 3 planner samples per anchor.
+- Selector training:
+  - Baseline run: `/root/autodl-tmp/anchor_runs/anchor_selector_train2k_baseline_lr0_20260426_2226`
+  - Train run: `/root/autodl-tmp/anchor_runs/anchor_selector_train2k_mean_t0p5_lr3e5_e10_20260426_2227`
+  - Target stats: 2000 records, 1600 train / 400 val, score_std_mean 0.2936, score_gap_mean 0.2528, top_prob_mean 0.4400, collision_scene_count 482.
+  - Baseline internal val: top1_match 30.4%, target_prob_on_pred 0.364.
+  - Train internal val best: top1_match about 31.5% at epoch 3; final epoch 10 top1_match 30.1%, target_prob_on_pred 0.346.
+- Deployment eval:
+  - Output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_train2k_mean_2k_20260426_2235`
+  - Manifest: `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`
+  - Case: `predicted_anchor_top1_selector_train2k`
+  - Result: collision 3.55%, progress 0.3187, route 0.8545, collision_score 0.1062, scenes 2000 / 2000.
+- Comparison on the same 2k manifest:
+  - Original `predicted_anchor_top1`: collision 4.20%, progress 0.3253, route 0.8548.
+  - Selector train500 top1: collision 3.70%, progress 0.3185, route 0.8574.
+  - Selector train2k top1: collision 3.55%, progress 0.3187, route 0.8545.
+- Interpretation:
+  - Scaling selector data from 500 to 2000 train scenes gives a small additional safety gain: 3.70% -> 3.55% collision.
+  - Compared with the original predictor top1, learned selector reduces collision by 0.65 percentage points absolute, but still trades off progress.
+  - It still does not beat original `predicted_anchor_rerank_a` collision 3.15%, so train2k selector is a positive learned-signal result, not the current best deployment method.
