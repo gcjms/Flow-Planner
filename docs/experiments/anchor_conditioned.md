@@ -549,3 +549,60 @@
   - However, using the current continuous flow-matching log-prob as a candidate-ranking objective is still too weak/noisy to justify deployment eval.
   - Do not run 500/2k eval for the softpref checkpoints above.
   - Next technical priority: diagnose/rework the probability objective, or move preference learning one level up to an explicit anchor selector/reranker where probabilities are discrete and trainable, closer to DriveDPO-style soft distribution over anchors/candidates.
+
+## Experiment: discrete anchor selector soft preference 20260426
+
+- Motivation:
+  - Continuous planner-DPO / soft preference uses flow-matching log-prob over full trajectories, but same-anchor chosen/rejected deltas were nearly zero.
+  - Existing `predicted_anchor_rerank_a` works because it changes the problem into discrete candidate selection after seeing planner-generated trajectories.
+  - This experiment tests a lighter middle ground: fine-tune the discrete `AnchorPredictor` head with soft preference targets aggregated from generated top-k anchor candidates.
+- Runtime code added in `/root/autodl-tmp/Flow-Planner-anchor-runtime`:
+  - `flow_planner/dpo/train_anchor_selector_softpref.py`
+  - Patch artifact: `/root/autodl-tmp/anchor_runs/patches/anchor_selector_softpref_train_runtime.patch`
+- Method:
+  - Reuse softpref candidate artifacts from `generate_anchor_softpref_candidates.py`.
+  - For each scene, aggregate candidate scores by `anchor_index` using `mean` or `max`.
+  - Convert anchor scores into sparse full-vocab teacher distribution with `softmax(score / T)`.
+  - Fine-tune only the `AnchorPredictor` head on `CE(q_anchor, p_predictor)` with small optional GT-nearest CE regularization.
+  - This is not planner-DPO; it is an anchor-level discrete selector/reranker diagnostic.
+- Train100 diagnostics:
+  - Candidate artifact: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train100_20260426_2050`
+  - `lr=0` baseline on 80/20 split, `mean`, `T=0.5`: val top1_match 34.4%, target_prob_on_pred 0.339.
+  - High-lr selector: `/root/autodl-tmp/anchor_runs/anchor_selector_train100_mean_t0p5_e8_20260426_2108`; best early val top1_match 25.0%, later 9.4%.
+  - Low-lr selector: `/root/autodl-tmp/anchor_runs/anchor_selector_train100_mean_t0p5_lr3e5_e8_20260426_2111`; best val top1_match stayed at baseline 34.4%, then dropped to 31.2%.
+  - Interpretation: 100 scenes is too small/noisy for this selector objective; high lr overfits quickly.
+- Train500 candidate generation:
+  - Output: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train500_20260426_2113`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train500_20260426_2113.log`
+  - Result: 500 / 500 scenes written, 4500 candidates, 0 failures.
+  - Mean aggregation target stats: 500 records, 400 train / 100 val split, score_std_mean 0.3125, score_gap_mean 0.2383, top_prob_mean 0.4485, collision_scene_count 134.
+- Train500 selector diagnostics:
+  - `lr=0` baseline, `mean`, `T=0.5`: `/root/autodl-tmp/anchor_runs/anchor_selector_train500_baseline_lr0_20260426_2129`; val top1_match 28.1%, target_prob_on_pred 0.324.
+  - Low-lr selector, `mean`, `T=0.5`: `/root/autodl-tmp/anchor_runs/anchor_selector_train500_mean_t0p5_lr3e5_e10_20260426_2130`; best val top1_match 26.6%, target_prob_on_pred about 0.330.
+  - `max` aggregation baseline: `/root/autodl-tmp/anchor_runs/anchor_selector_train500_max_t0p5_baseline_lr0_20260426_2132`; val top1_match 25.8%, target_prob_on_pred 0.313.
+  - Internal target-match metrics do not improve over the original predictor, but this metric is not perfectly aligned with deployment safety.
+- Direct 500-val deployment smoke, same manifest as rho=0.5 500 eval:
+  - Output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_train500_mean_500_20260426_2134`
+  - Original `predicted_anchor_top1`: collision 3.2%, progress 0.3361, route 0.8468, collision_score 0.1289.
+  - Selector `predicted_anchor_top1`: collision 2.0%, progress 0.3332, route 0.8480, collision_score 0.1256.
+  - Original `predicted_anchor_rerank_a`: collision 4.6%, progress 0.3434, route 0.8657, collision_score 0.1266.
+  - Selector `predicted_anchor_rerank_a`: collision 2.4%, progress 0.3387, route 0.8665, collision_score 0.1224.
+- Direct 2k-val deployment smoke, manifest `/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`:
+  - Output: `/root/autodl-tmp/anchor_runs/deploy_eval_anchor_selector_train500_mean_2k_20260426_2137`
+  - Baseline planner, no anchor: collision 5.45%, progress 0.3393, route 0.8592.
+  - Original `predicted_anchor_top1`: collision 4.20%, progress 0.3253, route 0.8548.
+  - Selector `predicted_anchor_top1`: collision 3.70%, progress 0.3185, route 0.8574.
+  - Original `predicted_anchor_rerank_a`: collision 3.15%, progress 0.3293, route 0.8738.
+  - Selector `predicted_anchor_rerank_a`: collision 3.35%, progress 0.3248, route 0.8768.
+  - Oracle anchor: collision 2.20%, progress 0.3149, route 0.8580.
+  - Oracle anchor rerank: collision 2.80%, progress 0.3309, route 0.8748.
+- Interpretation:
+  - Selector top1 has a real safety signal: on 2k val it improves predicted top1 collision from 4.20% to 3.70%, but pays progress cost.
+  - Selector plus existing hand rerank is not yet better than original hand rerank on 2k: 3.35% vs 3.15% collision, though route is slightly higher.
+  - Internal target-match metrics were pessimistic; deployment eval is necessary for selector variants.
+  - Best current deployment choice remains rho=0.5 + original `predicted_anchor_rerank_a` for safety/progress balance.
+  - Best learned preference signal so far is selector top1, not planner-DPO; this suggests future anchor-DPO should operate over discrete anchors/candidates or train a candidate-aware reranker rather than relying only on continuous planner log-prob.
+- Next recommended experiment:
+  - Generate a larger selector dataset, preferably 2k train scenes, and train a candidate-aware reranker that sees scene features plus candidate anchor/trajectory features.
+  - Keep the learned selector top1 as a positive but not final result.
+  - Do not replace the current production rerank_a with selector+rerank until it beats 3.15% collision on the 2k manifest.
