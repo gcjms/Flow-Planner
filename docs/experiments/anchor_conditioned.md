@@ -913,3 +913,20 @@ train500 selector 的 2k val 结果：
   - The tradeoff is lower progress and route than hand-rerank, so it is not yet a strictly better deployment method.
   - Important lesson: selector-DPO should use clean safety preference pairs first; all-pairs DPO with many weak quality pairs can hurt safety even if offline pair accuracy improves.
   - Next direction: improve selector-DPO objective to recover progress/route, or move to candidate-level learned selector that can replace hand-rerank more directly.
+
+## Experiment: experiment record utility 20260426
+
+- Status: completed
+- Goal:
+  - stop relying only on manual markdown edits for anchor experiments
+- Method:
+  - added dependency-free append helper with fields: Goal, Data, Method, Artifacts, Results, Eval JSON results, Interpretation, Next
+- Artifacts:
+  - runtime script: /root/autodl-tmp/Flow-Planner-anchor-runtime/scripts/anchor/record_anchor_experiment.py
+  - branch target: scripts/anchor/record_anchor_experiment.py on origin/feature/anchor
+- Results:
+  - local and remote dry-run passed
+- Interpretation:
+  - future anchor experiments should be recorded through this helper or follow the same field order manually
+- Next:
+  - use this script immediately after each training/eval run to append paper-reusable notes
