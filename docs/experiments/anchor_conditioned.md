@@ -478,3 +478,74 @@
 - Interpretation for current anchor-DPO issue:
   - This is the right direction for safe-vs-safe ambiguity: do not force every acceptable safe trajectory to be a hard rejected sample.
   - Use soft distribution / confidence weighting for quality differences, while keeping clear safe-vs-collided pairs as hard negatives later.
+
+## Experiment: anchor soft preference distillation smoke 20260426
+
+- Goal: address the user concern that safe-vs-safe hard DPO pairs can incorrectly mark acceptable trajectories as `rejected`. Instead of hard best-vs-worst pairs, test a scene-level soft ranking objective over all anchor-conditioned candidates.
+- Runtime code added in `/root/autodl-tmp/Flow-Planner-anchor-runtime`:
+  - `flow_planner/dpo/generate_anchor_softpref_candidates.py`
+  - `flow_planner/dpo/train_anchor_soft_pref.py`
+- Method:
+  - For each scene, AnchorPredictor proposes top-3 anchors.
+  - For each anchor, planner samples 3 trajectories, giving 9 candidates per scene.
+  - Each candidate is scored with a moderate safety-first teacher score, not the earlier 100-point hard safety bonus.
+  - Candidate score distribution is converted into a soft teacher target over 9 candidates.
+  - Train decoder LoRA with `KL(q_teacher || p_policy)` where `p_policy = softmax(log_prob(candidate_i | scene, anchor_i))`.
+- Smoke candidate generation, 20 train scenes:
+  - Output: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_smoke20_20260426_2047`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_smoke20_20260426_2047.log`
+  - Result: 20 / 20 scenes written, 180 candidates, 0 failures.
+  - Candidate NPZ contains `candidates (9,80,4)` and `anchor_trajs (9,80,3)`.
+  - Average score stats over scenes: min 5.375, mean 5.892, max 6.294, std 0.366.
+  - Average collided candidates per scene: 0.55.
+  - Average soft target entropy: 1.744; average top probability: 0.375.
+- Smoke training, 20 train scenes:
+  - Output: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_softpref_smoke20_e1_20260426_2048`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_smoke20_e1_20260426_2048.log`
+  - Correct anchor runtime check: LoRA includes `anchor_encoder` and `anchor_cross_attn`; merged checkpoint removes 150 LoRA side keys.
+  - Epoch 1: loss 2.2457, top1 match 20.00%.
+  - Interpretation: pipeline works; sample too small for a method conclusion.
+- Candidate generation, 100 train scenes:
+  - Output: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train100_20260426_2050`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train100_20260426_2050.log`
+  - Result: 100 / 100 scenes written, 900 candidates, 0 failures.
+  - Average score stats: min 5.328, mean 5.999, max 6.404, std 0.423.
+  - Score std distribution: p10 0.031, median 0.059, p90 2.103.
+  - Average collided candidates per scene: 0.56; only 18 / 100 scenes have any collision candidate.
+  - Average soft target entropy: 1.810; average top probability: 0.328.
+  - Teacher top candidate safe rate: 100%.
+- Training, 100 train scenes:
+  - Output: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_softpref_train100_e2_20260426_2052`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_train100_e2_20260426_2052.log`
+  - Epoch 1: loss 2.2545, top1 match 11.00%.
+  - Epoch 2: loss 2.2531, top1 match 9.00%.
+  - Offline diagnostic on same 100 scenes, `num_t_samples=2`:
+    - Base: CE 2.2016, top1 9.0%, policy safe mass 0.9370, target safe mass 0.9891.
+    - Soft100: CE 2.1988, top1 10.0%, policy safe mass 0.9381, target safe mass 0.9891.
+  - Interpretation: full 100-scene soft distillation gives only a tiny CE/safe-mass improvement, not enough for eval.
+- Informative-scene filter:
+  - Added runtime filter args: `--min_score_std` and `--min_top_prob`.
+  - On train100 candidates, `min_score_std=1.0` keeps 18 / 100 scenes, essentially the collision-rich scenes.
+- Filtered training, 18 informative scenes:
+  - Output: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_softpref_train100_std1_e5_20260426_2055`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_train100_std1_e5_20260426_2055.log`
+  - Setup: `min_score_std=1.0`, `target_temp=0.7`, `gt_weight=0.0`, `top1_weight=0.0`, `lr=2e-5`, epochs 5.
+  - Best top1 match: 16.67%.
+  - Offline diagnostic on the same 18 scenes:
+    - Base: CE 2.1988, top1 11.11%, policy safe mass 0.6539, target safe mass 0.9669.
+    - Filtered softpref: CE 2.1992, top1 27.78%, policy safe mass 0.6545, target safe mass 0.9669.
+  - Interpretation: top1 can move a little, but probability mass does not shift toward safe candidates.
+- Overfit diagnostic, 18 informative scenes:
+  - Output: `/root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_softpref_overfit_std1_e10_20260426_2100`
+  - Log: `/root/autodl-tmp/anchor_runs/anchor_softpref_overfit_std1_e10_20260426_2100.log`
+  - Setup: `min_score_std=1.0`, `target_temp=0.7`, `gt_weight=0.0`, `top1_weight=1.0`, `lr=1e-4`, epochs 10.
+  - Best top1 match: 22.22%.
+  - Offline diagnostic:
+    - Base: CE 2.1934, top1 0.00%, policy safe mass 0.6573, target safe mass 0.9669.
+    - Overfit run: CE 2.1948, top1 22.22%, policy safe mass 0.6554, target safe mass 0.9669.
+  - Checkpoint diff confirms weights changed, especially in anchor encoder and decoder LoRA-merged weights, so the weak result is not just a save/load failure.
+- Decision:
+  - Anchor soft preference data pipeline is now available and valid.
+  - However, using the current continuous flow-matching log-prob as a candidate-ranking objective is still too weak/noisy to justify deployment eval.
+  - Do not run 500/2k eval for the softpref checkpoints above.
+  - Next technical priority: diagnose/rework the probability objective, or move preference learning one level up to an explicit anchor selector/reranker where probabilities are discrete and trainable, closer to DriveDPO-style soft distribution over anchors/candidates.
