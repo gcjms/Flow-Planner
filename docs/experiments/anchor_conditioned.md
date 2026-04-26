@@ -164,7 +164,8 @@
   - Eval output: /root/autodl-tmp/anchor_runs/deploy_eval_sched_p0p5_2k_20260426_1743
 - Status:
   - Started on 2026-04-26 17:43 CST.
-  - Results pending.
+  - Completed on 2026-04-26 18:18 CST.
+  - Results summarized below.
 
 ## Anchor-DPO implementation note
 
@@ -173,3 +174,61 @@
 - Same-anchor DPO should use the same anchor_traj for chosen and rejected, then pass that anchor_traj into decoder inputs during DPO loss computation.
 - Without this change, training with anchor-generated pairs would become ordinary DPO under scene context, not anchor-conditioned DPO.
 - Immediate coding task: add anchor fields to PreferenceDataset/collate_preferences and add attach_anchor_to_decoder_inputs mirroring the existing goal path.
+
+## Results: anchor_sched_p0p5_eval_2k_20260426
+
+- Status: completed on 2026-04-26 18:18 CST.
+- Eval output: /root/autodl-tmp/anchor_runs/deploy_eval_sched_p0p5_2k_20260426_1743
+- Manifest: /root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json
+- Eval scenes: 2000
+- Results:
+  - planner_ft_none: collision_rate 5.45, avg_progress 0.3393, avg_route 0.8592
+  - predicted_anchor_top1: collision_rate 4.20, avg_progress 0.3253, avg_route 0.8548
+  - predicted_anchor_rerank_a: collision_rate 3.15, avg_progress 0.3293, avg_route 0.8738
+  - oracle_anchor: collision_rate 2.20, avg_progress 0.3149, avg_route 0.8580
+  - oracle_anchor_rerank: collision_rate 2.80, avg_progress 0.3309, avg_route 0.8748
+- Conclusion:
+  - 2k eval confirms predicted anchors help over no-anchor, and the top-k reranker is useful on a larger fixed validation subset.
+  - The 500-scene result had noticeable variance, especially for planner_ft_none and rerank.
+  - predicted_anchor_rerank_a is now the best predicted-anchor deployment setting, but it still trails oracle_anchor.
+  - oracle_anchor remains the upper-bound signal; predictor/selection quality is still the bottleneck.
+- Decision:
+  - Use rho=0.5 planner as the current candidate generator.
+  - Continue anchor selection/rerank work in parallel with anchor-DPO readiness.
+
+## Experiment: anchor_dpo_readiness_smoke_20260426
+
+- Goal: 验证 anchor-DPO 的最小数据/训练链路是否可行，且 preference pair 保持 condition-clean。
+- Code review finding:
+  - Existing train_dpo.py supported ordinary DPO and optional goal fields, but did not consume anchor-specific fields.
+  - Runtime train_dpo.py was patched to accept anchor_vocab_path, load anchor-enabled planner config, read anchor_trajs / chosen_anchor_trajs / rejected_anchor_trajs, and attach anchor_traj to decoder inputs.
+  - Added runtime script flow_planner/dpo/generate_anchor_same_anchor_pairs.py for same-scene + same-anchor pair mining.
+  - Runtime patches are preserved at /root/autodl-tmp/anchor_runs/patches/anchor_dpo_train_dpo_runtime.patch and /root/autodl-tmp/anchor_runs/patches/anchor_same_anchor_pair_generator.patch.
+  - These runtime code changes still need formal migration to the anchor branch before a large run is treated as canonical.
+- Pair mining smoke setup:
+  - Script: /root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/generate_anchor_same_anchor_pairs.py
+  - Planner ckpt: /root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth
+  - Predictor ckpt: /root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth
+  - Manifest: /root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json
+  - max_scenes: 20, top_k: 3, samples_per_anchor: 3
+- Pair mining smoke results:
+  - Output: /root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_smoke_20260426_1815.npz
+  - Pairs: 28
+  - Failures: 0
+  - Pair labels: same_anchor_collision 5, same_anchor_quality 23
+  - Shapes: chosen/rejected (28, 80, 4), anchor_trajs (28, 80, 3)
+- DPO train smoke setup:
+  - Preference path: /root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_smoke_20260426_1815.npz
+  - Output: /root/autodl-tmp/Flow-Planner/checkpoints/dpo_outputs/anchor_conditioned/anchor_dpo_smoke_20260426_1817
+  - max_pairs: 8, epochs: 1, batch_size: 2, num_t_samples: 1, lora_rank: 2
+- DPO train smoke result:
+  - Training completed successfully.
+  - Best accuracy: 87.50%
+  - This is only a pipeline sanity check, not a model-quality result.
+- Conclusion:
+  - same-anchor preference mining is feasible: even 20 scenes produced nonzero clean pairs.
+  - anchor-conditioned DPO training path is now technically viable in runtime.
+  - Next step should be pair-yield scaling and quality audit before any full anchor-DPO training.
+- Decision:
+  - Scale pair mining to a larger fixed subset next, starting from 500 scenes or 2k scenes depending on runtime budget.
+  - Do not treat smoke LoRA output as a deployable checkpoint.
