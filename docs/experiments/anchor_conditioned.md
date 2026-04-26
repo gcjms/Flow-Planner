@@ -351,3 +351,28 @@
 - Decision:
   - Next anchor-DPO run should use this v2 runtime behavior or a formal migration of these changes into the `anchor` branch.
   - Do not compare future DPO runs against the v1 pilot without noting that v1 had higher-variance loss estimation and dirty merged checkpoint format.
+
+## Experiment: anchor_dpo_pair_mining_train2k_v2_20260426
+
+- Goal: 在修复 DPO runtime v2 后，先扩大 same-anchor preference mining 到 2k train scenes，判断是否有足够干净 pair 支撑第二轮 DPO pilot。
+- Setup:
+  - Runtime: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Script: `flow_planner/dpo/generate_anchor_same_anchor_pairs.py`
+  - Base planner: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Predictor: `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+  - Scene dir: `/root/autodl-tmp/train_dataset`
+  - Scene manifest: `/root/autodl-tmp/anchor_runs/generated_lists/train_list.json`
+  - max_scenes: 2000
+  - top_k: 3
+  - samples_per_anchor: 3
+  - min_quality_gap: 0.05
+- Artifacts:
+  - Output preference path: `/root/autodl-tmp/Flow-Planner/dpo_data/anchor_conditioned/preferences/same_anchor_train2k_v2_20260426_1921.npz`
+  - Log: `/root/autodl-tmp/anchor_runs/same_anchor_train2k_v2_20260426_1921.log`
+  - PID at launch: 22951
+- Status:
+  - Started on 2026-04-26 19:21 CST.
+  - Running at record time.
+- Decision rule:
+  - If pair yield and score-gap distribution look healthy, create an explicit filtered `.npz` and run a v2 DPO pilot.
+  - If yield is weak or mostly ambiguous quality pairs, improve pair selection before training.
