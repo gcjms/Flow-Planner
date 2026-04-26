@@ -1,5 +1,117 @@
 # Anchor Conditioned Experiments
 
+## 0. 20260426 下午 anchor preference 实验总览（可读版）
+
+这一节是给人直接看的，不是原始日志。后面的 `Experiment:` 小节保留完整路径、参数和细节。
+
+### 0.1 今天下午到底在验证什么
+
+我们的最终目标不是做一个手写 reranker，而是把未来轨迹先离散成 anchor / trajectory modes，再在这些离散候选上学习 preference。换句话说，planner 负责生成可行轨迹，preference 模块负责学会更偏向安全、合理、符合路线的候选。
+
+今天下午的实验按问题拆成四层：
+
+1. `rho=0.5` 的 anchor planner 到底稳不稳。
+2. same-anchor hard DPO 能不能直接训练 planner。
+3. safe-vs-safe 不适合硬分好坏时，soft preference 能不能解决。
+4. 如果 planner-level DPO 太弱，是否应该改成离散的 learned anchor selector。
+
+### 0.2 第一层：anchor 本身有没有价值
+
+2k val 上，`rho=0.5` 的关键结果是：
+
+| 方法 | collision | progress | route | 解释 |
+|---|---:|---:|---:|---|
+| no anchor | 5.45% | 0.3393 | 0.8592 | 不使用 anchor 条件 |
+| predicted_anchor_top1 | 4.20% | 0.3253 | 0.8548 | predictor 只选 top1 anchor |
+| predicted_anchor_rerank_a | 3.15% | 0.3293 | 0.8738 | top3 anchor 生成后用手写规则挑一个，诊断用 |
+| oracle_anchor | 2.20% | 0.3149 | 0.8580 | 用 GT 最近 anchor，上限参考 |
+| oracle_anchor_rerank | 2.80% | 0.3309 | 0.8748 | oracle top-k + 手写 rerank |
+
+结论：anchor 空间本身有价值，因为 oracle anchor 明显降低 collision。当前瓶颈不是 “anchor 没用”，而是 predictor / selector 还没把 oracle 的价值完全传出来。
+
+### 0.3 第二层：为什么 same-anchor DPO 没直接成功
+
+这里的 DPO pair 都尽量限制在同一个 scene、同一个 anchor 下面，避免跨 goal / 跨 anchor 乱比较。
+
+`mixed v2 DPO` 表示两类 pair 混合：
+
+- `same_anchor_collision`：chosen 是 safe，rejected 是 collided。这个标签最干净。
+- `same_anchor_quality`：两条都 safe，但一条 structured score 更高。这个标签更软，因为 rejected 也可能是可接受轨迹。
+
+`collision-only DPO` 表示只保留 safe-vs-collided pair，去掉 safe-vs-safe quality pair。它的目的不是最终方案，而是排查：如果 collision-only 也学不动，就说明问题不只是 safe-vs-safe 标签噪声。
+
+结果：
+
+| 实验 | 结果 | 判断 |
+|---|---:|---|
+| mixed v2 DPO | epoch2 pair acc 44.85% | 弱，甚至低于随机附近 |
+| collision-only DPO | epoch2 pair acc 51.61% | 接近随机，信号仍弱 |
+
+结论：当前 planner-level hard DPO 不能作为正结果。即使用最干净的 safe-vs-collided pair，模型也没有稳定学会偏好 chosen。
+
+### 0.4 第三层：为什么 continuous flow-matching log-prob 是瓶颈
+
+DPO 需要比较 `chosen` 和 `rejected` 哪个更像模型会生成的轨迹，也就是需要类似 `log pi_theta(trajectory | scene, anchor)` 的分数。
+
+但 Flow Planner 不是离散分类器，它是连续轨迹生成模型，训练方式接近 flow matching / diffusion 去噪。我们只能用 flow-matching loss 近似某条 candidate trajectory 的 likelihood。这个近似在候选很相似、同属一个 anchor 时非常不灵敏：好轨迹和坏轨迹的分数差经常接近 0。
+
+实验表现就是：
+
+- chosen/rejected DPO margin 很小。
+- pair acc 接近随机。
+- soft preference 训练后，模型给 safe candidates 的总概率几乎没变。
+- top1 candidate 也没有稳定转向 teacher 认为最好的轨迹。
+
+结论：soft preference 数据生成方向是对的，但把它直接压到 planner 的连续 log-prob 上，目前不是可靠路径。
+
+### 0.5 第四层：为什么转向 learned anchor selector
+
+因为 planner-level likelihood 太弱，我转向离散 selector：让模型先学 `这个 scene 应该选哪个 anchor / candidate mode`。
+
+这不是手写 reranker。手写 `predicted_anchor_rerank_a` 只作为诊断工具，证明 top-k anchor pool 里确实有更好的候选。真正可能作为论文方法的是 learned selector / preference policy。
+
+当前 selector 做法：
+
+1. 每个 scene 用 predictor 取 top3 anchors。
+2. 每个 anchor 采样 3 条轨迹，共 9 条 candidate。
+3. 用 structured score 给 candidate 打分。
+4. 按 anchor 聚合成 soft target。
+5. 训练 AnchorPredictor head，让它输出更偏向高分 anchor 的概率。
+
+train500 selector 的 2k val 结果：
+
+| 方法 | collision | progress | route | 判断 |
+|---|---:|---:|---:|---|
+| original predicted_anchor_top1 | 4.20% | 0.3253 | 0.8548 | 原 predictor top1 |
+| selector predicted_anchor_top1 | 3.70% | 0.3185 | 0.8574 | collision 有改善，但 progress 降低 |
+| original predicted_anchor_rerank_a | 3.15% | 0.3293 | 0.8738 | 当前最稳部署 baseline |
+| selector predicted_anchor_rerank_a | 3.35% | 0.3248 | 0.8768 | route 高，但 collision 没赢 |
+
+结论：learned selector 已经出现正信号，尤其是 top1 collision 从 4.20% 降到 3.70%。但它还没有超过当前最稳的 original `predicted_anchor_rerank_a`。
+
+### 0.6 当前最清楚的判断
+
+- anchor 方向是可行的，oracle 和 top-k 结果都支持这一点。
+- 直接 planner-level DPO 现在不行，主要卡在 continuous flow-matching log-prob 对候选排序不敏感。
+- safe-vs-safe 硬 pair 的担心是合理的，所以后面不应把它当成同等强度的 hard rejected。
+- 手写 rerank 不作为创新点，只作为诊断 baseline / teacher signal。
+- 真正应该推进的创新线是 learned anchor/candidate selector：在离散 anchor / candidate 层面做 preference learning。
+- 当前部署最好结果仍是 `rho=0.5 + original predicted_anchor_rerank_a`。
+- 当前最有研究价值的 learned signal 是 selector top1 的 collision 改善。
+
+### 0.7 记录规范更新
+
+后续每个 anchor preference 实验都按这个顺序写：
+
+1. 目的：这个实验要回答什么问题。
+2. 数据：用了多少 train / val scenes，manifest 是哪一个。
+3. 方法：candidate 怎么生成，pair / soft target 怎么定义。
+4. 路径：输出目录、log、checkpoint。
+5. 结果：关键指标表。
+6. 解释：这个结果说明什么，不说明什么。
+7. 下一步：继续、停止、还是改方向。
+
+
 ## Experiment: anchor_eval_suite_clean
 
 - Goal: 验证 anchor conditioning 在部署评测中的上限与当前 predictor 瓶颈。
