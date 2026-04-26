@@ -328,3 +328,26 @@
   - Before the next DPO run, fix the DPO implementation issues found during review: apply `min_score_gap` filtering correctly, strip LoRA side keys when saving merged checkpoints, and reduce DPO loss variance by sharing sampled flow-matching noise/timesteps between policy and reference for each trajectory.
   - After the code fix, mine a larger train-split same-anchor preference set, likely 2k train scenes first, then train/eval a second pilot.
   - Continue treating rerank/selector as a high-priority path, because top-k predicted anchors are already more useful than top1 alone.
+
+## Code review/fix: anchor DPO runtime v2 20260426
+
+- Goal: 修掉下一轮 anchor-DPO 前会影响结论可信度的实现问题。
+- Runtime files changed:
+  - `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/train_dpo.py`
+  - `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/dpo_loss.py`
+- Fixes:
+  - `PreferenceDataset` now actually applies `min_score_gap` filtering and keeps chosen/rejected, scenario ids, labels, goals, and anchor trajectories aligned.
+  - CLI default `--min_score_gap` changed from 2.0 to 0.0 so existing files are not silently over-filtered unless explicitly requested.
+  - Merged DPO checkpoint saving now strips `.lora_A` / `.lora_B` side keys after merge, avoiding eval-time `unexpected keys` warnings.
+  - DPO loss now evaluates policy and reference with the same sampled flow-matching noise/timestep for each trajectory, reducing DPO delta variance.
+- Validation:
+  - `python -m py_compile` passed for runtime `train_dpo.py` and `dpo_loss.py`.
+  - Dataset smoke: raw train500 preference file with `min_score_gap=0.15` keeps 321 / 924 pairs.
+  - Anchor field smoke: dataset item contains `chosen_anchor_traj` with shape `(80, 3)`.
+  - DPO loss smoke: dummy policy/reference forward returns finite DPO/SFT losses.
+- Patch artifacts:
+  - `/root/autodl-tmp/anchor_runs/patches/anchor_dpo_train_dpo_runtime_v2.patch`
+  - `/root/autodl-tmp/anchor_runs/patches/anchor_dpo_loss_runtime_v2.patch`
+- Decision:
+  - Next anchor-DPO run should use this v2 runtime behavior or a formal migration of these changes into the `anchor` branch.
+  - Do not compare future DPO runs against the v1 pilot without noting that v1 had higher-variance loss estimation and dirty merged checkpoint format.
