@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from flow_planner.data.utils.collect import collect_batch
+from flow_planner.dpo.anchor_candidate_scorer import pair_label, summarize_anchor_groups
 from flow_planner.goal.anchor_predictor import AnchorPredictor
 from train_anchor_predictor import build_dataset, load_planner, set_seed
 
@@ -74,51 +74,6 @@ def collate_dpo(batch):
     )
 
 
-def _logmeanexp(values: Sequence[float], temperature: float = 1.0) -> float:
-    arr = np.asarray(values, dtype=np.float64) / temperature
-    m = float(arr.max())
-    return float(temperature * (m + math.log(np.exp(arr - m).mean())))
-
-
-def _anchor_summary(candidates: Sequence[Dict[str, object]], method: str) -> Dict[int, Dict[str, float]]:
-    grouped: Dict[int, List[Dict[str, object]]] = {}
-    for candidate in candidates:
-        grouped.setdefault(int(candidate["anchor_index"]), []).append(candidate)
-
-    out: Dict[int, Dict[str, float]] = {}
-    for anchor_idx, rows in grouped.items():
-        scores = [float(row["total_score"]) for row in rows]
-        if method == "mean":
-            agg_score = float(np.mean(scores))
-        elif method == "max":
-            agg_score = float(np.max(scores))
-        elif method == "logmeanexp":
-            agg_score = _logmeanexp(scores)
-        else:
-            raise ValueError(f"unknown score aggregation method: {method}")
-
-        collided = [
-            float(row.get("metrics", {}).get("collided", 0.0))
-            for row in rows
-        ]
-        out[anchor_idx] = {
-            "score": agg_score,
-            "max_score": float(np.max(scores)),
-            "min_score": float(np.min(scores)),
-            "collision_rate": float(np.mean(collided)) if collided else 0.0,
-            "has_collision": float(any(value > 0.5 for value in collided)),
-        }
-    return out
-
-
-def _pair_label(chosen: Dict[str, float], rejected: Dict[str, float]) -> str:
-    if chosen["has_collision"] < rejected["has_collision"]:
-        return "anchor_collision"
-    if chosen["collision_rate"] < rejected["collision_rate"]:
-        return "anchor_collision_rate"
-    return "anchor_quality"
-
-
 def load_pair_records(
     scored_dir: str,
     data_dir: str,
@@ -162,7 +117,7 @@ def load_pair_records(
             skipped["bad_scene_path"] += 1
             continue
 
-        summaries = _anchor_summary(candidates, score_agg)
+        summaries = summarize_anchor_groups(candidates, method=score_agg)
         if len(summaries) < 2:
             skipped["too_few_anchors"] += 1
             continue
@@ -191,7 +146,7 @@ def load_pair_records(
             if gap < min_score_gap:
                 skipped["low_score_gap"] += 1
                 continue
-            label = _pair_label(chosen_summary, rejected_summary)
+            label = pair_label(chosen_summary, rejected_summary)
             if require_collision_pair and not label.startswith("anchor_collision"):
                 skipped["require_collision_pair"] += 1
                 continue

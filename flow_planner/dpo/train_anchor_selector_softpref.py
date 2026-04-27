@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from flow_planner.data.utils.collect import collect_batch
+from flow_planner.dpo.anchor_candidate_scorer import aggregate_anchor_scores
 from flow_planner.goal.anchor_predictor import AnchorPredictor
 from train_anchor_predictor import build_dataset, load_planner, set_seed
 
@@ -76,34 +76,6 @@ def _softmax(values: np.ndarray, temperature: float) -> np.ndarray:
     return (probs / probs.sum()).astype(np.float32)
 
 
-def _logmeanexp(values: Sequence[float], temperature: float = 1.0) -> float:
-    arr = np.asarray(values, dtype=np.float64) / temperature
-    m = float(arr.max())
-    return float(temperature * (m + math.log(np.exp(arr - m).mean())))
-
-
-def _aggregate_anchor_scores(candidates: Sequence[Dict[str, object]], method: str) -> Tuple[List[int], List[float]]:
-    grouped: Dict[int, List[float]] = {}
-    for candidate in candidates:
-        anchor_idx = int(candidate["anchor_index"])
-        grouped.setdefault(anchor_idx, []).append(float(candidate["total_score"]))
-
-    anchor_indices = sorted(grouped)
-    anchor_scores: List[float] = []
-    for anchor_idx in anchor_indices:
-        scores = grouped[anchor_idx]
-        if method == "mean":
-            score = float(np.mean(scores))
-        elif method == "max":
-            score = float(np.max(scores))
-        elif method == "logmeanexp":
-            score = _logmeanexp(scores)
-        else:
-            raise ValueError(f"unknown anchor score aggregation: {method}")
-        anchor_scores.append(score)
-    return anchor_indices, anchor_scores
-
-
 def _has_collision_candidate(candidates: Sequence[Dict[str, object]]) -> bool:
     for candidate in candidates:
         metrics = candidate.get("metrics", {})
@@ -142,7 +114,7 @@ def load_selector_records(
             skipped["no_candidates"] += 1
             continue
 
-        anchor_indices, anchor_scores = _aggregate_anchor_scores(candidates, score_agg)
+        anchor_indices, anchor_scores = aggregate_anchor_scores(candidates, score_agg)
         score_arr = np.asarray(anchor_scores, dtype=np.float32)
         order = np.argsort(score_arr)[::-1]
         score_std = float(score_arr.std())

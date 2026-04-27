@@ -17,6 +17,13 @@ from typing import Dict, List
 import numpy as np
 import torch
 
+from flow_planner.dpo.anchor_candidate_scorer import (
+    AnchorCandidateScoreWeights,
+    build_candidate_record,
+    json_ready_anchor_summaries,
+    summarize_anchor_groups,
+    summarize_scene,
+)
 from flow_planner.dpo.eval_multidim_utils import (
     evaluate_trajectory,
     infer_single_trajectory,
@@ -42,24 +49,6 @@ def _gt_errors(traj: np.ndarray, gt_future: np.ndarray) -> Dict[str, float]:
         return {"ade": 0.0, "fde": 0.0}
     pos_err = np.linalg.norm(traj[:t, :2] - gt_future[:t, :2], axis=-1)
     return {"ade": float(pos_err.mean()), "fde": float(pos_err[-1])}
-
-
-def _teacher_score(metrics: Dict[str, float], args: argparse.Namespace) -> float:
-    """Moderate safety-first score for soft targets.
-
-    The hard-pair generator used a 100-point safety bonus. That is useful for
-    deterministic labels but too peaky for soft preference distillation, so this
-    score keeps safety dominant without collapsing the distribution by default.
-    """
-    safe = 1.0 - float(metrics["collided"])
-    return (
-        args.safety_weight * safe
-        + args.route_weight * float(metrics["route_score"])
-        + args.progress_weight * float(metrics["progress_score"])
-        + args.ttc_weight * float(metrics["ttc_score"])
-        + args.comfort_weight * float(metrics["comfort_score"])
-        - args.collision_weight * float(metrics["collision_score"])
-    )
 
 
 def generate_anchor_softpref_candidates(args: argparse.Namespace) -> Dict[str, int]:
@@ -93,6 +82,7 @@ def generate_anchor_softpref_candidates(args: argparse.Namespace) -> Dict[str, i
     written = 0
     total_candidates = 0
     neighbor_limit = int(model.planner_params.get("neighbor_num", 32))
+    score_weights = AnchorCandidateScoreWeights.from_args(args)
 
     for scene_i, scene_file in enumerate(scene_files):
         scenario_id = Path(scene_file).stem
@@ -131,7 +121,6 @@ def generate_anchor_softpref_candidates(args: argparse.Namespace) -> Dict[str, i
                     )
                     gt_metrics = _gt_errors(traj, scene_data.get("ego_agent_future"))
                     metrics = {**metrics, **gt_metrics}
-                    total_score = _teacher_score(metrics, args)
 
                     trajectories.append(traj[:, : args.state_dim].astype(np.float32))
                     anchor_trajs.append(anchor_np.astype(np.float32))
@@ -139,15 +128,15 @@ def generate_anchor_softpref_candidates(args: argparse.Namespace) -> Dict[str, i
                     anchor_ranks.append(int(rank))
                     sample_ids.append(int(sample_i))
                     candidate_infos.append(
-                        {
-                            "candidate_idx": candidate_idx,
-                            "anchor_index": int(anchor_idx),
-                            "anchor_rank": int(rank),
-                            "sample_i": int(sample_i),
-                            "seed": int(bon_seed),
-                            "total_score": float(total_score),
-                            "metrics": {key: float(value) for key, value in metrics.items()},
-                        }
+                        build_candidate_record(
+                            candidate_idx=candidate_idx,
+                            anchor_index=int(anchor_idx),
+                            anchor_rank=int(rank),
+                            sample_i=int(sample_i),
+                            seed=int(bon_seed),
+                            metrics=metrics,
+                            weights=score_weights,
+                        )
                     )
                     candidate_idx += 1
 
@@ -171,14 +160,11 @@ def generate_anchor_softpref_candidates(args: argparse.Namespace) -> Dict[str, i
                 "top_k": args.top_k,
                 "samples_per_anchor": args.samples_per_anchor,
                 "candidates": candidate_infos,
-                "score_config": {
-                    "safety_weight": args.safety_weight,
-                    "route_weight": args.route_weight,
-                    "progress_weight": args.progress_weight,
-                    "ttc_weight": args.ttc_weight,
-                    "comfort_weight": args.comfort_weight,
-                    "collision_weight": args.collision_weight,
-                },
+                "score_config": score_weights.to_dict(),
+                "scene_stats": summarize_scene(candidate_infos),
+                "anchor_group_stats": json_ready_anchor_summaries(
+                    summarize_anchor_groups(candidate_infos, method="mean")
+                ),
             }
             (scored_dir / f"{scenario_id}.json").write_text(
                 json.dumps(scored_payload, indent=2, ensure_ascii=False) + "\n",

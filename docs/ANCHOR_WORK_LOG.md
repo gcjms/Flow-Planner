@@ -546,3 +546,18 @@ bash run_anchor_scheduled_sampling.sh 0.5
 | cross-attn | predicted top3 rerank C (`100/0/0/0/0`) | 5.4% | 0.3771 | 0.8372 |
 
 （additive 那行还没跑，是未来要补的 ablation）
+
+---
+
+## 10. 2026-04-27 文档维护记录
+
+- 将 `docs/experiments/anchor_conditioned.md` 调整为中文为主的实验记录风格：标题、章节、字段标签和主要解释文字改为中文。
+- 保留 experiment id、checkpoint/path、metric 名称、脚本名和关键方法名的英文/代码格式，方便检索和复现实验。
+- 这次是文档可读性维护，不改变实验结论、指标或下一步技术路线。
+- 追加 GoalFlow 对齐后的架构补充：仅新增 scorer 模块化和 generate-then-score 两阶段 pipeline 规范化两项支撑决策；不覆盖原有 candidate-level dataset / selector v0 TODO。
+- 代码落地 scorer/pipeline 支撑项：
+  - 新增 `flow_planner/dpo/anchor_candidate_scorer.py`，统一 candidate score components、anchor group stats、scene stats、anchor pair label。
+  - 新增 `flow_planner/dpo/score_anchor_candidates.py`，支持对已有 `*_candidates.npz` 单独重新打分，形成显式 score stage。
+  - `generate_anchor_softpref_candidates.py` 现在输出 `score_components`、`scene_stats`、`anchor_group_stats`，同时保留旧 `total_score` 兼容 selector 训练。
+  - `train_anchor_selector_softpref.py` / `train_anchor_selector_dpo.py` 复用公共 scorer 聚合逻辑。
+  - 本地 Cursor lints 通过；Windows 本机没有可用 Python 解释器，`py_compile` 需在 AutoDL/conda 环境补跑。
