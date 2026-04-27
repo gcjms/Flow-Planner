@@ -1072,3 +1072,119 @@ dpo_data/anchor_conditioned/preferences/
 - 对原 TODO 的影响：
   - 不改变 candidate-level dataset / selector v0 的优先级。
   - 这次代码只是让 candidate-level selector 后续能直接读取标准化 score components、scene stats 和 anchor group stats。
+
+## Experiment: 20260427 candidate-level selector smoke (launch record)
+
+- Status: running
+- Goal:
+  - 验证 learned candidate-level selector 是否能替代手写 rerank，在 top-k anchor x multi-sample candidates 中直接选出更安全的轨迹。
+- Data:
+  - 使用已有 anchor softpref scored candidates 作为训练输入；优先复用 train2k 对应 scored_dir。
+  - 部署评测固定使用 2k val manifest eval_manifest_2k_seed3402.json。
+- Method:
+  - 新增 scene + anchor_traj + candidate_traj -> score 的 candidate selector。
+  - 先跑小规模 smoke / pilot，直接学习 scene 内 soft target，不先上 candidate-level DPO。
+  - 部署时使用 predicted_anchor_candidate_selector，从 top-k anchors x samples_per_anchor 候选中由 learned selector 选轨迹。
+- Artifacts:
+  - Record repo/worktree: /root/autodl-tmp/Flow-Planner
+  - Runtime repo/worktree: /root/autodl-tmp/Flow-Planner-anchor-runtime
+  - Planned train output: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_smoke_20260427
+  - Planned eval output: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_smoke_20260427
+- Artifacts Update:
+  - Train ckpt: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_smoke_20260427/anchor_candidate_selector_best.pth
+  - Train log: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_smoke_20260427/train.log
+  - 500-scene eval JSON: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_smoke_20260427/predicted_anchor_candidate_selector_smoke.json
+- Partial Results:
+  - 500-scene smoke deployment eval: collision 3.60%, progress 0.3427, route 0.8338, scenes 500 / 500, failed 0.
+- Interim Interpretation:
+  - candidate-level selector 没有出现明显 safety 崩盘，500-scene smoke 已经能跑通闭环；但 route 明显偏低，是否值得扩到正式训练还要看同配置 2k eval。
+- Final Smoke Results:
+  - 2k-manifest deployment eval: collision 4.45%, progress 0.3384, route 0.8425, scenes 2000 / 2000, failed 0.
+- Comparison Target:
+  - same-manifest references: original predicted_anchor_top1 4.20% / 0.3253 / 0.8548; soft selector train2k top1 3.55% / 0.3187 / 0.8545; collision-only selector-DPO 3.15% / 0.3150 / 0.8549; hand rerank 3.15% / 0.3293 / 0.8738.
+- Final Smoke Interpretation:
+  - 2k smoke result => collision 4.45%, progress 0.3384, route 0.8425.
+  - auto decision: hold 2k candidate-selector training and inspect before scaling.
+- Pending:
+  - 若自动起了 2k training，待补 train2k 运行结果与后续部署 eval。
+- Next:
+  - 依据 2k smoke 结果决定继续扩大训练还是先修 selector 行为。
+
+
+## Experiment: 20260427 candidate-level selector sharp target T0p05 (launch record)
+
+- Status: running
+- Goal:
+  - 验证 candidate-level selector smoke 失败是否主要来自 soft target 太平，而不是模型链路本身不可用。
+- Diagnosis From Previous Smoke:
+  - T=0.5 soft target 的 top candidate 平均概率只有 0.156，接近 9 candidates 均匀随机的 0.111。
+  - train/val loss 贴近 log(9)=2.197，val top1_match 约 0.107，基本等于随机排序。
+  - 2k eval 结果为 collision 4.45%, progress 0.3384, route 0.8425；弱于 original predicted_anchor_top1 4.20% 和 soft selector train2k 3.55%。
+- Data:
+  - train scored_dir: /root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir
+  - train subset: max_scenes=500
+  - eval subset: eval_manifest_2k_seed3402.json 的前 500 scenes
+- Method:
+  - 仍用 candidate-level soft CE，但把 target_temp 从 0.5 降到 0.05，让 top target 平均概率提升到约 0.414。
+  - 如果 sharp target 仍学不动，下一步应转向 hard pair / candidate-level DPO 或加入 online structured features，而不是继续单纯扩大训练样本。
+- Artifacts:
+  - Runtime repo/worktree: /root/autodl-tmp/Flow-Planner-anchor-runtime
+  - Train output: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_sharpT0p05_train500_20260427
+  - Eval output: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_sharpT0p05_train500_20260427
+- Results:
+  - 500-scene eval JSON: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_sharpT0p05_train500_20260427/predicted_anchor_candidate_selector_sharpT0p05_train500_500.json
+  - 500-scene sharp-target deployment eval: collision 13.20%, progress 0.3985, route 0.8278, scenes 500 / 500, failed 0.
+- Conclusion:
+  - 把 target 从 T=0.5 压到 T=0.05 虽然显著提升了 offline target match，但部署 safety 明显崩坏；说明当前 teacher score 的排序噪声会被 sharp target 放大。
+- Decision:
+  - 停止继续 sharp-target soft CE 路线，转向更干净的 candidate-level hard pair supervision。
+
+## Experiment: 20260427 candidate-level pairwise selector same-anchor train2k pilot (launch record)
+
+- Status: running
+- Goal:
+  - 验证 candidate-level hard pair supervision 是否能比 soft CE 更稳定地学会安全排序。
+- Data:
+  - source scored_dir: /root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir
+  - pair scope: same_anchor only
+  - pair reduce: one best-safe vs worst-collided pair per mixed anchor
+  - pair yield: 634 compressed same-anchor safety pairs from 436 mixed scenes within 2000 scored scenes
+- Method:
+  - candidate selector 输入仍为 scene + anchor_traj + candidate_traj
+  - supervision 改为 pairwise logistic ranking loss，不再模仿软 teacher 分布
+  - 当前 pilot 先做 train2k pairwise 训练，再看 offline pair_acc 和后续部署 eval 是否优于 soft CE 路线
+- Artifacts:
+  - Runtime repo/worktree: /root/autodl-tmp/Flow-Planner-anchor-runtime
+  - Train output: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_train2kpilot_20260427
+- Partial Results:
+  - pairwise train2k pilot offline: 634 same-anchor pairs, 507 train / 127 val, best val pair_acc 0.654.
+  - 500-scene pairwise deployment eval: collision 3.40%, progress 0.3378, route 0.8379, scenes 500 / 500, failed 0.
+- Results:
+  - 2k eval JSON: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_pairwise_sameanchor_train2kpilot_2k_20260427/predicted_anchor_candidate_selector_pairwise_sameanchor_2k.json
+  - 2k deployment eval: collision 3.60%, progress 0.3343, route 0.8514, scenes 2000 / 2000, failed 0.
+- Conclusion:
+  - same-anchor hard pair supervision 明显优于 soft CE candidate selector（4.45% -> 3.60%），并且优于原始 predicted_anchor_top1（4.20%）。
+  - 这条线已经接近旧的 anchor-level soft selector train2k（3.55%），说明 candidate-level scorer 的主要问题确实在监督，而不在链路本身。
+- Decision:
+  - 继续扩大 clean same-anchor pair 数，优先从 634 压缩版扩到 1268 all-pairs 版本；之后再看是否值得做 4-3-2 / 5-2-2 的 candidate budget allocation。
+
+## Experiment: 20260428 candidate-level pairwise selector same-anchor all-pairs train2k pilot (launch record)
+
+- Status: running
+- Goal:
+  - 在压缩版 same-anchor hard pair 已优于 soft CE 的前提下，把监督从 634 对扩到完整 same-anchor safety pairs，验证更多 clean pairs 是否能进一步改善 2k manifest collision。
+- Data:
+  - source scored_dir: /root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir
+  - pair scope: same_anchor only
+  - pair reduce: all safe-vs-collided pairs within the same anchor
+  - expected pair pool: about 1268 pairs from 2000 scored scenes
+- Method:
+  - 保持 candidate-level pairwise logistic ranking loss 不变，只扩大 clean pair 数量。
+  - 训练后直接评测同一 2k manifest，和 634-pair pilot / soft CE / anchor-selector baselines 做 apples-to-apples 比较。
+- Artifacts:
+  - Runtime repo/worktree: /root/autodl-tmp/Flow-Planner-anchor-runtime
+  - Train output: /root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_20260428
+  - Eval output: /root/autodl-tmp/anchor_runs/deploy_eval_anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_20260428
+- Pending:
+  - 待补 train history、2k eval JSON、结论。
+

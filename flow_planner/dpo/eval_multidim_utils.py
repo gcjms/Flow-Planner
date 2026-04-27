@@ -14,6 +14,7 @@ import torch
 from flow_planner.data.dataset.nuplan import NuPlanDataSample
 from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.anchor_predictor import AnchorPredictor
+from flow_planner.goal.candidate_selector import CandidateSelector
 from flow_planner.goal.anchor_utils import (
     find_nearest_anchor,
     find_topk_nearest_anchors,
@@ -144,6 +145,16 @@ def _extract_predictor_head_state_dict(state_dict: Dict[str, Any]) -> Dict[str, 
             k[len("head."):]: v
             for k, v in state_dict.items()
             if k.startswith("head.")
+        }
+    return state_dict
+
+
+def _extract_candidate_selector_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    if any(k.startswith("scorer.") for k in state_dict):
+        return {
+            k[len("scorer."):]: v
+            for k, v in state_dict.items()
+            if k.startswith("scorer.")
         }
     return state_dict
 
@@ -299,6 +310,40 @@ def load_anchor_predictor_model(
     predictor = predictor.to(device).eval()
     predictor.backbone.device = device
     return predictor
+
+
+def load_candidate_selector_model(
+    planner_model,
+    ckpt_path: str,
+    device: str = "cuda",
+) -> CandidateSelector:
+    """Instantiate a CandidateSelector and load its scorer weights."""
+    _ensure_device_available(device)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    hidden_dim = int(args.get("hidden_dim", 256))
+    dropout = float(args.get("dropout", 0.1))
+
+    selector = CandidateSelector(
+        planner_backbone=planner_model,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        freeze_backbone=True,
+    )
+    state_dict = _extract_candidate_selector_state_dict(_unwrap_state_dict(ckpt))
+    missing, unexpected = selector.scorer.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        logger.warning("Candidate selector missing %d keys: %s", len(missing), missing[:5])
+    if unexpected:
+        logger.warning(
+            "Candidate selector unexpected %d keys: %s", len(unexpected), unexpected[:5]
+        )
+
+    selector = selector.to(device).eval()
+    selector.backbone.device = device
+    return selector
 
 
 def resolve_anchor_vocab(model, anchor_vocab_path: Optional[str] = None) -> np.ndarray:
@@ -682,6 +727,64 @@ def _infer_reranked_anchor_trajectory_from_candidates(
     return candidate_trajs[best_idx]
 
 
+def _infer_candidate_selected_trajectory_from_candidates(
+    model,
+    data: NuPlanDataSample,
+    anchor_trajs: torch.Tensor,
+    candidate_selector: CandidateSelector,
+    samples_per_anchor: int = 3,
+    use_cfg: bool = True,
+    cfg_weight: float = 1.8,
+    bon_seed: int = -1,
+) -> np.ndarray:
+    """Generate multiple trajectories and let a learned selector pick one."""
+    if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
+        raise RuntimeError(
+            "Candidate selector requires a non-empty anchor candidate set shaped (B, k, T, 3)"
+        )
+    if samples_per_anchor <= 0:
+        raise ValueError("samples_per_anchor must be positive")
+
+    candidate_trajs: List[np.ndarray] = []
+    repeated_anchors: List[np.ndarray] = []
+    anchor_device = getattr(model, "device", data.ego_current.device)
+    for anchor_rank in range(anchor_trajs.shape[1]):
+        candidate_anchor = anchor_trajs[:, anchor_rank, :, :].to(anchor_device)
+        for sample_i in range(samples_per_anchor):
+            sample_seed = bon_seed
+            if bon_seed >= 0:
+                sample_seed = bon_seed + anchor_rank * 100 + sample_i
+            candidate_traj = infer_single_trajectory(
+                model,
+                data,
+                use_cfg=use_cfg,
+                cfg_weight=cfg_weight,
+                bon_seed=sample_seed,
+                anchor_traj=candidate_anchor,
+            )
+            candidate_trajs.append(candidate_traj.astype(np.float32))
+            repeated_anchors.append(
+                candidate_anchor[0].detach().cpu().numpy().astype(np.float32)
+            )
+
+    candidate_tensor = torch.from_numpy(np.stack(candidate_trajs, axis=0)).unsqueeze(0).float().to(anchor_device)
+    anchor_tensor = torch.from_numpy(np.stack(repeated_anchors, axis=0)).unsqueeze(0).float().to(anchor_device)
+    candidate_mask = torch.ones(
+        (1, candidate_tensor.shape[1]),
+        dtype=torch.bool,
+        device=anchor_device,
+    )
+    with torch.no_grad():
+        logits = candidate_selector(
+            data,
+            candidate_tensor,
+            anchor_tensor,
+            candidate_mask=candidate_mask,
+        )
+    best_idx = int(logits[0].argmax().item())
+    return candidate_trajs[best_idx]
+
+
 def infer_reranked_anchor_trajectory(
     model,
     data: NuPlanDataSample,
@@ -723,6 +826,34 @@ def infer_reranked_anchor_trajectory(
         comfort_weight=comfort_weight,
         progress_weight=progress_weight,
         collision_dist=collision_dist,
+    )
+
+
+def infer_candidate_selector_trajectory(
+    model,
+    data: NuPlanDataSample,
+    anchor_predictor: AnchorPredictor,
+    candidate_selector: CandidateSelector,
+    top_k: int = 3,
+    samples_per_anchor: int = 3,
+    use_cfg: bool = True,
+    cfg_weight: float = 1.8,
+    bon_seed: int = -1,
+) -> np.ndarray:
+    """Use learned scene+anchor+trajectory scoring to pick from top-k candidates."""
+    prediction = anchor_predictor.predict_topk(data, top_k=top_k)
+    anchor_trajs = prediction["anchor_trajs"]
+    if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
+        raise RuntimeError("Anchor predictor did not return usable top-k anchors")
+    return _infer_candidate_selected_trajectory_from_candidates(
+        model,
+        data,
+        anchor_trajs=anchor_trajs,
+        candidate_selector=candidate_selector,
+        samples_per_anchor=samples_per_anchor,
+        use_cfg=use_cfg,
+        cfg_weight=cfg_weight,
+        bon_seed=bon_seed,
     )
 
 
@@ -843,7 +974,9 @@ def run_multidim_evaluation(
     anchor_mode: str = "none",
     anchor_vocab: Optional[np.ndarray] = None,
     anchor_predictor: Optional[AnchorPredictor] = None,
+    candidate_selector: Optional[CandidateSelector] = None,
     predicted_anchor_top_k: int = 3,
+    candidate_samples_per_anchor: int = 3,
     rerank_collision_weight: float = 40.0,
     rerank_ttc_weight: float = 20.0,
     rerank_route_weight: float = 25.0,
@@ -897,7 +1030,11 @@ def run_multidim_evaluation(
                 goal_vocab=goal_vocab,
                 goal_predictor=goal_predictor,
             )
-            if anchor_mode in ("predicted_anchor_rerank", "oracle_anchor_rerank"):
+            if anchor_mode in (
+                "predicted_anchor_rerank",
+                "oracle_anchor_rerank",
+                "predicted_anchor_candidate_selector",
+            ):
                 if goal_point is not None:
                     raise ValueError(
                         f"{anchor_mode} is anchor-only; goal_mode must be 'none'"
@@ -921,6 +1058,26 @@ def run_multidim_evaluation(
                         comfort_weight=rerank_comfort_weight,
                         progress_weight=rerank_progress_weight,
                         collision_dist=collision_dist,
+                    )
+                elif anchor_mode == "predicted_anchor_candidate_selector":
+                    if anchor_predictor is None:
+                        raise ValueError(
+                            "predicted_anchor_candidate_selector requires an anchor predictor checkpoint"
+                        )
+                    if candidate_selector is None:
+                        raise ValueError(
+                            "predicted_anchor_candidate_selector requires a candidate selector checkpoint"
+                        )
+                    pred_traj = infer_candidate_selector_trajectory(
+                        model,
+                        data,
+                        anchor_predictor=anchor_predictor,
+                        candidate_selector=candidate_selector,
+                        top_k=predicted_anchor_top_k,
+                        samples_per_anchor=candidate_samples_per_anchor,
+                        use_cfg=use_cfg,
+                        cfg_weight=cfg_weight,
+                        bon_seed=bon_seed,
                     )
                 else:
                     pred_traj = infer_oracle_reranked_anchor_trajectory(

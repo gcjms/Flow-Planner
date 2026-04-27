@@ -22,6 +22,7 @@ import logging
 
 from flow_planner.dpo.eval_multidim_utils import (
     load_anchor_predictor_model,
+    load_candidate_selector_model,
     load_planner_model,
     log_summary,
     resolve_anchor_vocab,
@@ -99,6 +100,7 @@ def main():
             "none",
             "route_anchor",
             "predicted_anchor",
+            "predicted_anchor_candidate_selector",
             "predicted_anchor_rerank",
             "oracle_anchor",
             "oracle_anchor_rerank",
@@ -109,14 +111,25 @@ def main():
         "--anchor_predictor_ckpt",
         type=str,
         default=None,
-        help="Checkpoint of a trained AnchorPredictor (required for predicted_anchor / predicted_anchor_rerank).",
+        help="Checkpoint of a trained AnchorPredictor (required for predicted_anchor / predicted_anchor_rerank / predicted_anchor_candidate_selector).",
+    )
+    parser.add_argument(
+        "--candidate_selector_ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint of a trained CandidateSelector (required for predicted_anchor_candidate_selector).",
     )
     parser.add_argument(
         "--predicted_anchor_top_k",
         type=int,
         default=3,
-        help="Used by --anchor_mode=predicted_anchor_rerank / oracle_anchor_rerank: "
-             "take top-k anchor candidates, run planner for each, then rerank.",
+        help="Used by candidate/rerank anchor modes: take top-k anchor candidates before selecting one trajectory.",
+    )
+    parser.add_argument(
+        "--candidate_samples_per_anchor",
+        type=int,
+        default=3,
+        help="Used by --anchor_mode=predicted_anchor_candidate_selector: sample this many trajectories per anchor.",
     )
     parser.add_argument("--rerank_collision_weight", type=float, default=40.0)
     parser.add_argument("--rerank_ttc_weight", type=float, default=20.0)
@@ -153,16 +166,33 @@ def main():
 
     anchor_vocab = None
     anchor_predictor = None
+    candidate_selector = None
     if args.anchor_mode != "none":
         anchor_vocab = resolve_anchor_vocab(model, args.anchor_vocab_path)
-        if args.anchor_mode in ("predicted_anchor", "predicted_anchor_rerank"):
+        if args.anchor_mode in (
+            "predicted_anchor",
+            "predicted_anchor_rerank",
+            "predicted_anchor_candidate_selector",
+        ):
             if args.anchor_predictor_ckpt is None:
                 raise ValueError(
-                    "--anchor_mode=predicted_anchor / predicted_anchor_rerank "
+                    "--anchor_mode=predicted_anchor / predicted_anchor_rerank / "
+                    "predicted_anchor_candidate_selector "
                     "requires --anchor_predictor_ckpt"
                 )
             anchor_predictor = load_anchor_predictor_model(
                 model, args.anchor_predictor_ckpt, device=args.device
+            )
+        if args.anchor_mode == "predicted_anchor_candidate_selector":
+            if args.candidate_selector_ckpt is None:
+                raise ValueError(
+                    "--anchor_mode=predicted_anchor_candidate_selector "
+                    "requires --candidate_selector_ckpt"
+                )
+            candidate_selector = load_candidate_selector_model(
+                model,
+                args.candidate_selector_ckpt,
+                device=args.device,
             )
 
     summary, failures = run_multidim_evaluation(
@@ -178,7 +208,9 @@ def main():
         anchor_mode=args.anchor_mode,
         anchor_vocab=anchor_vocab,
         anchor_predictor=anchor_predictor,
+        candidate_selector=candidate_selector,
         predicted_anchor_top_k=args.predicted_anchor_top_k,
+        candidate_samples_per_anchor=args.candidate_samples_per_anchor,
         rerank_collision_weight=args.rerank_collision_weight,
         rerank_ttc_weight=args.rerank_ttc_weight,
         rerank_route_weight=args.rerank_route_weight,
@@ -206,7 +238,9 @@ def main():
                 "anchor_vocab_path": args.anchor_vocab_path,
                 "anchor_mode": args.anchor_mode,
                 "anchor_predictor_ckpt": args.anchor_predictor_ckpt,
+                "candidate_selector_ckpt": args.candidate_selector_ckpt,
                 "predicted_anchor_top_k": args.predicted_anchor_top_k,
+                "candidate_samples_per_anchor": args.candidate_samples_per_anchor,
                 "rerank_collision_weight": args.rerank_collision_weight,
                 "rerank_ttc_weight": args.rerank_ttc_weight,
                 "rerank_route_weight": args.rerank_route_weight,
