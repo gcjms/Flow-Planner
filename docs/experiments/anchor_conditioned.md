@@ -1188,3 +1188,169 @@ dpo_data/anchor_conditioned/preferences/
 - Pending:
   - 待补 train history、2k eval JSON、结论。
 
+---
+
+## TODO 总清单与发表路线图（20260428 同步）
+
+> 这一节是对话整理结果，整合三件事：
+> (1) work log §7 还在 open 的旧 TODO；
+> (2) 与 Diffusion-Planner / Hyper-Diffusion-Planner 比较后新冒出的工程项；
+> (3) 投稿前必须补齐的实验/写作 gap。
+> 后续每完成一项，请在该条目后追加 `done @<日期>` 或独立小节。
+> 失败/弃坑也要写明，不要悄悄删。
+
+### 关键事实校正（先记下来，避免下次被自己误导）
+
+- 之前对话/汇报里出现的 "原始 FlowPlanner = 2.0%" 这个数字，**含义是 500-scene 独立跑（`run_anchor_raw_no_goal_eval.sh`）**，不是 2k manifest。
+- 在**同 manifest 同 seed 的 500-scene full eval suite** 上：原始 FP = **2.4%**、`oracle_anchor` = **2.0%**、`predicted_anchor_rerank_a` = **6.2%**。
+- 在 **2k manifest（`eval_manifest_2k_seed3402.json`）** 上：当前最佳部署 `rho=0.5 + predicted_anchor_rerank_a` = **3.15%**，但**原始 FP 在 2k 上从未跑过**。
+- 因此当前所有"我们方法在 2k 上是否赢过原始 FP"的判断**没有数据支撑**，必须先补这一格。
+
+### P0 — 必须做（不做则 main result 不成立）
+
+- [ ] **P0-0**：把 anchor pipeline 接进官方 nuPlan closed-loop planner。
+  - 关键事实：当前 `flow_planner/planner.py` 只加载 `ckpt_path` 并调用 `core.inference(...)`，没有加载 `anchor_vocab.npy`、`AnchorPredictor`、`CandidateSelector`，也没有向模型传 `anchor_traj`。
+  - 直接后果：现在用 `launch_sim_nuplan.sh` 跑 anchor finetuned ckpt 时，等价于 `anchor_mode=none`，不是 `predicted_anchor_top1` / `predicted_anchor_rerank_a` / candidate selector。
+  - 最小验收：在官方 `nuplan-devkit run_simulation.py` 上跑通 1 个 `val14` scenario 的 `predicted_anchor_top1`。
+  - 完整验收：在官方 closed-loop 上跑 `raw_no_goal`、`anchor_ft_none`、`predicted_anchor_top1`、`predicted_anchor_rerank_a`、candidate selector，并拿到 NR-CLS / R-CLS 及官方子指标。
+  - 备注：在 P0-0 完成前，`eval_multidim.py` 的 collision / route / progress 只能作为内部 surrogate ablation，不能当作论文主表数字。
+- [ ] **P0-1**：在 `eval_manifest_2k_seed3402.json` 上跑 `flowplanner_no_goal.pth + anchor_mode none`。
+  - 脚本：`run_anchor_raw_no_goal_eval.sh`，`MANIFEST_PATH=/root/autodl-tmp/anchor_runs/eval_manifest_2k_seed3402.json`。
+  - 输出建议：`/root/autodl-tmp/anchor_runs/raw_no_goal_eval_2k_<日期>`。
+  - 决策规则：
+    - 如果 raw FP 2k > 3.15% → 当前最佳部署赢过原始 FP，main result 成立，进入 P1。
+    - 如果 raw FP 2k ≤ 3.15% → main result 不成立，必须先解决"为什么 anchor-finetuned planner 在 anchor 关掉后会退化"才能投稿。
+- [ ] **P0-2**：解释 `planner_ft_run1 + anchor_mode none = 6.4%` vs `flowplanner_no_goal.pth + none = 2.4%` 的退化（500-scene 同 manifest）。
+  - 假设候选：差分 LR 把 decoder backbone 推偏；anchor cross-attn out_proj 即使 zero-init 在 finetune 后产生残余偏移；optimizer state / 学习率调度差异。
+  - 诊断手段：在 anchor-finetuned ckpt 上把 `anchor_cross_attn` 的 KV 完全屏蔽，看 collision 是否回到 raw FP 水平；若仍退化，说明问题在 decoder 主干 finetune。
+- [ ] **P0-3**：等 candidate-level pairwise selector all-pairs train2k（2026-04-28 运行中）跑完，记录 2k eval。
+  - 决策规则：
+    - 若 2k collision < 3.15% → 接管 `predicted_anchor_rerank_a` 作为新部署 baseline，准备做 paper main 表。
+    - 若 ≥ 3.15% → candidate-level 暂停扩量，回头先解决 P0-2。
+
+### P1 — 强烈建议（论文 ablation 必交）
+
+- [ ] **P1-1**：CFG weight sweep on anchor checkpoint。
+  - 设置：`predicted_anchor_rerank_a` + 2k manifest，`cfg_weight ∈ {1.0, 1.25, 1.5, 1.75, 2.0}`。
+  - 动机：原版 `cfg_weight=1.5` 是 no-anchor 时调出来的；anchor cross-attn 接入后 `(u_cond − u_uncond)` 的含义变了，最优 w 可能漂移。
+- [ ] **P1-2**：训练时 CFG dropout 一致化。
+  - 现状：训练 cfg_flags=0 只 mask neighbors（或 lanes，按 `cfg_type`），不动 anchor；推理 cfg_flags=0 同时 zero anchor。uncond 分支推理期 OOD。
+  - 修法：在 `prepare_model_input` 里 cfg_flags=0 时把 anchor_traj 也置零，重训一个 short epoch 验证 collision 是否变化。
+- [ ] **P1-3**：Hybrid waypoint+velocity loss（HDP 启发）。
+  - 现状：`model_type=x_start`、`kinematic=waypoints`、`loss = MSE(prediction, target_tokens)`，**只监督 waypoint**。
+  - 改动：在 loss 里加一项 `MSE(diff(prediction[..., :2]), gt_velocity)`，权重 sweep `{0.1, 0.5, 1.0}`。
+  - 数学已被 HDP 证明：hybrid loss 不改变 optimal solution，只是降低高频抖动；工作量小、风险低。
+- [ ] **P1-4**：多 seed 重跑当前最佳部署设置。
+  - 至少 3 个 seed × `predicted_anchor_rerank_a` × 2k manifest，得到 mean ± std。
+  - 现在所有数字单 seed，paper 主表必须报方差。
+- [ ] **P1-5**：5k manifest 主表。
+  - manifest 已存在：`/root/autodl-tmp/anchor_runs/eval_manifest_5k_seed3402.json`。
+  - 至少跑 `raw_no_goal / planner_ft_none / predicted_anchor_top1 / predicted_anchor_rerank_a / oracle_anchor / oracle_anchor_rerank` 六格。
+  - 论文主表用 5k 比 2k 更稳。
+
+### P2 — 论文加分项（不做能投，做了更稳）
+
+- [ ] **P2-1**：anchor 注入方式 ablation（`cross-attn` vs `AdaLN additive` vs `concat at token level`）。
+  - 直接对应 §2.1 架构决策，是审稿人最爱问的"为什么这样接而不那样接"。
+- [ ] **P2-2**：anchor vocab 大小 K sweep（K ∈ {32, 64, 128, 256}）。
+  - 观察 `oracle_anchor` collision 与 K 的关系，验证 K=128 的合理性。
+- [ ] **P2-3**：AnchorPredictor metric heads（Hydra-MDP style：dac / safety / progress / comfort 多头）。
+  - 即旧 §7 P2 的 metric heads 项，扩展到候选级 multi-target distillation。
+- [ ] **P2-4**：失败 case 分析 + 可视化。
+  - oracle vs predicted 在 same scene 的轨迹差；selector picked vs hand-rerank picked 的 disagreement case。
+  - paper figure 候选。
+- [ ] **P2-5**：延迟 / 吞吐量分析。
+  - 单帧推理时间、K candidate 生成开销、与原版 FlowPlanner 对比。
+  - 工业审稿人会问的"你这一套比原版慢多少"。
+- [ ] **P2-6**：跨城市 / 跨 split 泛化诊断（如果 nuPlan split 允许）。
+- [ ] **P2-7**：timestep-adaptive anchor conditioning。
+  - 当前实现中，anchor cross-attn 注入发生在 `time_cond = self.t_embedder(t)` 之前；anchor token / anchor 注入强度本身不显式随 flow timestep `t` 自适应，只由后续 DiT / FinalLayer 间接吸收时间条件。
+  - 改进方向：在 `AnchorCrossAttention` 外加 timestep-conditioned gate / modulation，例如让 `time_cond` 预测 `anchor_delta` 的 gate，使高噪声阶段更依赖 anchor 全局形状、低噪声阶段允许 planner 保留细节修正。
+  - 影响：这是模型结构变化，旧 checkpoint 会缺新参数；需要重新 fine-tune anchor planner，并至少对比 `oracle_anchor`、`predicted_anchor_top1`、`predicted_anchor_candidate_selector`。
+
+### P3 — 收尾 / 长尾（不影响投稿）
+
+- [ ] DPO chosen/rejected 路径同 noise（已修 policy/reference 同 noise，pair 内同 noise 还可再改一层）。
+- [ ] Phase 0 teacher score cache（旧 §7 P2 项，目前由 candidate scoring 部分覆盖）。
+- [ ] Code release / README / 复现指南整理。
+- [ ] runtime patches 正式回收到 `feature/anchor` 分支（当前还有几份 patch 仅存于 runtime snapshot）。
+
+### 发表路线图（保守目标：CoRL 2026 / ICRA 2027）
+
+- **目标会议档次定调**：
+  - 顶会 oral 不现实（HDP 已发，diffusion planner 这个生态位被占）。
+  - 顶会 poster 风险高，仅当 P0-3（candidate-level all-pairs）出现明显胜过 hand rerank 的结果，再考虑冲。
+  - 主推：CoRL / ICRA / IROS。
+- **核心 contribution 候选**（按强度排）：
+  - C1（强）："continuous flow-matching log-prob 在 same-anchor pair 上 margin ≈ 0，因此 trajectory-level DPO 失效；需要 reformulate 到 discrete anchor / candidate space"。已有 mixed-DPO / collision-only DPO / softpref distillation 三组失败实验作为支撑。
+  - C2（中）："collision-only selector-DPO 优于 all-pairs selector-DPO，更多数据反而伤 safety"——反直觉发现，配 ablation 站得住。
+  - C3（弱）：scheduled anchor sampling 缩小 train/inference gap（已被 DAgger / scheduled sampling 文献覆盖，新颖度低）。
+- **短路线（约 3–4 周纯投入）**：
+  - Week 1：P0-1 / P0-2 / P0-3 收口；P1-1 cfg sweep；P1-2 训练一致化重训。
+  - Week 2：P1-3 hybrid loss；P1-4 多 seed；P1-5 5k 主表；P2-1 注入方式 ablation。
+  - Week 3：写作（thesis statement + 主图 + 主表 + related work：HDP / Diffusion-Planner / Hydra-MDP / GoalFlow 定位）。
+  - Week 4：buffer / polish / 内审。
+- **stop conditions**（哪些情况就别硬投）：
+  - P0-1 表明 raw FP 2k ≤ 3.15% 且 P0-2 解释不掉退化 → 暂停投稿。
+  - P1-4 多 seed 显示当前最佳部署的 std > 0.5 pp → 数字不稳，先解决方差。
+
+### 跟 Diffusion-Planner / Hyper-Diffusion-Planner 的相对位置（写 related work 用）
+
+- **本工作 vs Diffusion-Planner（ICLR 2025 oral, arXiv 2501.15564）**：
+  - DP 用 classifier guidance（无需训分类器，复用 diffusion model 估能量）做推理期偏好控制；本工作用 CFG + 离散 anchor selector + post-hoc rerank。
+  - 两者完全正交，不冲突；本工作不在 ODE 步内改 score。
+  - DP 的输入也是结构化（vector），与本工作可比；DP 报告的是 nuPlan benchmark closed-loop SOTA。
+- **本工作 vs Hyper-Diffusion-Planner / HDP（arXiv 2602.22801, 真车 200km）**：
+  - HDP 主张 τ₀-pred + τ₀-loss 是轨迹生成最优组合；**本工作（继承 FlowPlanner）已在 `model_type=x_start` 上，等价于 HDP 推荐组合**，无需修改。
+  - HDP 用 hybrid waypoint+velocity loss + RL post-training；本工作目前**只 waypoint loss**，对应 P1-3。
+  - HDP 明确表态"不依赖 anchor / goal point"，与本工作 anchor-conditioned 路线相反。审稿时审稿人会问"为什么 anchor 必要"，需要用 oracle gap（`oracle_anchor` 2.20% vs `planner_ft_none` 5.45% 在 2k 上）+ candidate oracle 1.2% 的诊断作为支撑回应。
+  - 本工作与 HDP 是**正交贡献**：HDP 关注 backbone loss space + RL 后训；本工作关注 conditioning prior + discrete preference learning。
+
+---
+
+## 代码审查记录：recent anchor selector / scorer / eval code（20260428）
+
+- 目的：
+  - 用户要求重新检查最近几轮 candidate-level selector / scorer / eval 代码，判断实验结论是否可能被实现问题污染。
+- 检查文件：
+  - `flow_planner/planner.py`
+  - `flow_planner/nuplan_simulation/planner/flow_planner.yaml`
+  - `flow_planner/dpo/eval_multidim_utils.py`
+  - `flow_planner/dpo/anchor_candidate_scorer.py`
+  - `flow_planner/dpo/generate_anchor_softpref_candidates.py`
+  - `flow_planner/dpo/score_anchor_candidates.py`
+  - `flow_planner/dpo/train_anchor_candidate_selector_softpref.py`
+  - `flow_planner/dpo/train_anchor_candidate_selector_pairwise.py`
+  - `flow_planner/goal/candidate_selector.py`
+- 发现 1（P0）：官方 closed-loop planner 没接 anchor pipeline。
+  - `planner.py::compute_planner_trajectory` 当前只调用 `self.core.inference(self._planner, inputs, use_cfg, cfg_weight, num_candidates, bon_seed)`。
+  - 没有加载 anchor vocab / anchor predictor / candidate selector，也没有传 `anchor_traj`。
+  - 因此官方 nuPlan closed-loop 目前不能评估 anchor 方法；只能评估 raw FlowPlanner 或 anchor finetuned ckpt 的 `anchor_mode=none` 退化版本。
+- 发现 2（P0）：`eval_multidim.py` 不是 nuPlan 官方 metric。
+  - collision 是 ego/neighbor 中心点距离 `< collision_dist`，不是官方 vehicle footprint polygon intersection。
+  - route/progress/comfort 也是自定义 surrogate，不是 nuPlan official NR-CLS/R-CLS metric。
+  - 当前 3.15% / 3.55% / 4.20% 等数字只能做内部 ablation，不能直接与 FlowPlanner / Diffusion-Planner 官方分数比较。
+- 发现 3（P1 bug）：candidate scorer 的 `collision_score` 符号疑似反了。
+  - `TrajectoryScorer._collision_score` 中 `collision_score` 越大表示越安全（最小距离越大）。
+  - 但 `anchor_candidate_scorer.score_components` 当前使用 `- weights.collision_weight * collision_score`，等价于轻微惩罚更安全的距离。
+  - 影响：soft candidate selector / selector-DPO all-pairs / score-gap 排序会被轻微污染；same-anchor safe-vs-collided pairwise 受影响较小，因为 `safety_weight * (1-collided)` 主导。
+  - 下一步：修成 `+ weights.collision_weight * collision_score` 或改名为 collision_penalty 并明确公式；修后必须重新 score candidates，再重训受影响的 selector 版本。
+- 发现 4（P1 bug）：`CandidateSelector` 冻结 backbone 后，训练时仍会被 `model.train(True)` 递归切回 train mode。
+  - `CandidateSelector.__init__` 里对 `backbone.eval()` 和 `requires_grad_(False)` 做了冻结。
+  - 但 `train_anchor_candidate_selector_*::run_epoch` 调用 `model.train(train)`，会把 `CandidateSelector.backbone` 递归设置为 train mode；即使 no grad，dropout / train-time behavior 仍可能打开。
+  - 影响：selector 训练和部署时的 scene features 分布不一致，可能解释 soft CE / sharp target / pairwise 训练不稳定。
+  - 下一步：在 `CandidateSelector.train()` 中覆盖逻辑，或在 `extract_scene_features()` 内部若 `freeze_backbone=True` 则强制 `self.backbone.eval()`；`AnchorPredictor` 也有相同模式，建议一起修。
+- 发现 5（P1 bug / validation risk）：candidate pairwise all-pairs 的 train/val split 是按 pair 随机切，不是按 scene 切。
+  - `train_anchor_candidate_selector_pairwise.py::split_records` 当前直接 shuffle records。
+  - 当 `pair_reduce=all` 时，同一个 scene 的多个 pair 可能同时出现在 train 和 val，offline val pair_acc 会偏乐观。
+  - 部署 eval 不会直接泄漏，但会影响 best checkpoint selection 和对 offline pair_acc 的解读。
+  - 下一步：按 `scenario_id` group split；历史 all-pairs pilot 的 val pair_acc 只作参考，不能作为强结论。
+- 发现 6（P1 risk）：oracle anchor eval 与训练标签对齐逻辑不一致。
+  - 训练中 `FlowPlanner._get_anchor_index_for_gt` 使用 `gt_future[:, -T_anchor:, :3]`。
+  - `eval_multidim_utils.resolve_anchor_condition(oracle_anchor)` 与 `_get_oracle_topk_anchor_trajs()` 当前使用 `ego_future_arr[:T, :3]`。
+  - 如果 NPZ 的 `ego_agent_future` 长度大于 `T_anchor`，oracle eval 会选错时间段的 anchor；如果恰好等于 80，则没有影响。
+  - 下一步：统一改成 `ego_future_arr[-T:, :3]`，并在日志中记录 NPZ future length。
+- 结论：
+  - 近期 selector/pairwise 实验不是完全无效，但 paper-facing 结论必须降级：只能说明在当前自定义 surrogate eval 下有方向性信号。
+  - 在修复 scorer 符号、frozen-backbone mode、scene-level split、oracle alignment，并接入官方 closed-loop 前，不应把这些结果包装成最终主结果。
+

@@ -138,6 +138,7 @@
 | `docs/ANCHOR_DEPLOYMENT_AND_VERIFICATION.md` | 部署与验证 runbook |
 | `docs/TONIGHT_AUTODL_TASKS.md` | AutoDL 实验任务单（4 个任务 + 命令 + gate） |
 | `docs/ANCHOR_WORK_LOG.md` | **本文件** |
+| `flow_planner/Innovation Projects.pptx` | 创新项目申报/答辩材料；正文主线已调整为 trajectory anchor / 同场景多候选 / 偏好对齐 |
 
 ---
 
@@ -398,6 +399,7 @@
   - `predicted_anchor_top1` collision 相比当前 `6.2%` 明显下降
   - `oracle_anchor_rerank` 更接近 `oracle_anchor`
   - 若 `planner_ft_none` 进一步恶化，则需要同时重新平衡 unconditional path
+- [ ] **timestep-adaptive anchor conditioning 设计验证**：当前 `decoder.py` 中 anchor cross-attn 在 `time_cond = self.t_embedder(t)` 之前注入，anchor token / 注入强度不显式随 flow timestep 自适应；下一步可加 timestep-conditioned gate / modulation，让高噪声阶段更依赖 anchor 全局形状、低噪声阶段保留细节修正。该项属于模型结构变化，旧 ckpt 会缺新参数，需重新 fine-tune anchor planner 后验证。
 - [ ] `train_soft_pref.py` 改造：goal_labels → anchor_labels，scene-level soft KL 保留
 - [ ] AnchorPredictor 加 metric heads（dis / dac / safety / progress / comfort）
 - [ ] Phase 0 teacher 打分 cache 生成（`risk/trajectory_scorer.py`）
@@ -561,3 +563,46 @@ bash run_anchor_scheduled_sampling.sh 0.5
   - `generate_anchor_softpref_candidates.py` 现在输出 `score_components`、`scene_stats`、`anchor_group_stats`，同时保留旧 `total_score` 兼容 selector 训练。
   - `train_anchor_selector_softpref.py` / `train_anchor_selector_dpo.py` 复用公共 scorer 聚合逻辑。
   - 本地 Cursor lints 通过；Windows 本机没有可用 Python 解释器，`py_compile` 需在 AutoDL/conda 环境补跑。
+
+---
+
+## 11. 2026-04-28 创新项目答辩材料更新
+
+- 更新 `flow_planner/Innovation Projects.pptx`，面向创新项目申报场景前移“项目可行性”叙事。
+- 新增正文页“项目可行性”：集中说明已有代码基础、full eval suite、raw/predicted/oracle baseline 口径、已修关键 bug、scheduled anchor sampling / predictor metric heads / rerank / DPO-VLM judge 下一步路线。
+- 将正文主线从旧的 `goal conditioning + soft preference distillation` 调整为 `trajectory anchor / 同场景多候选 / 偏好对齐`；`soft preference distillation` 仅保留在附录，并标注为“非当前主线前置依赖”的技术储备。
+- 在结果证据页保留关键风险表述：`predicted_anchor_top1 / rerank ≈ 6.2%` 尚未超过 `raw FlowPlanner 2.4%`，但 `oracle_anchor=2.0%` 证明 anchor 架构有上限；下一步优先攻关 planner robustness / exposure bias。
+- 生成本地备份 `flow_planner/Innovation Projects.before_feasibility_update.pptx`，用于必要时回退本次 PPT 编辑。
+
+### 2026-04-28 晚 — 创新项目 PPT 完整重写尝试已回退
+
+- 曾尝试将 `flow_planner/Innovation Projects.pptx` 重写为 14 页申报版，但该操作重建了整套 PPT 母版/版式，不符合“在原模板上修改”的要求，已回退。
+- 当前 `flow_planner/Innovation Projects.pptx` 已恢复自 `flow_planner/Innovation Projects.before_feasibility_update.pptx`，PowerPoint COM 验证可打开，slide count = 32。
+- 被丢弃的 14 页重写稿另存为 `flow_planner/Innovation Projects.full_rewrite_discarded_copy_20260428_2130.pptx`，仅作为文案参考，不再作为当前 PPT。
+- 后续若继续修改 PPT，必须遵守：**保留原模板、母版、页数和主要布局，只在现有页内替换文字/图片/表格内容**。
+- 可复用的申报口径仍然保留：
+  - 只使用 **2k 内部 surrogate eval** 口径，避免混用 500-scene raw FP。
+  - `no anchor 5.45%` → `oracle_anchor 2.20%` 证明 anchor 有价值。
+  - planner-level DPO / soft preference 暂缓；collision-only selector-DPO top1 达到 `3.15%` 追平 hand rerank_a。
+  - candidate oracle `1.20%` 说明 candidate pool 仍有潜力，candidate-level selector 是下一步主攻方向。
+
+### 2026-04-28 晚 — 原模板内 PPT 内容替换
+
+- 按“保留原模板、页数、母版和主要布局”的要求，在 `flow_planner/Innovation Projects.pptx` 原 32 页模板内做局部内容替换。
+- 修改范围：
+  - Slide 6：方案总览改为 `Anchor 生成候选 + Selector 学偏好 + 工程闭环验证`。
+  - Slide 7：创新分组改为 `轨迹级 Anchor 条件 / 从 planner-DPO 转向 Selector / 安全感知候选选择 / 从内部评测到公司落地`。
+  - Slide 8：保留原“核心创新 1”页布局，插入 Anchor/Delta 图，解释 candidate 偏离 anchor 的问题和 candidate-level selector 的意义。
+  - Slide 11：去掉 `Goal + DPO` 主线说法，改为安全评分 + learned selector + Scene-Adaptive CFG 的落地支撑。
+  - Slide 13：保留页眉/页脚，将内容替换为深色“截至目前工作”消融表格。
+  - Slide 18：结论页改为 Anchor/selector 路线与后续补 raw FP 2k、官方 closed-loop、公司数据验证。
+- 核心数据口径只使用 2k 内部 surrogate eval：`no anchor 5.45%`、`oracle_anchor 2.20%`、`original top1 4.20%`、`soft selector 3.55%`、`selector-DPO 3.15%`、`candidate oracle 1.20%`、`candidate pairwise 3.60%`。
+- 生成备份 `flow_planner/Innovation Projects.before_inplace_anchor_update_20260428_213521.pptx`；PowerPoint COM 验证当前 PPT 可打开，slide count = 32。
+
+### 2026-04-29 — 创新项目 PPT 附录补充：Anchor 的离散候选价值
+
+- 在 `flow_planner/Innovation Projects.pptx` 附录区新增第26页“为什么 Anchor 能让候选真正离散？”，插在原“为什么需要多模态轨迹生成？”之后。
+- 本页用于 Q&A 解释一个关键论点：生成式 planner 虽然可以多次采样，但原始 noise 往往只带来同一高概率模式附近的局部扰动，不一定产生语义级多样性。
+- 新增表述：anchor 是显式 `mode scaffold`，通过 `AnchorPredictor` 选择 top-k 轨迹意图，每个意图下再采样 candidate，从而让候选池覆盖直行、偏左、偏右、减速等不同形状。
+- 同时保留风险判断：anchor 不是硬约束，planner 允许合理偏离；后续由 `CandidateSelector` 基于 `scene + anchor + candidate + delta` 判断偏离是安全修正还是危险偏离。
+- 当前 `flow_planner/Innovation Projects.pptx` 为37页，主讲范围仍为第1-22页；`flow_planner/speaker_notes_for_innovation_project.md` 已同步更新页序说明。备份：`flow_planner/Innovation Projects.before_anchor_discreteness_20260429_1624.pptx`。
