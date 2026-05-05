@@ -1356,7 +1356,7 @@ dpo_data/anchor_conditioned/preferences/
 
 ## Experiment: 20260502 val20 strict_gate trace per-scene summary + focus scene analysis
 
-- Status: completed
+- Status: completed / alignment caveat added 2026-05-05
 - Goal:
   - 把 `strict_gate` 的 `val20` trace 落成 per-scene summary，确认新增碰撞 scene `71e4ce1d08e85a3c` 到底是 rare unsafe gate release，还是更长时程的 anchor-induced state-distribution shift。
 - Data:
@@ -1364,7 +1364,9 @@ dpo_data/anchor_conditioned/preferences/
   - scene delta CSV: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_strict_gate_w2_20260501/scene_delta_vs_none.csv`
   - eval subset: official `val20_clean`
 - Method:
-  - 按 trace 中 `planner_instance_id` 的首次出现顺序，对齐到 `scene_delta_vs_none.csv` 的 20 个 scenario。
+  - Original 2026-05-02 summary used the first-seen order of `planner_instance_id` in trace JSONL and aligned that order to `scene_delta_vs_none.csv`.
+  - 2026-05-05 follow-up found this implicit order-based alignment is risky.
+  - A safer timestamp-based remap was added in `scripts/anchor/summarize_candidate_trace.py`; it maps trace `iteration_time_us` to official metric `time_series_timestamps`.
   - 对每个 scene 汇总：
     - raw selector 选择 anchor 的 tick 比例
     - strict gate 最终放行 anchor 的 tick 比例
@@ -1376,25 +1378,23 @@ dpo_data/anchor_conditioned/preferences/
   - per-scene JSON: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/val20_trace_per_scene_summary.json`
   - per-scene CSV: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/val20_trace_per_scene_summary.csv`
   - focus case study: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/focus_scene_case_study.json`
+  - timestamp-remapped per-scene CSV: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/trace_summary_repro_20260505/candidate_trace_per_scene_summary.csv`
+  - timestamp-remapped focus case: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/trace_summary_repro_20260505/focus_scene_71e4ce1d08e85a3c.json`
 - Results:
   - 全局 trace 结论保持不变：raw selector 在 `94.2%` ticks 想选 anchor，但 strict gate 最终只放行 `12.6%`。
   - `71e4ce1d08e85a3c` 是唯一 `delta.no_ego_at_fault_collisions = -1.0` 的 scene。
-  - 该 scene 共 `149` ticks，raw selector `149/149` ticks 都偏好 anchor，但 strict gate 只在 `11/149` ticks 放行 anchor，final anchor rate = `7.38%`，fallback rate = `92.62%`。
-  - 该 scene 的主导 gate reasons：
-    - `rule_score_margin_lt_1p0`: `82`
-    - `rule_score_lt_unconditioned`: `71`
-    - `selected_final_x_lt_fallback_minus_2m`: `54`
-    - `large_lateral_delta_without_progress`: `15`
-  - focus scene 的 final anchor 放行不是单次长时间 takeover，而是稀疏、离散的小段：
-    - early single ticks: `4`, `10`, `17`, `23`
-    - near-end sparse ticks / short segments: `116-117`, `119`, `122`, `128`, `140`, `142`
-  - 在末段 `last_25_ticks` 中，大多数 tick 仍被 gate 拒绝；只有 `128`, `140`, `142` 三个 tick 放行 anchor，而且这些放行 tick 上：
-    - `raw_collision_score` 与 `unconditioned_collision_score` 都是 `0.0`
-    - 放行主要来自 rule score 暂时高于 fallback，而不是 collision proxy 显著改善
+  - Order-aligned original focus numbers are superseded for tick-level details.
+  - Timestamp-remapped `71e4ce1d08e85a3c` summary:
+    - `149` ticks.
+    - raw selector chose anchor on `137/149` ticks, raw anchor rate = `91.95%`.
+    - strict gate final anchor on `8/149` ticks, final anchor rate = `5.37%`.
+    - fallback ticks = `129/149`, fallback rate = `86.58%`.
+    - final anchor iters: `73`, `81`, `84`, `91`, `92`, `102`, `103`, `145`; longest final-anchor run = `2`.
+    - top gate reasons: `selected_final_x_lt_fallback_minus_2m=86`, `selected_path_lt_0p75_fallback=69`, `large_lateral_delta_without_progress=50`, `rule_score_margin_lt_1p0=42`, `rule_score_lt_unconditioned=33`.
 - Conclusion:
   - 目前证据更支持“稀疏 anchor 执行造成的长时程状态分布偏移”而不是“某一个明显的 unsafe gate release 直接导致新增碰撞”。
-  - 原因是：focus scene 在临近末段时仍然大部分 tick 被 fallback，anchor 放行只发生在少量离散 tick；新增碰撞更像 earlier sparse anchor actions 改变了后续闭环状态，而不是 gate 在碰撞前稳定接管。
-  - 同时，gate 的主导拒绝原因依然是 progress/rule margin，而不是 direct collision proxy failure，这与全局 `val20` trace 的诊断一致。
+  - 时间戳复核后，focus scene 仍然是低 final-anchor-rate、稀疏放行；但旧文档里具体 tick id / gate reason 计数不应继续引用。
+  - 后续所有 candidate trace per-scene summary 应使用 timestamp-based mapping，而不是 `planner_instance_id` 首次出现顺序。
 - Decision:
   - 不继续跑更大 budget sweep，也不继续把当前 `strict_gate` 当 deployment path 扩到 `val100`。
   - 如果继续这条线，优先级应放在：
@@ -1523,7 +1523,7 @@ dpo_data/anchor_conditioned/preferences/
 
 ## Experiment: 20260505 clean selector 5-2-2 official val20_clean probe
 
-- Status: launch prepared
+- Status: running
 - Goal:
   - Test whether the clean selector checkpoint from the root-fix pass improves or still regresses in official closed-loop evaluation.
   - Keep the candidate budget comparable to the previous `5-2-2` official probe; do not start new budget sweeps yet.
@@ -1535,9 +1535,29 @@ dpo_data/anchor_conditioned/preferences/
   - Anchor mode: `predicted_anchor_candidate_selector`
   - Candidate budget: `anchor_top_k=3`, `candidate_samples_per_anchor_list=[5,2,2]`
   - Eval subset: official `val20_clean`
-  - Worker setup: `single_machine_thread_pool`, `worker.max_workers=2`
-- Planned artifacts:
-  - Output root: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_20260505`
-  - Experiment output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_20260505/anchor_selector_522_clean_rootfix_val20_clean_w2`
+  - AutoDL visible resources checked on 2026-05-05:
+    - visible GPU: `1 x NVIDIA GeForce RTX 4090 D`
+    - CPU cores: `128`
+    - memory: `503GiB`
+  - Valid metric run worker setup: `single_machine_thread_pool`, `worker.max_workers=20`
+  - Parallel trace run worker setup: `single_machine_thread_pool`, `worker.max_workers=8`
+- Artifacts:
+  - Valid metric output root: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505`
+  - Valid metric experiment output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/anchor_selector_522_clean_rootfix_val20_clean_w20_final`
+  - Metric launch meta: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/launch_meta.txt`
+  - Clean trace output root: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505`
+  - Clean trace experiment output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/anchor_selector_522_clean_rootfix_trace_val20_w8`
+  - Clean trace JSONL: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/candidate_trace.jsonl`
+  - Summary tool: `scripts/anchor/summarize_official_eval.py`
+  - Trace summary tool: `scripts/anchor/summarize_candidate_trace.py`
+- Running notes:
+  - Earlier `w2`, `w16`, and first `w20` launches were stopped/superseded before completion to avoid wasting time on too-conservative worker settings.
+  - Sharded attempts improved instantaneous GPU utilization but were invalid because chunk filters produced empty shards; future sharding must use verified scenario tokens or timestamp/metric-backed mapping.
+  - The current valid metric run keeps full `val20_clean` coverage and avoids empty-shard risk.
+  - A parallel clean trace run was launched because official closed-loop left the single visible GPU mostly idle; this run is for per-scene/tick diagnosis, not a new budget sweep.
+- Current status:
+  - As of `2026-05-05 17:19 CST`, both metric and trace runs were active.
+  - No `runner_report.parquet` had been written yet for the clean metric run at that timestamp.
+  - The clean trace run had started but had not yet produced `candidate_trace.jsonl` rows at the first monitor tick.
 - Decision:
   - If this still regresses against `anchor_none`, the selector line needs a more closed-loop-consistent training/acceptance mechanism, not more open-loop budget tuning.
