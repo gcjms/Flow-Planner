@@ -1523,7 +1523,7 @@ dpo_data/anchor_conditioned/preferences/
 
 ## Experiment: 20260505 clean selector 5-2-2 official val20_clean probe
 
-- Status: running
+- Status: completed
 - Goal:
   - Test whether the clean selector checkpoint from the root-fix pass improves or still regresses in official closed-loop evaluation.
   - Keep the candidate budget comparable to the previous `5-2-2` official probe; do not start new budget sweeps yet.
@@ -1556,8 +1556,48 @@ dpo_data/anchor_conditioned/preferences/
   - The current valid metric run keeps full `val20_clean` coverage and avoids empty-shard risk.
   - A parallel clean trace run was launched because official closed-loop left the single visible GPU mostly idle; this run is for per-scene/tick diagnosis, not a new budget sweep.
 - Current status:
-  - As of `2026-05-05 17:19 CST`, both metric and trace runs were active.
-  - No `runner_report.parquet` had been written yet for the clean metric run at that timestamp.
-  - The clean trace run had started but had not yet produced `candidate_trace.jsonl` rows at the first monitor tick.
+  - As of `2026-05-05 20:00 CST`, both metric and trace runs had completed.
+  - Both runs finished with `20/20` simulations succeeded and `0` failed.
+- Results:
+  - Official metric summary artifact:
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/summary_vs_none_20260505/official_eval_summary.txt`
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/summary_vs_none_20260505/official_eval_scene_delta.csv`
+  - Clean trace summary artifact:
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/trace_summary_20260505/candidate_trace_per_scene_summary.csv`
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/trace_summary_20260505/focus_scene_71e4ce1d08e85a3c.json`
+  - `anchor_none` vs clean root-fix raw selector:
+    - weighted score: `94.7543 -> 84.6520` (`-10.1023`)
+    - product score: `65.7745 -> 25.9733`
+    - `no_ego_at_fault_collisions`: `19/20 -> 18/20`
+    - `drivable_area_compliance`: `19/20 -> 16/20`
+    - `ego_is_comfortable`: `19/20 -> 16/20`
+    - `ego_is_making_progress`: `20/20 -> 18/20`
+    - `ego_progress_along_expert_route` mean: `0.9215 -> 0.6523`
+    - `time_to_collision_within_bound`: `17/20 -> 16/20`
+    - `speed_limit_compliance` mean: `0.9794 -> 0.9602`
+    - `compute_trajectory_runtimes_mean`: `5.94 -> 66.60`
+  - Collision regressions remained concentrated in two scenes:
+    - `0002182ea6cd5afd`
+    - `bf01e524555c556e`
+  - Strong progress collapses remained concentrated in the same family of scenes already seen in the older raw selector run:
+    - `26023c247e8251e3`: `delta progress = -1.0`, `delta making_progress = -1.0`
+    - `d92e020065eb5d9e`: `delta progress = -1.0`, `delta making_progress = -1.0`
+    - `71e4ce1d08e85a3c`: no new collision, but progress `0.9042 -> 0.3266`
+  - Compared against the older dirty raw selector run (`anchor_selector_522_val20_clean`), the clean root-fix raw selector is only moderately worse, not a new order-of-magnitude collapse:
+    - weighted score: `86.3908 -> 84.6520` (`-1.7388`)
+    - the main failing scenes overlap heavily; the root failure mode did not qualitatively change.
+  - Important mode clarification:
+    - This run used `anchor_mode=predicted_anchor_candidate_selector`, not `strict_gate`.
+    - In [planner.py](/home/gcjms/Flow-Planner/flow_planner/planner.py), `predicted_anchor_candidate_selector` does not include the unconditioned baseline candidate, so there is no per-tick fallback path in this mode.
+    - The clean trace confirms that behavior directly: all `20/20` scenes had `raw_anchor_rate=1.0`, `final_anchor_rate=1.0`, `fallback_rate=0.0`.
+    - Therefore this result should be compared first to the older raw selector probe, not to `strict_gate` / `hybrid_gate`, which are different deployment modes with baseline fallback.
+- Conclusion:
+  - The root-fix pass corrected known contamination issues, but it did not solve the main closed-loop mismatch.
+  - After removing leakage / score-sign / oracle-horizon / frozen-backbone contamination, the raw selector line still underperforms badly against `anchor_none` in official closed-loop.
+  - The fact that the clean raw selector stays close to the older raw selector failure pattern suggests the dominant problem is not the fixed bugs alone; it is the lack of a closed-loop-consistent acceptance mechanism.
+  - Put differently: the fixes cleaned the measurement and supervision path, but they did not change the fact that a raw open-loop-trained selector is too aggressive when deployed every tick without fallback.
 - Decision:
-  - If this still regresses against `anchor_none`, the selector line needs a more closed-loop-consistent training/acceptance mechanism, not more open-loop budget tuning.
+  - Stop treating raw `predicted_anchor_candidate_selector` as a viable deployment mode.
+  - Do not continue budget sweeps on raw selector.
+  - If the selector line is continued, it should continue only behind an explicit gate / accept-reject mechanism or another closed-loop-consistent override path.
+  - The next apples-to-apples follow-up, if we keep this line alive, should be a clean `strict_gate` or cleaner learned override gate using the same fixed selector checkpoint.
