@@ -194,6 +194,7 @@ def split_records(records: Sequence[AnchorPairRecord], val_fraction: float, seed
     if val_fraction <= 0 or len(scene_ids) < 2:
         return records, []
     val_scene_count = max(1, int(round(len(scene_ids) * val_fraction)))
+    val_scene_count = min(val_scene_count, len(scene_ids) - 1)
     val_scenes = set(scene_ids[:val_scene_count])
     train_records = [record for record in records if record.scenario_id not in val_scenes]
     val_records = [record for record in records if record.scenario_id in val_scenes]
