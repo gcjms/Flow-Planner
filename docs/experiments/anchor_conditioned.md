@@ -1802,3 +1802,39 @@ dpo_data/anchor_conditioned/preferences/
     - `anchor_none`
     - old open-loop candidate selector
     - new candidate selector plus closed-loop gate
+
+## Experiment: 20260506 high-risk closed-loop gate data collection v2
+
+- Status: running
+- Goal:
+  - Replace fixed tick `0/74` intervention sampling with trace-ranked high-risk tick sampling.
+  - Collect trajectory-rich accept/reject labels for the first trainable `ClosedLoopGate`.
+  - Keep `official val20_clean` held out; use development scenes from `val100_clean - val20_clean`.
+- Rationale:
+  - Batch3 payload train12 verified the payload path but produced mostly easy labels (`11 accept / 1 reject`), because fixed `0/74` one-tick interventions are too mild.
+  - The new sampler first records old-selector decisions at every tick, then chooses ticks where the selector strongly prefers anchor or where rule/TTC/collision-style scores suggest the anchor proposal is risky.
+- Code:
+  - `scripts/anchor/launch_selector_trace_run.py`
+    - Creates a selector trace-only official closed-loop run for a specified scene list.
+  - `scripts/anchor/launch_closed_loop_intervention_batch.py`
+    - Adds `--ticks high_risk`.
+    - Adds per-scene top-k risk selection with min tick spacing and a small low-risk control quota.
+    - Writes `risk_score`, selector logits, and gate reasons into each intervention manifest.
+- Setup:
+  - Formal branch / GitHub: `anchor`, commit `91aefa7`.
+  - AutoDL formal repo: `/root/autodl-tmp/Flow-Planner`, branch `anchor`, commit `91aefa7`.
+  - Runtime repo: `/root/autodl-tmp/Flow-Planner-anchor-runtime`.
+  - Artifact root: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505`.
+  - Development scene list: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch2_val100_extra20_scenes.txt`.
+  - Baseline comparison run: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val100_clean_20260501/anchor_none_val100_clean`.
+- Current run:
+  - Trace run root: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/highrisk_trace_dev20_20260506`.
+  - Trace experiment: `anchor_selector_522_clean_rootfix_trace_dev20_w8`.
+  - Trace JSONL: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/highrisk_trace_dev20_20260506/candidate_trace.jsonl`.
+  - Started at about `2026-05-06 00:10 CST`.
+  - AutoDL visible resources at launch: `1 x RTX 4090 D`, 16 CPU cores, 60 GB memory.
+- Next steps:
+  - After the trace run finishes, generate a high-risk intervention batch from its `candidate_trace.jsonl`.
+  - Target `48-72` one-tick payload interventions, with conservative single-GPU parallelism.
+  - Summarize labels with `scripts/anchor/summarize_closed_loop_interventions.py`.
+  - Train `ClosedLoopGate` only if the resulting data has at least `10` reject labels and a useful reject ratio.
