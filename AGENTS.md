@@ -51,6 +51,27 @@
 
 这样后面继续扩展 `goal` / `anchor` / 其他实验线时，语义会更顺，不容易混。
 
+### 3.1 anchor 线分支同步硬规则
+
+如果用户说“继续 anchor 线”“跑 anchor 实验”“看 anchor 结果”，默认必须先确认三处都在同一条最新 `anchor` 分支上：
+
+- WSL / 本地工作区：当前分支应为 `anchor`，并跟踪 `origin/anchor`
+- GitHub / 云端：正式远端分支使用 `origin/anchor`
+- AutoDL 主仓库：`/root/autodl-tmp/Flow-Planner` 当前分支应为 `anchor`，并跟踪 `origin/anchor`
+
+不要把 `main` 当作 anchor 线工作分支。
+
+允许 `main` 保留公共摘要、统一入口或跨实验线说明，但正式 anchor 训练、评测、代码提交、详细实验记录，默认都应该在 `anchor` 分支上完成并同步。
+
+如果 AutoDL 主仓库停在 `main`，需要先处理清楚：
+
+- 有未提交改动时，先判断归属；不能直接覆盖或丢弃
+- 必要时先 `git stash push -u -m "<clear backup message>"` 保存现场
+- 再切到 `anchor` 并 `git pull --ff-only`
+- 切分支后重新确认 `git status --short --branch`
+
+除非用户明确要求保留历史兼容分支，否则不要再维护 `feature/anchor` 作为长期 anchor 入口；统一使用 `anchor`。
+
 ## 4. 重要约束
 
 - 不要随便新建第二份长期开发仓库。
