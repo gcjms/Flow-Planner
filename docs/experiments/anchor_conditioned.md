@@ -1354,3 +1354,51 @@ dpo_data/anchor_conditioned/preferences/
   - 近期 selector/pairwise 实验不是完全无效，但 paper-facing 结论必须降级：只能说明在当前自定义 surrogate eval 下有方向性信号。
   - 在修复 scorer 符号、frozen-backbone mode、scene-level split、oracle alignment，并接入官方 closed-loop 前，不应把这些结果包装成最终主结果。
 
+## Experiment: 20260502 val20 strict_gate trace per-scene summary + focus scene analysis
+
+- Status: completed
+- Goal:
+  - 把 `strict_gate` 的 `val20` trace 落成 per-scene summary，确认新增碰撞 scene `71e4ce1d08e85a3c` 到底是 rare unsafe gate release，还是更长时程的 anchor-induced state-distribution shift。
+- Data:
+  - trace JSONL: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/candidate_trace.jsonl`
+  - scene delta CSV: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_strict_gate_w2_20260501/scene_delta_vs_none.csv`
+  - eval subset: official `val20_clean`
+- Method:
+  - 按 trace 中 `planner_instance_id` 的首次出现顺序，对齐到 `scene_delta_vs_none.csv` 的 20 个 scenario。
+  - 对每个 scene 汇总：
+    - raw selector 选择 anchor 的 tick 比例
+    - strict gate 最终放行 anchor 的 tick 比例
+    - fallback 比例
+    - final anchor 的连续段长度
+    - gate reason 计数
+  - 对唯一 collision regression scene `71e4ce1d08e85a3c` 单独导出末段 tick 级 case study。
+- Artifacts:
+  - per-scene JSON: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/val20_trace_per_scene_summary.json`
+  - per-scene CSV: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/val20_trace_per_scene_summary.csv`
+  - focus case study: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_20260502/focus_scene_case_study.json`
+- Results:
+  - 全局 trace 结论保持不变：raw selector 在 `94.2%` ticks 想选 anchor，但 strict gate 最终只放行 `12.6%`。
+  - `71e4ce1d08e85a3c` 是唯一 `delta.no_ego_at_fault_collisions = -1.0` 的 scene。
+  - 该 scene 共 `149` ticks，raw selector `149/149` ticks 都偏好 anchor，但 strict gate 只在 `11/149` ticks 放行 anchor，final anchor rate = `7.38%`，fallback rate = `92.62%`。
+  - 该 scene 的主导 gate reasons：
+    - `rule_score_margin_lt_1p0`: `82`
+    - `rule_score_lt_unconditioned`: `71`
+    - `selected_final_x_lt_fallback_minus_2m`: `54`
+    - `large_lateral_delta_without_progress`: `15`
+  - focus scene 的 final anchor 放行不是单次长时间 takeover，而是稀疏、离散的小段：
+    - early single ticks: `4`, `10`, `17`, `23`
+    - near-end sparse ticks / short segments: `116-117`, `119`, `122`, `128`, `140`, `142`
+  - 在末段 `last_25_ticks` 中，大多数 tick 仍被 gate 拒绝；只有 `128`, `140`, `142` 三个 tick 放行 anchor，而且这些放行 tick 上：
+    - `raw_collision_score` 与 `unconditioned_collision_score` 都是 `0.0`
+    - 放行主要来自 rule score 暂时高于 fallback，而不是 collision proxy 显著改善
+- Conclusion:
+  - 目前证据更支持“稀疏 anchor 执行造成的长时程状态分布偏移”而不是“某一个明显的 unsafe gate release 直接导致新增碰撞”。
+  - 原因是：focus scene 在临近末段时仍然大部分 tick 被 fallback，anchor 放行只发生在少量离散 tick；新增碰撞更像 earlier sparse anchor actions 改变了后续闭环状态，而不是 gate 在碰撞前稳定接管。
+  - 同时，gate 的主导拒绝原因依然是 progress/rule margin，而不是 direct collision proxy failure，这与全局 `val20` trace 的诊断一致。
+- Decision:
+  - 不继续跑更大 budget sweep，也不继续把当前 `strict_gate` 当 deployment path 扩到 `val100`。
+  - 如果继续这条线，优先级应放在：
+    - 更保守的 learned override gate / confidence gate
+    - 针对 focus scene 这类 sparse-anchor-distribution-shift case 的 scene-level gate features
+    - 更便宜的 `unconditioned + top1x1` 或 `unconditioned + top1x2` 探针
+  - 在没有达到“collision 不差于 `none` 且 anchor 使用率不塌到近零”之前，不建议继续大规模 official closed-loop 扩展。
