@@ -12,9 +12,16 @@ import argparse
 import json
 import shlex
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.anchor.build_closed_loop_intervention_manifest import (
     _build_timestamp_scene_map,
@@ -52,6 +59,74 @@ def _select_ticks(rows: list[dict[str, Any]], ticks: list[int] | None) -> list[d
         nearest = min(rows, key=lambda row: abs(int(row.get("iteration_index", -1)) - tick))
         selected.append(nearest)
     return selected
+
+
+def _select_tick_indices(num_ticks: int, ticks: list[int] | None) -> list[int]:
+    if num_ticks <= 0:
+        return []
+    if ticks is None:
+        return [0, num_ticks // 2]
+
+    selected: list[int] = []
+    for tick in ticks:
+        clamped = max(0, min(int(tick), num_ticks - 1))
+        selected.append(clamped)
+    return selected
+
+
+def _iter_time_series(values: Any) -> list[int]:
+    if values is None:
+        return []
+    if isinstance(values, list):
+        return [int(v) for v in values]
+    try:
+        if pd.isna(values):
+            return []
+    except ValueError:
+        pass
+    if hasattr(values, "tolist"):
+        return [int(v) for v in values.tolist()]
+    return []
+
+
+def _load_metric_tick_rows(metrics_run: Path, scenes: set[str]) -> dict[str, list[dict[str, Any]]]:
+    metrics_dir = metrics_run / "metrics"
+    if not metrics_dir.exists():
+        raise FileNotFoundError(f"metrics dir not found: {metrics_dir}")
+
+    for metric_name in (
+        "ego_progress_along_expert_route",
+        "time_to_collision_within_bound",
+        "driving_direction_compliance",
+    ):
+        path = metrics_dir / f"{metric_name}.parquet"
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        if "time_series_timestamps" not in df.columns:
+            continue
+        rows_by_scene: dict[str, list[dict[str, Any]]] = {}
+        for row in df.to_dict("records"):
+            scene_name = str(row.get("scenario_name", ""))
+            if scene_name not in scenes:
+                continue
+            timestamps = _iter_time_series(row.get("time_series_timestamps"))
+            if not timestamps:
+                continue
+            log_name = str(row.get("log_name", ""))
+            rows_by_scene[scene_name] = [
+                {
+                    "scenario_name": scene_name,
+                    "log_name": log_name,
+                    "iteration_index": idx,
+                    "iteration_time_us": timestamp,
+                }
+                for idx, timestamp in enumerate(timestamps)
+            ]
+        if rows_by_scene:
+            return rows_by_scene
+
+    raise FileNotFoundError(f"no usable time_series_timestamps found in: {metrics_dir}")
 
 
 def _write_run_script(
@@ -128,12 +203,13 @@ rm -f "$TRACE_PATH"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace-jsonl", required=True, type=Path)
+    parser.add_argument("--trace-jsonl", type=Path, default=None)
     parser.add_argument("--metrics-run", required=True, type=Path)
     parser.add_argument("--scenes-file", required=True, type=Path)
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--batch-name", default="batch1")
     parser.add_argument("--ticks", default="0,74")
+    parser.add_argument("--force", choices=("trace_raw", "raw_best_anchor"), default="trace_raw")
     parser.add_argument("--launch-first", type=int, default=0)
     parser.add_argument("--project-root", type=Path, default=Path("/root/autodl-tmp/Flow-Planner-anchor-runtime"))
     parser.add_argument("--python-bin", type=Path, default=Path("/root/miniconda3/envs/flow_planner/bin/python"))
@@ -159,19 +235,24 @@ def main() -> None:
     scenes = _load_scene_filter(args.scenes_file)
     if not scenes:
         raise RuntimeError(f"no scenes loaded from {args.scenes_file}")
-    timestamp_scene_map = _build_timestamp_scene_map(args.metrics_run)
     rows_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in _load_jsonl(args.trace_jsonl):
-        scene_log = timestamp_scene_map.get(int(row["iteration_time_us"]))
-        if not scene_log:
-            continue
-        scene_name, log_name = scene_log
-        if scene_name not in scenes or row.get("raw_best_type") != "anchor":
-            continue
-        enriched = dict(row)
-        enriched["scenario_name"] = scene_name
-        enriched["log_name"] = log_name
-        rows_by_scene[scene_name].append(enriched)
+    if args.force == "trace_raw":
+        if args.trace_jsonl is None:
+            raise ValueError("--trace-jsonl is required when --force=trace_raw")
+        timestamp_scene_map = _build_timestamp_scene_map(args.metrics_run)
+        for row in _load_jsonl(args.trace_jsonl):
+            scene_log = timestamp_scene_map.get(int(row["iteration_time_us"]))
+            if not scene_log:
+                continue
+            scene_name, log_name = scene_log
+            if scene_name not in scenes or row.get("raw_best_type") != "anchor":
+                continue
+            enriched = dict(row)
+            enriched["scenario_name"] = scene_name
+            enriched["log_name"] = log_name
+            rows_by_scene[scene_name].append(enriched)
+    else:
+        rows_by_scene.update(_load_metric_tick_rows(args.metrics_run, scenes))
 
     ticks = None if args.ticks.lower() == "auto" else [int(v) for v in args.ticks.split(",") if v.strip()]
     manifest_dir = args.run_root / f"{args.batch_name}_manifests"
@@ -182,7 +263,14 @@ def main() -> None:
     run_scripts: list[Path] = []
     idx = 0
     for scene_name in sorted(scenes):
-        selected_rows = _select_ticks(rows_by_scene.get(scene_name, []), ticks)
+        scene_rows = rows_by_scene.get(scene_name, [])
+        if args.force == "trace_raw":
+            selected_rows = _select_ticks(scene_rows, ticks)
+        else:
+            selected_rows = [
+                scene_rows[tick_idx]
+                for tick_idx in _select_tick_indices(len(scene_rows), ticks)
+            ]
         for row in selected_rows:
             tick = int(row["iteration_index"])
             exp_name = f"{args.batch_name}_{idx:02d}_{scene_name}_tick{tick:03d}"
@@ -191,18 +279,31 @@ def main() -> None:
                 "log_name": row["log_name"],
                 "iteration_index": tick,
                 "iteration_time_us": int(row["iteration_time_us"]),
-                "type": "anchor",
-                "anchor_rank": row.get("raw_best_anchor_rank"),
-                "sample_i": row.get("raw_best_sample_i"),
-                "candidate_idx": row.get("raw_best_idx"),
-                "source_trace": str(args.trace_jsonl),
-                "source_planner_instance_id": row.get("planner_instance_id"),
             }
+            if args.force == "trace_raw":
+                intervention.update(
+                    {
+                        "type": "anchor",
+                        "anchor_rank": row.get("raw_best_anchor_rank"),
+                        "sample_i": row.get("raw_best_sample_i"),
+                        "candidate_idx": row.get("raw_best_idx"),
+                        "source_trace": str(args.trace_jsonl),
+                        "source_planner_instance_id": row.get("planner_instance_id"),
+                    }
+                )
+            else:
+                intervention.update(
+                    {
+                        "type": "raw_best_anchor",
+                        "source_metrics_run": str(args.metrics_run),
+                    }
+                )
             manifest = {
                 "schema_version": 1,
                 "description": "Single-tick closed-loop intervention rollout.",
-                "source_trace": str(args.trace_jsonl),
-                "force": "raw",
+                "source_trace": str(args.trace_jsonl) if args.trace_jsonl else None,
+                "source_metrics_run": str(args.metrics_run),
+                "force": args.force,
                 "num_interventions": 1,
                 "interventions": [intervention],
             }

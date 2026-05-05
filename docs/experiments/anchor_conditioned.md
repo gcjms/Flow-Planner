@@ -1654,3 +1654,104 @@ dpo_data/anchor_conditioned/preferences/
   - Build the first small batch of intervention manifests from regression scenes and raw-selector high-confidence ticks.
   - Run those official rollouts from the runtime snapshot.
   - Convert each rollout result into accept/reject labels versus `anchor_none` before training any closed-loop selector.
+
+## Experiment: 20260505 closed-loop intervention batch1 val20_clean probe
+
+- Status: completed
+- Goal:
+  - Verify that the new closed-loop intervention collector can produce usable per-tick accept/reject labels.
+  - Keep this as a debugging/probe batch only; do not use `val20_clean` labels for training.
+- Setup:
+  - Runtime repo: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Formal branch: `anchor`
+  - Artifact root: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505`
+  - Source trace: `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/candidate_trace.jsonl`
+  - Timestamp mapping run: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/anchor_selector_522_clean_rootfix_val20_clean_w20_final`
+  - Baseline comparison run: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_20260501/anchor_none_val20_clean`
+  - Intervention mode: `predicted_anchor_candidate_selector_intervention`
+  - Semantics: all non-listed ticks use baseline/unconditioned planning; exactly one listed tick forces one raw-selector anchor candidate.
+  - Scenes: `0002182ea6cd5afd`, `26023c247e8251e3`, `71e4ce1d08e85a3c`, `bf01e524555c556e`, `d92e020065eb5d9e`
+  - Ticks per scene: first tick and mid tick (`0`, nearest `74`)
+- Artifacts:
+  - Batch scripts: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_scripts`
+  - Batch manifests: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_manifests`
+  - Batch output dirs: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_*`
+  - Label summary TXT: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_summary/closed_loop_intervention_summary.txt`
+  - Label table CSV: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_summary/closed_loop_intervention_labels.csv`
+  - Label summary JSON: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch1_summary/closed_loop_intervention_summary.json`
+  - Summary tool: `scripts/anchor/summarize_closed_loop_interventions.py`
+- Results:
+  - Official rollouts: `10/10` completed.
+  - Forced-candidate trace check: `10/10` matched the manifest by candidate metadata.
+  - Invalid labels: `0/10`.
+  - Labels under the default conservative policy:
+    - accept: `9/10`
+    - reject: `1/10`
+  - Mean weighted-score delta versus `anchor_none`: `-0.7175`.
+  - Mean progress delta versus `anchor_none`: `+0.0010`.
+  - Only reject:
+    - `batch1_04_71e4ce1d08e85a3c_tick000`
+    - forced candidate: `anchor_rank=1`, `sample_i=1`
+    - weighted score: `83.8047 -> 76.0527` (`-7.7520`)
+    - collision metric: `-0.5`
+    - progress delta: `-0.0279`
+  - The same scene at mid tick was acceptable:
+    - `batch1_05_71e4ce1d08e85a3c_tick074`
+    - weighted score delta: `+0.0769`
+    - progress delta: `+0.0044`
+- Conclusion:
+  - The collector now produces the kind of label the open-loop selector could not provide: a candidate can be acceptable at one tick and unsafe at another after official closed-loop rollout.
+  - This supports switching the selector line from "always take the open-loop best candidate" to "train a closed-loop accept/reject gate".
+  - `val20_clean` batch1 is evidence that the data path works, not training data.
+- Decision:
+  - Keep the runtime snapshot as the official experiment execution environment for this line.
+  - Before training, create train-scene intervention batches and summarize them with the same label table format.
+  - Do not continue raw selector budget sweeps.
+
+## Experiment: 20260505 closed-loop intervention batch2 val100_clean extra-scenes collection
+
+- Status: running
+- Goal:
+  - Expand closed-loop accept/reject label collection beyond the `val20_clean` probe scenes.
+  - Keep `val20_clean` held out for final method checking; use `val100_clean - val20_clean` as development-label scenes because AutoDL currently has official nuPlan DB cache for `val` / `mini`, but not official `train` DB cache.
+- Setup:
+  - Runtime repo: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Formal branch: `anchor`
+  - Artifact root: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505`
+  - Baseline comparison run: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val100_clean_20260501/anchor_none_val100_clean`
+  - Scenario source: successful scenes from `val100_clean`, excluding `val20_clean` and the one `rawbest_smoke` scene.
+  - Scene list: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch2_val100_extra20_scenes.txt`
+  - Number of scenes: `20`
+  - Ticks per scene: `0` and nearest `74`
+  - Planned rollouts: `40`
+  - Intervention force mode: `raw_best_anchor`
+    - The manifest specifies only the scene and tick.
+    - At the intervention tick, the runtime computes the candidate pool and forces the highest-logit anchor candidate at that tick.
+    - Non-listed ticks still use baseline/unconditioned planning.
+- Code update:
+  - `flow_planner/dpo/eval_multidim_utils.py`
+    - Added manifest type `raw_best_anchor` to avoid requiring a full raw-selector trace before collecting labels.
+  - `scripts/anchor/launch_closed_loop_intervention_batch.py`
+    - Added `--force raw_best_anchor`, which builds manifests from baseline metric timestamps.
+  - `scripts/anchor/summarize_closed_loop_interventions.py`
+    - Updated forced-candidate verification for `raw_best_anchor`.
+- Artifacts:
+  - Batch scripts: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch2_val100_extra20_scripts`
+  - Batch manifests: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch2_val100_extra20_manifests`
+  - Batch output dirs: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/batch2_val100_extra20_*`
+- Running notes:
+  - `rawbest_smoke` first confirmed the new manifest type:
+    - scene `029bea2e8bd95bbd`
+    - trace forced `raw_best_anchor` into final `anchor_rank=0`, `sample_i=1`
+  - Batch2 launched in three waves:
+    - first `12` rollouts,
+    - next `12` rollouts,
+    - final `16` rollouts,
+    - total `40/40` launched.
+  - On launch, the machine had `128` CPU cores, `503GiB` RAM, and one visible `RTX 4090 D`.
+  - Peak launch-time load reached about `95`; memory/GPU remained within limits.
+- Results:
+  - Pending.
+- Decision:
+  - After batch2 finishes, summarize with `scripts/anchor/summarize_closed_loop_interventions.py`.
+  - If valid labels are non-trivial and forced-candidate checks pass, train the first accept/reject closed-loop gate from these development labels.

@@ -113,6 +113,8 @@ def _write_candidate_selector_trace(
 def _resolve_forced_candidate_idx(
     candidate_meta: List[Dict[str, Any]],
     forced_candidate: Optional[Dict[str, Any]],
+    logits: Optional[torch.Tensor] = None,
+    raw_best_idx: Optional[int] = None,
 ) -> Optional[int]:
     if not forced_candidate:
         return None
@@ -120,6 +122,22 @@ def _resolve_forced_candidate_idx(
     candidate_type = str(forced_candidate.get("type", "anchor"))
     if candidate_type == "baseline":
         candidate_type = "unconditioned"
+    if candidate_type in {"raw_best", "raw_best_candidate"}:
+        return raw_best_idx
+    if candidate_type == "raw_best_anchor":
+        if logits is None:
+            return raw_best_idx
+        flat_logits = logits.detach().cpu().reshape(-1)
+        best_idx: Optional[int] = None
+        best_logit: Optional[float] = None
+        for idx, meta in enumerate(candidate_meta):
+            if meta.get("type") != "anchor":
+                continue
+            value = float(flat_logits[idx].item())
+            if best_logit is None or value > best_logit:
+                best_idx = idx
+                best_logit = value
+        return best_idx
     anchor_rank = forced_candidate.get("anchor_rank")
     sample_i = forced_candidate.get("sample_i")
     for idx, meta in enumerate(candidate_meta):
@@ -942,7 +960,12 @@ def _infer_candidate_selected_trajectory_from_candidates(
     collision_scores_trace: Optional[torch.Tensor] = None
     ttc_scores_trace: Optional[torch.Tensor] = None
 
-    forced_idx = _resolve_forced_candidate_idx(candidate_meta, forced_candidate)
+    forced_idx = _resolve_forced_candidate_idx(
+        candidate_meta,
+        forced_candidate,
+        logits=logits,
+        raw_best_idx=raw_best_idx,
+    )
     if forced_candidate is not None:
         if forced_idx is None or not (0 <= forced_idx < len(candidate_trajs)):
             raise ValueError(f"forced candidate not found: {forced_candidate}")
