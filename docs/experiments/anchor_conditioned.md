@@ -1467,3 +1467,39 @@ dpo_data/anchor_conditioned/preferences/
     - retraining a clean selector with scene-grouped split,
     - then running official closed-loop validation.
   - Older selector checkpoints remain useful only as historical baselines, not as clean evidence.
+
+## Experiment: 20260505 clean scorefix rescore + scene-grouped pairwise selector retrain
+
+- Status: launch prepared
+- Goal:
+  - Produce the first clean candidate selector checkpoint after the known selector-line contamination fixes.
+  - Separate low-cost teacher-score correction from expensive candidate resampling by reusing the existing train2k candidate NPZ cache.
+- Code baseline:
+  - Branch: `feature/anchor`
+  - Required fixes included:
+    - positive `collision_score` teacher sign,
+    - frozen-backbone train/eval protection,
+    - scene-grouped selector train/val split,
+    - oracle anchor horizon alignment,
+    - scene split clamp so small runs cannot put every scene into val.
+- Data:
+  - Source candidate root: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153`
+  - Source scored_dir: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_20260426_2153/scored_dir`
+  - Train scenes: `/root/autodl-tmp/train_dataset`
+  - Candidate cache size: 2000 scored scenes, `top_k=3`, `samples_per_anchor=3`
+- Planned setup:
+  - Clean AutoDL worktree: `/root/autodl-tmp/Flow-Planner-sync-anchor`
+  - Rescore output: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_clean_scorefix_20260505`
+  - Train output: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505`
+  - Planner ckpt: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Anchor vocab: `/root/autodl-tmp/anchor_runs/anchor_vocab.npy`
+  - Pair mining: `pair_scope=same_anchor`, `pair_reduce=all`, `min_score_gap=0.0`
+  - Split: scene-grouped, `val_fraction=0.2`, `seed=3402`
+  - Training: `epochs=5`, `batch_size=32`, `lr=2e-4`, `weight_decay=1e-4`
+- Required checks:
+  - `pair_stats.json` must report `split_strategy=scene_grouped`.
+  - `pair_stats.json` must report `train_val_scene_overlap=0`.
+  - Training should use the clean `CandidateSelector.train()` behavior so the frozen planner backbone stays in eval mode.
+- Decision rule:
+  - If offline clean training is sane, use this checkpoint for a new official closed-loop `val20_clean` probe.
+  - If offline clean training is not sane, stop before spending official closed-loop budget and inspect labels/features first.
