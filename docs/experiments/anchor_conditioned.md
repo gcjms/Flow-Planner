@@ -1601,3 +1601,33 @@ dpo_data/anchor_conditioned/preferences/
   - Do not continue budget sweeps on raw selector.
   - If the selector line is continued, it should continue only behind an explicit gate / accept-reject mechanism or another closed-loop-consistent override path.
   - The next apples-to-apples follow-up, if we keep this line alive, should be a clean `strict_gate` or cleaner learned override gate using the same fixed selector checkpoint.
+
+## Code / Experiment Prep: 20260505 closed-loop selector data collector v1
+
+- Status: implementation started
+- Goal:
+  - Replace the open-loop selector supervision path with a closed-loop data path.
+  - First collect official closed-loop labels for "baseline except this specific tick/candidate intervention" rollouts.
+  - Use those labels later to train an accept/reject closed-loop selector, instead of trusting open-loop teacher scores.
+- Setup:
+  - Working branch: `anchor`
+  - Official runtime target: `/root/autodl-tmp/Flow-Planner`
+  - Artifact root: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505`
+  - Source raw trace for first manifests:
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_trace_val20_clean_rootfix_20260505/candidate_trace.jsonl`
+  - Source metric run for timestamp-to-scene mapping:
+    - `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_w20_final_20260505/anchor_selector_522_clean_rootfix_val20_clean_w20_final`
+- Implementation plan:
+  - Merge the official anchor execution path from the runtime snapshot back into the formal `anchor` branch.
+  - Add `anchor_mode=predicted_anchor_candidate_selector_intervention`.
+  - Add `planner.flow_planner.candidate_intervention_manifest_path`.
+  - In intervention mode, non-listed ticks use baseline / unconditioned planning; listed ticks generate the same candidate pool and force the manifest-selected candidate.
+  - Keep `candidate_trace_path` writing candidate metadata, raw selector choice, forced final choice, and intervention details.
+  - Add `scripts/anchor/build_closed_loop_intervention_manifest.py` to build first manifests from existing selector trace plus official timestamp mapping.
+- Data policy:
+  - Do not train on `val20_clean`.
+  - Use the `val20_clean` interventions only as probe / debugging evidence.
+  - For actual closed-loop selector training data, create separate train-scene intervention manifests after the collector smoke passes.
+- Initial decision:
+  - Stop polishing raw open-loop selector as the main method.
+  - Build the closed-loop label collector first; train the accept/reject selector only after the collector produces valid official rollouts.

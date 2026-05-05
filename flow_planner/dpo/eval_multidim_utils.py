@@ -4,6 +4,7 @@ import glob
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,111 @@ from flow_planner.goal.goal_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_CANDIDATE_TRACE_LOCK = threading.Lock()
+
+
+def _tensor_to_float_list(values: Optional[torch.Tensor]) -> Optional[List[float]]:
+    if values is None:
+        return None
+    try:
+        return [float(v) for v in values.detach().cpu().reshape(-1).tolist()]
+    except Exception:
+        return None
+
+
+def _write_candidate_selector_trace(
+    trace_context: Optional[Dict[str, Any]],
+    *,
+    candidate_meta: List[Dict[str, Any]],
+    logits: torch.Tensor,
+    raw_best_idx: int,
+    final_idx: int,
+    gate_reasons: List[str],
+    rule_scores: Optional[torch.Tensor] = None,
+    collision_scores: Optional[torch.Tensor] = None,
+    ttc_scores: Optional[torch.Tensor] = None,
+    forced_candidate: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Append one selector/gate/intervention decision row for analysis."""
+    if not trace_context:
+        return
+    trace_path = trace_context.get("path")
+    if not trace_path:
+        return
+    try:
+        path = Path(str(trace_path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw_meta = candidate_meta[raw_best_idx] if 0 <= raw_best_idx < len(candidate_meta) else {}
+        final_meta = candidate_meta[final_idx] if 0 <= final_idx < len(candidate_meta) else {}
+        logits_list = _tensor_to_float_list(logits)
+        rule_list = _tensor_to_float_list(rule_scores)
+        collision_list = _tensor_to_float_list(collision_scores)
+        ttc_list = _tensor_to_float_list(ttc_scores)
+        row: Dict[str, Any] = {
+            key: value
+            for key, value in trace_context.items()
+            if key != "path"
+        }
+        row.update(
+            {
+                "pid": os.getpid(),
+                "wall_time": time.time(),
+                "num_candidates": len(candidate_meta),
+                "raw_best_idx": int(raw_best_idx),
+                "raw_best_type": raw_meta.get("type"),
+                "raw_best_anchor_rank": raw_meta.get("anchor_rank"),
+                "raw_best_sample_i": raw_meta.get("sample_i"),
+                "final_idx": int(final_idx),
+                "final_type": final_meta.get("type"),
+                "final_anchor_rank": final_meta.get("anchor_rank"),
+                "final_sample_i": final_meta.get("sample_i"),
+                "fallback_triggered": bool(raw_best_idx != final_idx),
+                "gate_reasons": gate_reasons,
+                "forced_candidate": forced_candidate,
+                "logits": logits_list,
+                "raw_best_logit": logits_list[raw_best_idx] if logits_list and 0 <= raw_best_idx < len(logits_list) else None,
+                "unconditioned_logit": logits_list[0] if logits_list else None,
+                "raw_best_rule_score": rule_list[raw_best_idx] if rule_list and 0 <= raw_best_idx < len(rule_list) else None,
+                "unconditioned_rule_score": rule_list[0] if rule_list else None,
+                "raw_best_collision_score": collision_list[raw_best_idx] if collision_list and 0 <= raw_best_idx < len(collision_list) else None,
+                "unconditioned_collision_score": collision_list[0] if collision_list else None,
+                "raw_best_ttc_score": ttc_list[raw_best_idx] if ttc_list and 0 <= raw_best_idx < len(ttc_list) else None,
+                "unconditioned_ttc_score": ttc_list[0] if ttc_list else None,
+                "candidate_meta": candidate_meta,
+            }
+        )
+        with _CANDIDATE_TRACE_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:  # pragma: no cover - trace must never break planning
+        logger.warning("failed to write candidate selector trace: %s", exc)
+
+
+def _resolve_forced_candidate_idx(
+    candidate_meta: List[Dict[str, Any]],
+    forced_candidate: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    if not forced_candidate:
+        return None
+    if "candidate_idx" in forced_candidate and forced_candidate["candidate_idx"] is not None:
+        return int(forced_candidate["candidate_idx"])
+
+    candidate_type = str(forced_candidate.get("type", "anchor"))
+    if candidate_type == "baseline":
+        candidate_type = "unconditioned"
+    anchor_rank = forced_candidate.get("anchor_rank")
+    sample_i = forced_candidate.get("sample_i")
+    for idx, meta in enumerate(candidate_meta):
+        if meta.get("type") != candidate_type:
+            continue
+        if candidate_type == "unconditioned":
+            return idx
+        if anchor_rank is not None and int(meta.get("anchor_rank", -1)) != int(anchor_rank):
+            continue
+        if sample_i is not None and int(meta.get("sample_i", -1)) != int(sample_i):
+            continue
+        return idx
+    return None
 
 
 def _read_scene_manifest(scene_manifest: str) -> List[str]:
@@ -737,8 +843,13 @@ def _infer_candidate_selected_trajectory_from_candidates(
     use_cfg: bool = True,
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
+    include_unconditioned_candidate: bool = False,
+    fallback_progress_guard: bool = False,
+    fallback_strict_safety_guard: bool = False,
+    forced_candidate: Optional[Dict[str, Any]] = None,
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
-    """Generate multiple trajectories and let a learned selector pick one."""
+    """Generate trajectories and let a learned selector or intervention pick one."""
     if anchor_trajs.ndim != 4 or anchor_trajs.shape[0] == 0 or anchor_trajs.shape[1] == 0:
         raise RuntimeError(
             "Candidate selector requires a non-empty anchor candidate set shaped (B, k, T, 3)"
@@ -759,7 +870,29 @@ def _infer_candidate_selected_trajectory_from_candidates(
 
     candidate_trajs: List[np.ndarray] = []
     repeated_anchors: List[np.ndarray] = []
+    candidate_meta: List[Dict[str, Any]] = []
     anchor_device = getattr(model, "device", data.ego_current.device)
+    if include_unconditioned_candidate:
+        fallback_traj = infer_single_trajectory(
+            model,
+            data,
+            use_cfg=use_cfg,
+            cfg_weight=cfg_weight,
+            bon_seed=bon_seed,
+            anchor_traj=None,
+        )
+        candidate_trajs.append(fallback_traj.astype(np.float32))
+        repeated_anchors.append(
+            np.zeros_like(anchor_trajs[0, 0].detach().cpu().numpy(), dtype=np.float32)
+        )
+        candidate_meta.append(
+            {
+                "candidate_idx": len(candidate_meta),
+                "type": "unconditioned",
+                "anchor_rank": None,
+                "sample_i": None,
+            }
+        )
     for anchor_rank in range(anchor_trajs.shape[1]):
         candidate_anchor = anchor_trajs[:, anchor_rank, :, :].to(anchor_device)
         for sample_i in range(samples_by_anchor[anchor_rank]):
@@ -778,6 +911,15 @@ def _infer_candidate_selected_trajectory_from_candidates(
             repeated_anchors.append(
                 candidate_anchor[0].detach().cpu().numpy().astype(np.float32)
             )
+            candidate_meta.append(
+                {
+                    "candidate_idx": len(candidate_meta),
+                    "type": "anchor",
+                    "anchor_rank": int(anchor_rank),
+                    "anchor_rank_1based": int(anchor_rank) + 1,
+                    "sample_i": int(sample_i),
+                }
+            )
 
     candidate_tensor = torch.from_numpy(np.stack(candidate_trajs, axis=0)).unsqueeze(0).float().to(anchor_device)
     anchor_tensor = torch.from_numpy(np.stack(repeated_anchors, axis=0)).unsqueeze(0).float().to(anchor_device)
@@ -793,7 +935,94 @@ def _infer_candidate_selected_trajectory_from_candidates(
             anchor_tensor,
             candidate_mask=candidate_mask,
         )
-    best_idx = int(logits[0].argmax().item())
+    raw_best_idx = int(logits[0].argmax().item())
+    best_idx = raw_best_idx
+    gate_reasons: List[str] = []
+    rule_scores_trace: Optional[torch.Tensor] = None
+    collision_scores_trace: Optional[torch.Tensor] = None
+    ttc_scores_trace: Optional[torch.Tensor] = None
+
+    forced_idx = _resolve_forced_candidate_idx(candidate_meta, forced_candidate)
+    if forced_candidate is not None:
+        if forced_idx is None or not (0 <= forced_idx < len(candidate_trajs)):
+            raise ValueError(f"forced candidate not found: {forced_candidate}")
+        best_idx = int(forced_idx)
+        gate_reasons.append("forced_candidate")
+    elif include_unconditioned_candidate and fallback_progress_guard and best_idx != 0:
+        fallback = candidate_trajs[0]
+        selected = candidate_trajs[best_idx]
+        fallback_final_x = float(fallback[-1, 0])
+        selected_final_x = float(selected[-1, 0])
+        fallback_path = float(np.linalg.norm(np.diff(fallback[:, :2], axis=0), axis=1).sum())
+        selected_path = float(np.linalg.norm(np.diff(selected[:, :2], axis=0), axis=1).sum())
+        lateral_delta = float(abs(selected[-1, 1] - fallback[-1, 1]))
+        should_fallback = False
+        if selected_final_x < fallback_final_x - 2.0:
+            should_fallback = True
+            gate_reasons.append("selected_final_x_lt_fallback_minus_2m")
+        if selected_path < 0.75 * max(fallback_path, 1e-3):
+            should_fallback = True
+            gate_reasons.append("selected_path_lt_0p75_fallback")
+        if lateral_delta > 3.0 and selected_final_x <= fallback_final_x + 1.0:
+            should_fallback = True
+            gate_reasons.append("large_lateral_delta_without_progress")
+        if not should_fallback:
+            from flow_planner.risk.trajectory_scorer import TrajectoryScorer
+
+            neighbors_future, route = _build_rerank_context(
+                data,
+                future_steps=candidate_tensor.shape[2],
+            )
+            scorer = TrajectoryScorer(
+                collision_weight=40.0,
+                ttc_weight=20.0,
+                route_weight=25.0,
+                comfort_weight=10.0,
+                progress_weight=5.0,
+                collision_threshold=2.0,
+                ttc_threshold=3.0,
+                dt=0.1,
+                verbose=False,
+            )
+            candidate_cpu = candidate_tensor[0].detach().cpu()
+            rule_scores = scorer.score_trajectories(
+                candidate_cpu,
+                neighbors=neighbors_future,
+                route=route,
+            )
+            rule_scores_trace = rule_scores.detach().cpu()
+            if float(rule_scores[best_idx].item()) < float(rule_scores[0].item()):
+                should_fallback = True
+                gate_reasons.append("rule_score_lt_unconditioned")
+            if fallback_strict_safety_guard:
+                collision_scores = scorer._collision_score(candidate_cpu, neighbors_future)
+                ttc_scores = scorer._ttc_score(candidate_cpu, neighbors_future)
+                collision_scores_trace = collision_scores.detach().cpu()
+                ttc_scores_trace = ttc_scores.detach().cpu()
+                if float(collision_scores[best_idx].item()) < float(collision_scores[0].item()):
+                    should_fallback = True
+                    gate_reasons.append("collision_score_lt_unconditioned")
+                if float(ttc_scores[best_idx].item()) < float(ttc_scores[0].item()):
+                    should_fallback = True
+                    gate_reasons.append("ttc_score_lt_unconditioned")
+                if float(rule_scores[best_idx].item()) < float(rule_scores[0].item()) + 1.0:
+                    should_fallback = True
+                    gate_reasons.append("rule_score_margin_lt_1p0")
+        if should_fallback:
+            best_idx = 0
+
+    _write_candidate_selector_trace(
+        trace_context,
+        candidate_meta=candidate_meta,
+        logits=logits.detach().cpu(),
+        raw_best_idx=raw_best_idx,
+        final_idx=best_idx,
+        gate_reasons=gate_reasons,
+        rule_scores=rule_scores_trace,
+        collision_scores=collision_scores_trace,
+        ttc_scores=ttc_scores_trace,
+        forced_candidate=forced_candidate,
+    )
     return candidate_trajs[best_idx]
 
 
@@ -852,6 +1081,11 @@ def infer_candidate_selector_trajectory(
     use_cfg: bool = True,
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
+    include_unconditioned_candidate: bool = False,
+    fallback_progress_guard: bool = False,
+    fallback_strict_safety_guard: bool = False,
+    forced_candidate: Optional[Dict[str, Any]] = None,
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Use learned scene+anchor+trajectory scoring to pick from top-k candidates."""
     prediction = anchor_predictor.predict_topk(data, top_k=top_k)
@@ -868,6 +1102,11 @@ def infer_candidate_selector_trajectory(
         use_cfg=use_cfg,
         cfg_weight=cfg_weight,
         bon_seed=bon_seed,
+        include_unconditioned_candidate=include_unconditioned_candidate,
+        fallback_progress_guard=fallback_progress_guard,
+        fallback_strict_safety_guard=fallback_strict_safety_guard,
+        forced_candidate=forced_candidate,
+        trace_context=trace_context,
     )
 
 
