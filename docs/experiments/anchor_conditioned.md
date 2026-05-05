@@ -1755,3 +1755,50 @@ dpo_data/anchor_conditioned/preferences/
 - Decision:
   - After batch2 finishes, summarize with `scripts/anchor/summarize_closed_loop_interventions.py`.
   - If valid labels are non-trivial and forced-candidate checks pass, train the first accept/reject closed-loop gate from these development labels.
+
+## Experiment: 20260505 closed-loop gate implementation
+
+- Status: implementation ready, waiting for trajectory-rich closed-loop labels
+- Goal:
+  - Replace the failed "always trust the open-loop candidate selector" behavior with a closed-loop accept/reject gate.
+  - Keep the old candidate selector only as a proposal generator: it picks the anchor candidate it wants, then the new gate decides whether that one tick should take over or fall back to `anchor_none`.
+- Setup:
+  - Formal branch: `anchor`
+  - Runtime target: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - New runtime mode: `predicted_anchor_candidate_selector_closed_loop_gate`
+  - Gate checkpoint config:
+    - `planner.flow_planner.closed_loop_gate_ckpt`
+    - `planner.flow_planner.closed_loop_gate_threshold`
+  - Training data source:
+    - closed-loop intervention label CSV from `scripts/anchor/summarize_closed_loop_interventions.py`
+    - matching trace JSONL files written with `planner.flow_planner.candidate_trace_training_payload=true`
+- Code:
+  - `flow_planner/goal/closed_loop_gate.py`
+    - Binary accept/reject model over scene features, selected candidate trajectory, and selected anchor trajectory.
+  - `flow_planner/dpo/train_closed_loop_gate.py`
+    - Trains `closed_loop_gate_best.pth` from accept/reject intervention labels.
+    - Uses scene-grouped train/val split.
+  - `flow_planner/dpo/eval_multidim_utils.py`
+    - Adds trajectory-rich trace payload fields:
+      - `scene_features`
+      - `selected_candidate_traj`
+      - `selected_anchor_traj`
+    - Adds closed-loop gate loading and runtime scoring.
+  - `flow_planner/planner.py`
+    - Adds the runtime mode `predicted_anchor_candidate_selector_closed_loop_gate`.
+    - Behavior:
+      - old selector proposes a candidate,
+      - gate probability below threshold falls back to unconditioned baseline,
+      - gate probability above threshold allows the proposed candidate.
+  - `scripts/anchor/launch_closed_loop_intervention_batch.py`
+    - Adds `--trace-training-payload` so future intervention batches can be used directly as gate training data.
+- Current limitation:
+  - Batch2 was launched before trajectory-rich trace payload existed, so it can summarize label balance and bad cases, but it is not sufficient by itself to train the gate.
+- Decision:
+  - Let current batch2 finish as a label-balance/probe batch.
+  - Launch the next development batch with `--trace-training-payload`.
+  - Train the first `ClosedLoopGate` checkpoint from that trajectory-rich batch.
+  - Evaluate on held-out `official val20_clean` against:
+    - `anchor_none`
+    - old open-loop candidate selector
+    - new candidate selector plus closed-loop gate

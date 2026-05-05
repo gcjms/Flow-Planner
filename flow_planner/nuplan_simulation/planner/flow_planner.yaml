@@ -28,10 +28,13 @@ flow_planner:
   anchor_mode: none
   anchor_predictor_ckpt: null
   candidate_selector_ckpt: null
+  closed_loop_gate_ckpt: null
+  closed_loop_gate_threshold: 0.5
   anchor_top_k: 3
   candidate_samples_per_anchor: 3
   candidate_samples_per_anchor_list: null
   candidate_trace_path: null
+  candidate_trace_training_payload: false
   candidate_intervention_manifest_path: null
   anchor_state_dim: 3
   anchor_token_num: 4

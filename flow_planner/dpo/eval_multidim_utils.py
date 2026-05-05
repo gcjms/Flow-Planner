@@ -15,6 +15,7 @@ import torch
 from flow_planner.data.dataset.nuplan import NuPlanDataSample
 from flow_planner.dpo.config_utils import load_composed_config
 from flow_planner.goal.anchor_predictor import AnchorPredictor
+from flow_planner.goal.closed_loop_gate import ClosedLoopGate
 from flow_planner.goal.candidate_selector import CandidateSelector
 from flow_planner.goal.anchor_utils import (
     find_nearest_anchor,
@@ -42,10 +43,17 @@ def _tensor_to_float_list(values: Optional[torch.Tensor]) -> Optional[List[float
         return None
 
 
+def _array_to_nested_float_list(values: np.ndarray) -> List[Any]:
+    return np.asarray(values, dtype=np.float32).tolist()
+
+
 def _write_candidate_selector_trace(
     trace_context: Optional[Dict[str, Any]],
     *,
     candidate_meta: List[Dict[str, Any]],
+    candidate_trajs: List[np.ndarray],
+    repeated_anchors: List[np.ndarray],
+    scene_features: Optional[torch.Tensor],
     logits: torch.Tensor,
     raw_best_idx: int,
     final_idx: int,
@@ -54,6 +62,9 @@ def _write_candidate_selector_trace(
     collision_scores: Optional[torch.Tensor] = None,
     ttc_scores: Optional[torch.Tensor] = None,
     forced_candidate: Optional[Dict[str, Any]] = None,
+    closed_loop_gate_logit: Optional[float] = None,
+    closed_loop_gate_prob: Optional[float] = None,
+    closed_loop_gate_threshold: Optional[float] = None,
 ) -> None:
     """Append one selector/gate/intervention decision row for analysis."""
     if not trace_context:
@@ -100,9 +111,22 @@ def _write_candidate_selector_trace(
                 "unconditioned_collision_score": collision_list[0] if collision_list else None,
                 "raw_best_ttc_score": ttc_list[raw_best_idx] if ttc_list and 0 <= raw_best_idx < len(ttc_list) else None,
                 "unconditioned_ttc_score": ttc_list[0] if ttc_list else None,
+                "closed_loop_gate_logit": closed_loop_gate_logit,
+                "closed_loop_gate_prob": closed_loop_gate_prob,
+                "closed_loop_gate_threshold": closed_loop_gate_threshold,
                 "candidate_meta": candidate_meta,
             }
         )
+        if trace_context.get("write_training_payload"):
+            selected_traj = candidate_trajs[final_idx] if 0 <= final_idx < len(candidate_trajs) else None
+            selected_anchor = repeated_anchors[final_idx] if 0 <= final_idx < len(repeated_anchors) else None
+            if scene_features is not None:
+                scene_feature_values = scene_features.detach().cpu().float().reshape(-1).tolist()
+                row["scene_features"] = [float(value) for value in scene_feature_values]
+            if selected_traj is not None:
+                row["selected_candidate_traj"] = _array_to_nested_float_list(selected_traj)
+            if selected_anchor is not None:
+                row["selected_anchor_traj"] = _array_to_nested_float_list(selected_anchor)
         with _CANDIDATE_TRACE_LOCK:
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -274,6 +298,16 @@ def _extract_predictor_head_state_dict(state_dict: Dict[str, Any]) -> Dict[str, 
 
 
 def _extract_candidate_selector_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    if any(k.startswith("scorer.") for k in state_dict):
+        return {
+            k[len("scorer."):]: v
+            for k, v in state_dict.items()
+            if k.startswith("scorer.")
+        }
+    return state_dict
+
+
+def _extract_closed_loop_gate_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     if any(k.startswith("scorer.") for k in state_dict):
         return {
             k[len("scorer."):]: v
@@ -468,6 +502,40 @@ def load_candidate_selector_model(
     selector = selector.to(device).eval()
     selector.backbone.device = device
     return selector
+
+
+def load_closed_loop_gate_model(
+    planner_model,
+    ckpt_path: str,
+    device: str = "cuda",
+) -> ClosedLoopGate:
+    """Instantiate a closed-loop accept/reject gate and load ``ckpt_path``."""
+    _ensure_device_available(device)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    hidden_dim = int(args.get("hidden_dim", 256))
+    dropout = float(args.get("dropout", 0.1))
+
+    gate = ClosedLoopGate(
+        planner_backbone=planner_model,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        freeze_backbone=True,
+    )
+    state_dict = _extract_closed_loop_gate_state_dict(_unwrap_state_dict(ckpt))
+    missing, unexpected = gate.scorer.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        logger.warning("Closed-loop gate missing %d keys: %s", len(missing), missing[:5])
+    if unexpected:
+        logger.warning(
+            "Closed-loop gate unexpected %d keys: %s", len(unexpected), unexpected[:5]
+        )
+
+    gate = gate.to(device).eval()
+    gate.backbone.device = device
+    return gate
 
 
 def resolve_anchor_vocab(model, anchor_vocab_path: Optional[str] = None) -> np.ndarray:
@@ -856,6 +924,8 @@ def _infer_candidate_selected_trajectory_from_candidates(
     data: NuPlanDataSample,
     anchor_trajs: torch.Tensor,
     candidate_selector: CandidateSelector,
+    closed_loop_gate: Optional[ClosedLoopGate] = None,
+    closed_loop_gate_threshold: float = 0.5,
     samples_per_anchor: int = 3,
     sample_counts_per_anchor: Optional[List[int]] = None,
     use_cfg: bool = True,
@@ -947,8 +1017,9 @@ def _infer_candidate_selected_trajectory_from_candidates(
         device=anchor_device,
     )
     with torch.no_grad():
-        logits = candidate_selector(
-            data,
+        scene_features = candidate_selector.extract_scene_features(data)
+        logits = candidate_selector.score_features(
+            scene_features,
             candidate_tensor,
             anchor_tensor,
             candidate_mask=candidate_mask,
@@ -959,6 +1030,8 @@ def _infer_candidate_selected_trajectory_from_candidates(
     rule_scores_trace: Optional[torch.Tensor] = None
     collision_scores_trace: Optional[torch.Tensor] = None
     ttc_scores_trace: Optional[torch.Tensor] = None
+    closed_loop_gate_logit: Optional[float] = None
+    closed_loop_gate_prob: Optional[float] = None
 
     forced_idx = _resolve_forced_candidate_idx(
         candidate_meta,
@@ -971,6 +1044,27 @@ def _infer_candidate_selected_trajectory_from_candidates(
             raise ValueError(f"forced candidate not found: {forced_candidate}")
         best_idx = int(forced_idx)
         gate_reasons.append("forced_candidate")
+    elif (
+        closed_loop_gate is not None
+        and include_unconditioned_candidate
+        and best_idx != 0
+    ):
+        with torch.no_grad():
+            selected_candidate_tensor = candidate_tensor[:, best_idx : best_idx + 1]
+            selected_anchor_tensor = anchor_tensor[:, best_idx : best_idx + 1]
+            gate_logit = closed_loop_gate.score_features(
+                scene_features,
+                selected_candidate_tensor,
+                selected_anchor_tensor,
+            ).reshape(-1)[0]
+            gate_prob = torch.sigmoid(gate_logit)
+        closed_loop_gate_logit = float(gate_logit.detach().cpu().item())
+        closed_loop_gate_prob = float(gate_prob.detach().cpu().item())
+        if closed_loop_gate_prob < closed_loop_gate_threshold:
+            best_idx = 0
+            gate_reasons.append("closed_loop_gate_reject")
+        else:
+            gate_reasons.append("closed_loop_gate_accept")
     elif include_unconditioned_candidate and fallback_progress_guard and best_idx != 0:
         fallback = candidate_trajs[0]
         selected = candidate_trajs[best_idx]
@@ -1037,6 +1131,9 @@ def _infer_candidate_selected_trajectory_from_candidates(
     _write_candidate_selector_trace(
         trace_context,
         candidate_meta=candidate_meta,
+        candidate_trajs=candidate_trajs,
+        repeated_anchors=repeated_anchors,
+        scene_features=scene_features,
         logits=logits.detach().cpu(),
         raw_best_idx=raw_best_idx,
         final_idx=best_idx,
@@ -1045,6 +1142,9 @@ def _infer_candidate_selected_trajectory_from_candidates(
         collision_scores=collision_scores_trace,
         ttc_scores=ttc_scores_trace,
         forced_candidate=forced_candidate,
+        closed_loop_gate_logit=closed_loop_gate_logit,
+        closed_loop_gate_prob=closed_loop_gate_prob,
+        closed_loop_gate_threshold=closed_loop_gate_threshold if closed_loop_gate is not None else None,
     )
     return candidate_trajs[best_idx]
 
@@ -1098,6 +1198,8 @@ def infer_candidate_selector_trajectory(
     data: NuPlanDataSample,
     anchor_predictor: AnchorPredictor,
     candidate_selector: CandidateSelector,
+    closed_loop_gate: Optional[ClosedLoopGate] = None,
+    closed_loop_gate_threshold: float = 0.5,
     top_k: int = 3,
     samples_per_anchor: int = 3,
     sample_counts_per_anchor: Optional[List[int]] = None,
@@ -1120,6 +1222,8 @@ def infer_candidate_selector_trajectory(
         data,
         anchor_trajs=anchor_trajs,
         candidate_selector=candidate_selector,
+        closed_loop_gate=closed_loop_gate,
+        closed_loop_gate_threshold=closed_loop_gate_threshold,
         samples_per_anchor=samples_per_anchor,
         sample_counts_per_anchor=sample_counts_per_anchor,
         use_cfg=use_cfg,

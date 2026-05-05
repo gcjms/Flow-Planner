@@ -50,10 +50,13 @@ class FlowPlanner(AbstractPlanner):
             anchor_mode: str = "none",
             anchor_predictor_ckpt: Optional[str] = None,
             candidate_selector_ckpt: Optional[str] = None,
+            closed_loop_gate_ckpt: Optional[str] = None,
+            closed_loop_gate_threshold: float = 0.5,
             anchor_top_k: int = 3,
             candidate_samples_per_anchor: int = 3,
             candidate_samples_per_anchor_list: Optional[str] = None,
             candidate_trace_path: Optional[str] = None,
+            candidate_trace_training_payload: bool = False,
             candidate_intervention_manifest_path: Optional[str] = None,
             anchor_state_dim: int = 3,
             anchor_token_num: int = 4,
@@ -76,6 +79,7 @@ class FlowPlanner(AbstractPlanner):
             "predicted_anchor_candidate_selector_hybrid",
             "predicted_anchor_candidate_selector_hybrid_gate",
             "predicted_anchor_candidate_selector_strict_gate",
+            "predicted_anchor_candidate_selector_closed_loop_gate",
             "predicted_anchor_candidate_selector_intervention",
         }
         if anchor_mode not in valid_anchor_modes:
@@ -117,9 +121,12 @@ class FlowPlanner(AbstractPlanner):
         self.anchor_mode = anchor_mode
         self.anchor_predictor_ckpt = anchor_predictor_ckpt
         self.candidate_selector_ckpt = candidate_selector_ckpt
+        self.closed_loop_gate_ckpt = closed_loop_gate_ckpt
+        self.closed_loop_gate_threshold = float(closed_loop_gate_threshold)
         self.anchor_top_k = anchor_top_k
         self.candidate_samples_per_anchor = candidate_samples_per_anchor
         self.candidate_trace_path = candidate_trace_path
+        self.candidate_trace_training_payload = bool(candidate_trace_training_payload)
         self.candidate_intervention_manifest_path = candidate_intervention_manifest_path
         self._candidate_interventions = self._load_candidate_interventions(
             candidate_intervention_manifest_path
@@ -139,6 +146,7 @@ class FlowPlanner(AbstractPlanner):
                 ]
         self.anchor_predictor = None
         self.candidate_selector = None
+        self.closed_loop_gate = None
 
     @staticmethod
     def _load_candidate_interventions(path: Optional[str]) -> Dict[int, Dict[str, Any]]:
@@ -233,6 +241,7 @@ class FlowPlanner(AbstractPlanner):
                 "predicted_anchor_candidate_selector_hybrid",
                 "predicted_anchor_candidate_selector_hybrid_gate",
                 "predicted_anchor_candidate_selector_strict_gate",
+                "predicted_anchor_candidate_selector_closed_loop_gate",
                 "predicted_anchor_candidate_selector_intervention",
             }:
                 if self.candidate_selector_ckpt is None:
@@ -241,6 +250,13 @@ class FlowPlanner(AbstractPlanner):
                 self.candidate_selector = load_candidate_selector_model(
                     self._planner, self.candidate_selector_ckpt, device=self._device
                 )
+                if self.anchor_mode == "predicted_anchor_candidate_selector_closed_loop_gate":
+                    if self.closed_loop_gate_ckpt is None:
+                        raise ValueError("closed-loop gate mode requires closed_loop_gate_ckpt")
+                    from flow_planner.dpo.eval_multidim_utils import load_closed_loop_gate_model
+                    self.closed_loop_gate = load_closed_loop_gate_model(
+                        self._planner, self.closed_loop_gate_ckpt, device=self._device
+                    )
         self._initialization = initialization
 
     def planner_input_to_model_inputs(self, planner_input: PlannerInput) -> Dict[str, torch.Tensor]:
@@ -332,6 +348,7 @@ class FlowPlanner(AbstractPlanner):
             "predicted_anchor_candidate_selector_hybrid",
             "predicted_anchor_candidate_selector_hybrid_gate",
             "predicted_anchor_candidate_selector_strict_gate",
+            "predicted_anchor_candidate_selector_closed_loop_gate",
             "predicted_anchor_candidate_selector_intervention",
         }:
             if self.candidate_selector is None:
@@ -342,6 +359,8 @@ class FlowPlanner(AbstractPlanner):
                 inputs,
                 anchor_predictor=self.anchor_predictor,
                 candidate_selector=self.candidate_selector,
+                closed_loop_gate=self.closed_loop_gate,
+                closed_loop_gate_threshold=self.closed_loop_gate_threshold,
                 top_k=self.anchor_top_k,
                 samples_per_anchor=self.candidate_samples_per_anchor,
                 sample_counts_per_anchor=self.candidate_samples_per_anchor_list,
@@ -355,6 +374,7 @@ class FlowPlanner(AbstractPlanner):
                         "predicted_anchor_candidate_selector_hybrid",
                         "predicted_anchor_candidate_selector_hybrid_gate",
                         "predicted_anchor_candidate_selector_strict_gate",
+                        "predicted_anchor_candidate_selector_closed_loop_gate",
                     }
                 ),
                 fallback_progress_guard=(
@@ -393,6 +413,7 @@ class FlowPlanner(AbstractPlanner):
                 "anchor_mode": self.anchor_mode,
                 "iteration_index": int(getattr(current_input.iteration, "index", -1)),
                 "iteration_time_us": iteration_time_us,
+                "write_training_payload": self.candidate_trace_training_payload,
             }
             if forced_candidate is not None:
                 trace_context["intervention"] = forced_candidate

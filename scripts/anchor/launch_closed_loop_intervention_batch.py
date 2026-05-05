@@ -147,6 +147,7 @@ def _write_run_script(
     anchor_vocab: Path,
     anchor_predictor_ckpt: Path,
     candidate_selector_ckpt: Path,
+    trace_training_payload: bool,
     scenario_filter: str,
 ) -> None:
     trace_path = run_root / f"{exp_name}_trace.jsonl"
@@ -195,6 +196,7 @@ rm -f "$TRACE_PATH"
   planner.flow_planner.candidate_samples_per_anchor_list=[5,2,2] \\
   planner.flow_planner.candidate_intervention_manifest_path="$MANIFEST" \\
   planner.flow_planner.candidate_trace_path="$TRACE_PATH" \\
+  planner.flow_planner.candidate_trace_training_payload={str(trace_training_payload).lower()} \\
   2>&1 | tee "$RUN_OUT/{exp_name}.log"
 """
     path.write_text(content, encoding="utf-8")
@@ -229,6 +231,7 @@ def main() -> None:
         type=Path,
         default=Path("/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505/anchor_candidate_selector_pairwise_best.pth"),
     )
+    parser.add_argument("--trace-training-payload", action="store_true")
     parser.add_argument("--scenario-filter", default="val20_clean")
     args = parser.parse_args()
 
@@ -327,6 +330,7 @@ def main() -> None:
                 anchor_vocab=args.anchor_vocab,
                 anchor_predictor_ckpt=args.anchor_predictor_ckpt,
                 candidate_selector_ckpt=args.candidate_selector_ckpt,
+                trace_training_payload=args.trace_training_payload,
                 scenario_filter=args.scenario_filter,
             )
             run_scripts.append(run_script)

@@ -52,6 +52,51 @@ class CandidateSelector(nn.Module):
         denom = weights.sum(dim=1).clamp_min(1.0)
         return (tokens * weights).sum(dim=1) / denom
 
+    @staticmethod
+    def build_candidate_features(
+        scene_features: torch.Tensor,
+        candidate_trajs: torch.Tensor,
+        anchor_trajs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build scorer inputs from cached scene features and trajectories."""
+        if candidate_trajs.ndim != 4:
+            raise ValueError(
+                f"candidate_trajs must have shape (B, N, T, D), got {tuple(candidate_trajs.shape)}"
+            )
+        if anchor_trajs.ndim != 4:
+            raise ValueError(
+                f"anchor_trajs must have shape (B, N, T, D), got {tuple(anchor_trajs.shape)}"
+            )
+        if candidate_trajs.shape[:2] != anchor_trajs.shape[:2]:
+            raise ValueError(
+                "candidate_trajs and anchor_trajs must share batch/candidate dims, "
+                f"got {tuple(candidate_trajs.shape[:2])} vs {tuple(anchor_trajs.shape[:2])}"
+            )
+        if scene_features.ndim != 2:
+            raise ValueError(
+                f"scene_features must have shape (B, F), got {tuple(scene_features.shape)}"
+            )
+        if scene_features.shape[0] != candidate_trajs.shape[0]:
+            raise ValueError(
+                "scene_features and candidate_trajs must share batch dim, "
+                f"got {scene_features.shape[0]} vs {candidate_trajs.shape[0]}"
+            )
+
+        batch_size, num_candidates = candidate_trajs.shape[:2]
+        candidate_flat = candidate_trajs.reshape(batch_size, num_candidates, -1).float()
+        anchor_flat = anchor_trajs.reshape(batch_size, num_candidates, -1).float()
+
+        overlap_dim = min(candidate_trajs.shape[-1], anchor_trajs.shape[-1])
+        delta_flat = (
+            candidate_trajs[..., :overlap_dim] - anchor_trajs[..., :overlap_dim]
+        ).reshape(batch_size, num_candidates, -1).float()
+
+        scene_expanded = scene_features.float().unsqueeze(1).expand(-1, num_candidates, -1)
+        return torch.cat(
+            [scene_expanded, candidate_flat, anchor_flat, delta_flat],
+            dim=-1,
+        )
+
     def extract_scene_features(self, data) -> torch.Tensor:
         """Pool the same scene tokens used by goal/anchor predictors."""
         batch_size = data.ego_current.shape[0]
@@ -81,6 +126,21 @@ class CandidateSelector(nn.Module):
             )
         return features
 
+    def score_features(
+        self,
+        scene_features: torch.Tensor,
+        candidate_trajs: torch.Tensor,
+        anchor_trajs: torch.Tensor,
+        candidate_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score candidates from precomputed scene features."""
+        features = self.build_candidate_features(scene_features, candidate_trajs, anchor_trajs)
+        logits = self.scorer(features).squeeze(-1)
+
+        if candidate_mask is not None:
+            logits = logits.masked_fill(~candidate_mask.bool(), -1e9)
+        return logits
+
     def forward(
         self,
         data,
@@ -89,38 +149,10 @@ class CandidateSelector(nn.Module):
         candidate_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return per-candidate logits with shape ``(B, N)``."""
-        if candidate_trajs.ndim != 4:
-            raise ValueError(
-                f"candidate_trajs must have shape (B, N, T, D), got {tuple(candidate_trajs.shape)}"
-            )
-        if anchor_trajs.ndim != 4:
-            raise ValueError(
-                f"anchor_trajs must have shape (B, N, T, D), got {tuple(anchor_trajs.shape)}"
-            )
-        if candidate_trajs.shape[:2] != anchor_trajs.shape[:2]:
-            raise ValueError(
-                "candidate_trajs and anchor_trajs must share batch/candidate dims, "
-                f"got {tuple(candidate_trajs.shape[:2])} vs {tuple(anchor_trajs.shape[:2])}"
-            )
-
         scene_features = self.extract_scene_features(data)
-        batch_size, num_candidates = candidate_trajs.shape[:2]
-
-        candidate_flat = candidate_trajs.reshape(batch_size, num_candidates, -1).float()
-        anchor_flat = anchor_trajs.reshape(batch_size, num_candidates, -1).float()
-
-        overlap_dim = min(candidate_trajs.shape[-1], anchor_trajs.shape[-1])
-        delta_flat = (
-            candidate_trajs[..., :overlap_dim] - anchor_trajs[..., :overlap_dim]
-        ).reshape(batch_size, num_candidates, -1).float()
-
-        scene_expanded = scene_features.unsqueeze(1).expand(-1, num_candidates, -1)
-        features = torch.cat(
-            [scene_expanded, candidate_flat, anchor_flat, delta_flat],
-            dim=-1,
+        return self.score_features(
+            scene_features,
+            candidate_trajs,
+            anchor_trajs,
+            candidate_mask=candidate_mask,
         )
-        logits = self.scorer(features).squeeze(-1)
-
-        if candidate_mask is not None:
-            logits = logits.masked_fill(~candidate_mask.bool(), -1e9)
-        return logits
