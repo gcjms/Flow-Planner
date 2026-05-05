@@ -1470,12 +1470,13 @@ dpo_data/anchor_conditioned/preferences/
 
 ## Experiment: 20260505 clean scorefix rescore + scene-grouped pairwise selector retrain
 
-- Status: launch prepared
+- Status: offline retrain completed
 - Goal:
   - Produce the first clean candidate selector checkpoint after the known selector-line contamination fixes.
   - Separate low-cost teacher-score correction from expensive candidate resampling by reusing the existing train2k candidate NPZ cache.
 - Code baseline:
   - Branch: `feature/anchor`
+  - Commit: `070a534`
   - Required fixes included:
     - positive `collision_score` teacher sign,
     - frozen-backbone train/eval protection,
@@ -1500,6 +1501,43 @@ dpo_data/anchor_conditioned/preferences/
   - `pair_stats.json` must report `split_strategy=scene_grouped`.
   - `pair_stats.json` must report `train_val_scene_overlap=0`.
   - Training should use the clean `CandidateSelector.train()` behavior so the frozen planner backbone stays in eval mode.
+- Results:
+  - Rescore completed: `written_scenes=2000`, `rescored_candidates=3179`.
+  - Rescore consistency spot-check passed: `total_score` matches `score_components.final_score`, and scene/anchor summaries were regenerated.
+  - Pair mining produced `1268` same-anchor all-pairs from `436` scenes with usable pairs.
+  - Scene-grouped split: `num_train_pairs=1010`, `num_val_pairs=258`, `num_train_scenes=349`, `num_val_scenes=87`, `train_val_scene_overlap=0`.
+  - Best offline checkpoint: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505/anchor_candidate_selector_pairwise_best.pth`
+  - Final/best offline validation: epoch 5, `val_pair_acc=0.7292`, `val_pair_loss=0.6270`, `val_chosen_prob=0.1457`.
+- Artifacts:
+  - Rescore meta: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_clean_scorefix_20260505/meta.json`
+  - Rescore log: `/root/autodl-tmp/anchor_runs/anchor_softpref_candidates_train2k_clean_scorefix_20260505.rescore.log`
+  - Train output: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505`
+  - Train log: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505/train.log`
+  - Pair stats: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505/pair_stats.json`
 - Decision rule:
   - If offline clean training is sane, use this checkpoint for a new official closed-loop `val20_clean` probe.
   - If offline clean training is not sane, stop before spending official closed-loop budget and inspect labels/features first.
+- Decision:
+  - Offline clean training is sane and the required no-leakage split checks passed.
+  - Launch a clean-selector official `val20_clean` probe with the same `5-2-2` candidate budget before any new budget sweep.
+
+## Experiment: 20260505 clean selector 5-2-2 official val20_clean probe
+
+- Status: launch prepared
+- Goal:
+  - Test whether the clean selector checkpoint from the root-fix pass improves or still regresses in official closed-loop evaluation.
+  - Keep the candidate budget comparable to the previous `5-2-2` official probe; do not start new budget sweeps yet.
+- Setup:
+  - Runtime repo: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Planner ckpt: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Anchor predictor ckpt: `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+  - Clean candidate selector ckpt: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_clean_rootfix_20260505/anchor_candidate_selector_pairwise_best.pth`
+  - Anchor mode: `predicted_anchor_candidate_selector`
+  - Candidate budget: `anchor_top_k=3`, `candidate_samples_per_anchor_list=[5,2,2]`
+  - Eval subset: official `val20_clean`
+  - Worker setup: `single_machine_thread_pool`, `worker.max_workers=2`
+- Planned artifacts:
+  - Output root: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_20260505`
+  - Experiment output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_clean_rootfix_20260505/anchor_selector_522_clean_rootfix_val20_clean_w2`
+- Decision:
+  - If this still regresses against `anchor_none`, the selector line needs a more closed-loop-consistent training/acceptance mechanism, not more open-loop budget tuning.
