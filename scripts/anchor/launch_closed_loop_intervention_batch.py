@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import subprocess
 import sys
@@ -59,6 +60,120 @@ def _select_ticks(rows: list[dict[str, Any]], ticks: list[int] | None) -> list[d
         nearest = min(rows, key=lambda row: abs(int(row.get("iteration_index", -1)) - tick))
         selected.append(nearest)
     return selected
+
+
+HIGH_RISK_GATE_REASON_WEIGHTS = {
+    "selected_final_x_lt_fallback_minus_2m": 4.0,
+    "selected_path_lt_0p75_fallback": 4.0,
+    "large_lateral_delta_without_progress": 5.0,
+    "rule_score_margin_lt_1p0": 3.0,
+    "rule_score_lt_unconditioned": 5.0,
+    "ttc_score_lt_unconditioned": 4.0,
+    "collision_score_lt_unconditioned": 4.0,
+}
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(number) else number
+
+
+def _high_risk_score(row: dict[str, Any]) -> float:
+    """Score ticks where an anchor proposal is informative for gate training."""
+    raw_logit = _to_float(row.get("raw_best_logit"))
+    uncond_logit = _to_float(row.get("unconditioned_logit"))
+    raw_rule = _to_float(row.get("raw_best_rule_score"))
+    uncond_rule = _to_float(row.get("unconditioned_rule_score"))
+    raw_ttc = _to_float(row.get("raw_best_ttc_score"))
+    uncond_ttc = _to_float(row.get("unconditioned_ttc_score"))
+    raw_collision = _to_float(row.get("raw_best_collision_score"))
+    uncond_collision = _to_float(row.get("unconditioned_collision_score"))
+
+    score = max(0.0, raw_logit - uncond_logit)
+    score += max(0.0, uncond_rule - raw_rule) * 2.0
+    score += max(0.0, uncond_ttc - raw_ttc) * 2.0
+    score += max(0.0, uncond_collision - raw_collision) * 2.0
+
+    if row.get("fallback_triggered"):
+        score += 3.0
+    for reason in row.get("gate_reasons") or []:
+        score += HIGH_RISK_GATE_REASON_WEIGHTS.get(str(reason), 1.0)
+
+    anchor_rank = row.get("raw_best_anchor_rank")
+    if anchor_rank is not None:
+        score += 0.5 * max(0, int(anchor_rank))
+    return score
+
+
+def _select_high_risk_ticks(
+    rows: list[dict[str, Any]],
+    *,
+    max_ticks: int,
+    min_spacing: int,
+    include_low_risk: int,
+) -> list[dict[str, Any]]:
+    rows = [
+        row
+        for row in rows
+        if row.get("raw_best_type") == "anchor" and row.get("iteration_index") is not None
+    ]
+    rows = sorted(rows, key=lambda row: int(row.get("iteration_index", -1)))
+    if not rows:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    selected_ticks: list[int] = []
+    selected_ids: set[int] = set()
+    high_risk_slots = max(0, max_ticks - max(include_low_risk, 0))
+    ranked = sorted(rows, key=_high_risk_score, reverse=True)
+    if high_risk_slots > 0:
+        for row in ranked:
+            tick = int(row["iteration_index"])
+            if any(abs(tick - existing) < min_spacing for existing in selected_ticks):
+                continue
+            selected.append(row)
+            selected_ticks.append(tick)
+            selected_ids.add(int(row["iteration_time_us"]))
+            if len(selected) >= high_risk_slots:
+                break
+
+    low_risk_added = 0
+    if include_low_risk > 0:
+        low_ranked = sorted(rows, key=_high_risk_score)
+        for row in low_ranked:
+            if int(row["iteration_time_us"]) in selected_ids:
+                continue
+            tick = int(row["iteration_index"])
+            if any(abs(tick - existing) < min_spacing for existing in selected_ticks):
+                continue
+            selected.append(row)
+            selected_ticks.append(tick)
+            selected_ids.add(int(row["iteration_time_us"]))
+            low_risk_added += 1
+            if low_risk_added >= include_low_risk:
+                break
+            if len(selected) >= max_ticks:
+                break
+
+    if len(selected) < max_ticks:
+        for row in ranked:
+            if int(row["iteration_time_us"]) in selected_ids:
+                continue
+            tick = int(row["iteration_index"])
+            if any(abs(tick - existing) < min_spacing for existing in selected_ticks):
+                continue
+            selected.append(row)
+            selected_ticks.append(tick)
+            selected_ids.add(int(row["iteration_time_us"]))
+            if len(selected) >= max_ticks:
+                break
+
+    return sorted(selected, key=lambda row: int(row.get("iteration_index", -1)))
 
 
 def _select_tick_indices(num_ticks: int, ticks: list[int] | None) -> list[int]:
@@ -211,6 +326,9 @@ def main() -> None:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--batch-name", default="batch1")
     parser.add_argument("--ticks", default="0,74")
+    parser.add_argument("--high-risk-ticks-per-scene", type=int, default=4)
+    parser.add_argument("--high-risk-min-spacing", type=int, default=8)
+    parser.add_argument("--high-risk-low-risk-per-scene", type=int, default=1)
     parser.add_argument("--force", choices=("trace_raw", "raw_best_anchor"), default="trace_raw")
     parser.add_argument("--launch-first", type=int, default=0)
     parser.add_argument("--project-root", type=Path, default=Path("/root/autodl-tmp/Flow-Planner-anchor-runtime"))
@@ -257,7 +375,9 @@ def main() -> None:
     else:
         rows_by_scene.update(_load_metric_tick_rows(args.metrics_run, scenes))
 
-    ticks = None if args.ticks.lower() == "auto" else [int(v) for v in args.ticks.split(",") if v.strip()]
+    ticks_arg = args.ticks.lower()
+    high_risk_ticks = ticks_arg in {"high_risk", "high-risk", "risk"}
+    ticks = None if ticks_arg == "auto" or high_risk_ticks else [int(v) for v in args.ticks.split(",") if v.strip()]
     manifest_dir = args.run_root / f"{args.batch_name}_manifests"
     script_dir = args.run_root / f"{args.batch_name}_scripts"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -268,8 +388,18 @@ def main() -> None:
     for scene_name in sorted(scenes):
         scene_rows = rows_by_scene.get(scene_name, [])
         if args.force == "trace_raw":
-            selected_rows = _select_ticks(scene_rows, ticks)
+            if high_risk_ticks:
+                selected_rows = _select_high_risk_ticks(
+                    scene_rows,
+                    max_ticks=args.high_risk_ticks_per_scene,
+                    min_spacing=args.high_risk_min_spacing,
+                    include_low_risk=args.high_risk_low_risk_per_scene,
+                )
+            else:
+                selected_rows = _select_ticks(scene_rows, ticks)
         else:
+            if high_risk_ticks:
+                raise ValueError("--ticks high_risk requires --force trace_raw")
             selected_rows = [
                 scene_rows[tick_idx]
                 for tick_idx in _select_tick_indices(len(scene_rows), ticks)
@@ -290,6 +420,10 @@ def main() -> None:
                         "anchor_rank": row.get("raw_best_anchor_rank"),
                         "sample_i": row.get("raw_best_sample_i"),
                         "candidate_idx": row.get("raw_best_idx"),
+                        "risk_score": _high_risk_score(row),
+                        "raw_best_logit": row.get("raw_best_logit"),
+                        "unconditioned_logit": row.get("unconditioned_logit"),
+                        "gate_reasons": row.get("gate_reasons") or [],
                         "source_trace": str(args.trace_jsonl),
                         "source_planner_instance_id": row.get("planner_instance_id"),
                     }
