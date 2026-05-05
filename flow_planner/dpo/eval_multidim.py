@@ -33,6 +33,25 @@ from flow_planner.dpo.eval_multidim_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_candidate_samples_per_anchor_list(raw):
+    if raw is None or raw.strip() == "":
+        return None
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(
+                f"Invalid --candidate_samples_per_anchor_list={raw!r}: empty item"
+            )
+        value = int(item)
+        if value <= 0:
+            raise ValueError(
+                "--candidate_samples_per_anchor_list values must be positive"
+            )
+        values.append(value)
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-dimensional open-loop evaluation"
@@ -131,6 +150,16 @@ def main():
         default=3,
         help="Used by --anchor_mode=predicted_anchor_candidate_selector: sample this many trajectories per anchor.",
     )
+    parser.add_argument(
+        "--candidate_samples_per_anchor_list",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-anchor sample allocation for "
+            "predicted_anchor_candidate_selector, e.g. '5,2,2'. "
+            "Length must match --predicted_anchor_top_k."
+        ),
+    )
     parser.add_argument("--rerank_collision_weight", type=float, default=40.0)
     parser.add_argument("--rerank_ttc_weight", type=float, default=20.0)
     parser.add_argument("--rerank_route_weight", type=float, default=25.0)
@@ -148,6 +177,17 @@ def main():
         help="Optional path to save a JSON summary.",
     )
     args = parser.parse_args()
+    candidate_samples_per_anchor_list = _parse_candidate_samples_per_anchor_list(
+        args.candidate_samples_per_anchor_list
+    )
+    if (
+        candidate_samples_per_anchor_list is not None
+        and len(candidate_samples_per_anchor_list) != args.predicted_anchor_top_k
+    ):
+        raise ValueError(
+            "--candidate_samples_per_anchor_list length must match "
+            "--predicted_anchor_top_k"
+        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -211,6 +251,7 @@ def main():
         candidate_selector=candidate_selector,
         predicted_anchor_top_k=args.predicted_anchor_top_k,
         candidate_samples_per_anchor=args.candidate_samples_per_anchor,
+        candidate_samples_per_anchor_list=candidate_samples_per_anchor_list,
         rerank_collision_weight=args.rerank_collision_weight,
         rerank_ttc_weight=args.rerank_ttc_weight,
         rerank_route_weight=args.rerank_route_weight,
@@ -241,6 +282,7 @@ def main():
                 "candidate_selector_ckpt": args.candidate_selector_ckpt,
                 "predicted_anchor_top_k": args.predicted_anchor_top_k,
                 "candidate_samples_per_anchor": args.candidate_samples_per_anchor,
+                "candidate_samples_per_anchor_list": candidate_samples_per_anchor_list,
                 "rerank_collision_weight": args.rerank_collision_weight,
                 "rerank_ttc_weight": args.rerank_ttc_weight,
                 "rerank_route_weight": args.rerank_route_weight,

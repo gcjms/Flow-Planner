@@ -39,6 +39,13 @@ class CandidateSelector(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
     @staticmethod
     def _masked_mean(tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         weights = valid_mask.float().unsqueeze(-1)

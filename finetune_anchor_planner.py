@@ -72,9 +72,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from flow_planner.data.utils.collect import collect_batch
-from flow_planner.dpo.eval_multidim_utils import (
-    _extract_predictor_head_state_dict,
-    _unwrap_state_dict,
+from flow_planner.goal.predictor_ckpt_utils import (
+    extract_predictor_head_state_dict,
+    unwrap_state_dict,
 )
 from flow_planner.goal.anchor_predictor import AnchorPredictor
 
@@ -249,7 +249,7 @@ def load_anchor_predictor_for_sampling(
         freeze_backbone=False,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = _extract_predictor_head_state_dict(_unwrap_state_dict(ckpt))
+    state_dict = extract_predictor_head_state_dict(unwrap_state_dict(ckpt))
     missing, unexpected = predictor.head.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[warn] scheduled predictor missing {len(missing)} keys: {missing[:5]}")

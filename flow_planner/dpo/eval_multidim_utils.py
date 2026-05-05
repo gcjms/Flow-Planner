@@ -733,6 +733,7 @@ def _infer_candidate_selected_trajectory_from_candidates(
     anchor_trajs: torch.Tensor,
     candidate_selector: CandidateSelector,
     samples_per_anchor: int = 3,
+    sample_counts_per_anchor: Optional[List[int]] = None,
     use_cfg: bool = True,
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
@@ -742,15 +743,26 @@ def _infer_candidate_selected_trajectory_from_candidates(
         raise RuntimeError(
             "Candidate selector requires a non-empty anchor candidate set shaped (B, k, T, 3)"
         )
-    if samples_per_anchor <= 0:
-        raise ValueError("samples_per_anchor must be positive")
+    num_anchor_candidates = int(anchor_trajs.shape[1])
+    if sample_counts_per_anchor is None:
+        if samples_per_anchor <= 0:
+            raise ValueError("samples_per_anchor must be positive")
+        samples_by_anchor = [int(samples_per_anchor)] * num_anchor_candidates
+    else:
+        samples_by_anchor = [int(value) for value in sample_counts_per_anchor]
+        if len(samples_by_anchor) != num_anchor_candidates:
+            raise ValueError(
+                "sample_counts_per_anchor length must match anchor candidate count"
+            )
+        if any(value <= 0 for value in samples_by_anchor):
+            raise ValueError("sample_counts_per_anchor values must be positive")
 
     candidate_trajs: List[np.ndarray] = []
     repeated_anchors: List[np.ndarray] = []
     anchor_device = getattr(model, "device", data.ego_current.device)
     for anchor_rank in range(anchor_trajs.shape[1]):
         candidate_anchor = anchor_trajs[:, anchor_rank, :, :].to(anchor_device)
-        for sample_i in range(samples_per_anchor):
+        for sample_i in range(samples_by_anchor[anchor_rank]):
             sample_seed = bon_seed
             if bon_seed >= 0:
                 sample_seed = bon_seed + anchor_rank * 100 + sample_i
@@ -836,6 +848,7 @@ def infer_candidate_selector_trajectory(
     candidate_selector: CandidateSelector,
     top_k: int = 3,
     samples_per_anchor: int = 3,
+    sample_counts_per_anchor: Optional[List[int]] = None,
     use_cfg: bool = True,
     cfg_weight: float = 1.8,
     bon_seed: int = -1,
@@ -851,6 +864,7 @@ def infer_candidate_selector_trajectory(
         anchor_trajs=anchor_trajs,
         candidate_selector=candidate_selector,
         samples_per_anchor=samples_per_anchor,
+        sample_counts_per_anchor=sample_counts_per_anchor,
         use_cfg=use_cfg,
         cfg_weight=cfg_weight,
         bon_seed=bon_seed,
@@ -977,6 +991,7 @@ def run_multidim_evaluation(
     candidate_selector: Optional[CandidateSelector] = None,
     predicted_anchor_top_k: int = 3,
     candidate_samples_per_anchor: int = 3,
+    candidate_samples_per_anchor_list: Optional[List[int]] = None,
     rerank_collision_weight: float = 40.0,
     rerank_ttc_weight: float = 20.0,
     rerank_route_weight: float = 25.0,
@@ -1075,6 +1090,7 @@ def run_multidim_evaluation(
                         candidate_selector=candidate_selector,
                         top_k=predicted_anchor_top_k,
                         samples_per_anchor=candidate_samples_per_anchor,
+                        sample_counts_per_anchor=candidate_samples_per_anchor_list,
                         use_cfg=use_cfg,
                         cfg_weight=cfg_weight,
                         bon_seed=bon_seed,
