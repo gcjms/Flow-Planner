@@ -1631,3 +1631,26 @@ dpo_data/anchor_conditioned/preferences/
 - Initial decision:
   - Stop polishing raw open-loop selector as the main method.
   - Build the closed-loop label collector first; train the accept/reject selector only after the collector produces valid official rollouts.
+- Smoke result:
+  - Runtime snapshot remains the execution environment for official experiments because it already has the validated scenario filters and nuPlan wiring.
+  - Formal code and records are still synced back to the `anchor` branch.
+  - Code commit: `3f7b6f0 anchor: resolve interventions by candidate metadata`
+  - Synced runtime files:
+    - `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/planner.py`
+    - `/root/autodl-tmp/Flow-Planner-anchor-runtime/flow_planner/dpo/eval_multidim_utils.py`
+    - `/root/autodl-tmp/Flow-Planner-anchor-runtime/scripts/anchor/build_closed_loop_intervention_manifest.py`
+  - Smoke manifest:
+    - `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/manifest_71e4_raw_first1.json`
+  - Valid smoke run:
+    - `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/intervention_71e4_raw_first1_exact_runtime_v2`
+    - trace: `/root/autodl-tmp/anchor_runs/closed_loop_selector_v1_20260505/intervention_71e4_raw_first1_exact_runtime_v2_trace.jsonl`
+    - runner: `1/1` succeeded, scenario `71e4ce1d08e85a3c`
+    - forced trace row: iteration `0`, final `anchor_rank=1`, `sample_i=1`, `gate_reasons=["forced_candidate"]`
+    - official single-scene metrics: collision `0.5`, drivable `1.0`, making_progress `1.0`, progress `0.8763`, TTC `0.0`, comfort `1.0`
+  - Invalid / diagnostic-only smoke runs:
+    - `intervention_71e4_raw_first1_smoke_runtime` selected another scene from the same log because the command did not constrain `scenario_tokens`; do not use as data.
+    - `intervention_71e4_raw_first1_exact_runtime` used the old forced-candidate index path before the metadata lookup fix; do not use as data.
+- Next:
+  - Build the first small batch of intervention manifests from regression scenes and raw-selector high-confidence ticks.
+  - Run those official rollouts from the runtime snapshot.
+  - Convert each rollout result into accept/reject labels versus `anchor_none` before training any closed-loop selector.
