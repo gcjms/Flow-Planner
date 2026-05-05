@@ -116,8 +116,6 @@ def _resolve_forced_candidate_idx(
 ) -> Optional[int]:
     if not forced_candidate:
         return None
-    if "candidate_idx" in forced_candidate and forced_candidate["candidate_idx"] is not None:
-        return int(forced_candidate["candidate_idx"])
 
     candidate_type = str(forced_candidate.get("type", "anchor"))
     if candidate_type == "baseline":
@@ -134,6 +132,8 @@ def _resolve_forced_candidate_idx(
         if sample_i is not None and int(meta.get("sample_i", -1)) != int(sample_i):
             continue
         return idx
+    if "candidate_idx" in forced_candidate and forced_candidate["candidate_idx"] is not None:
+        return int(forced_candidate["candidate_idx"])
     return None
 
 
