@@ -1402,3 +1402,28 @@ dpo_data/anchor_conditioned/preferences/
     - 针对 focus scene 这类 sparse-anchor-distribution-shift case 的 scene-level gate features
     - 更便宜的 `unconditioned + top1x1` 或 `unconditioned + top1x2` 探针
   - 在没有达到“collision 不差于 `none` 且 anchor 使用率不塌到近零”之前，不建议继续大规模 official closed-loop 扩展。
+
+## Experiment: 20260505 val20 strict_gate top1x1 official probe
+
+- Status: launched
+- Goal:
+  - 以最低成本测试“baseline/unconditioned + top1x1 anchor candidate + strict gate”是否能避免 `5-2-2` 的 sparse-anchor-distribution-shift 问题。
+  - 如果 `top1x1` 仍然对 `anchor_mode=none` 出现 collision regression，则说明问题不主要来自多 anchor / 多 sample budget，而是更基本的 selector-vs-closed-loop misalignment。
+- Setup:
+  - Runtime repo: `/root/autodl-tmp/Flow-Planner-anchor-runtime`
+  - Planner ckpt: `/root/autodl-tmp/anchor_runs/planner_ft_sched_p0p5_20260426_1612/planner_anchor_best.pth`
+  - Anchor predictor ckpt: `/root/autodl-tmp/anchor_runs/anchor_predictor_run1/anchor_predictor_best.pth`
+  - Candidate selector ckpt: `/root/autodl-tmp/anchor_runs/anchor_candidate_selector_pairwise_sameanchor_allpairs_train2k_rescorefix_scenegroup_20260429_2306/anchor_candidate_selector_pairwise_best.pth`
+  - Anchor mode: `predicted_anchor_candidate_selector_strict_gate`
+  - Candidate budget: `anchor_top_k=1`, `candidate_samples_per_anchor_list=[1]`
+  - Gate policy: strict gate with baseline/unconditioned fallback candidate included
+  - Worker setup:
+    - smoke: `debug_2`
+    - official probe: `val20_clean`, `worker.max_workers=2`
+- Artifacts:
+  - Planned smoke output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505`
+  - Planned official output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_top1x1_strict_gate_w2_20260505`
+  - Planned trace: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_top1x1_strict_gate_w2_20260505/candidate_trace.jsonl`
+- Decision Rule:
+  - 如果 `val20_clean` 上 collision 不差于 `none`，且 anchor 使用率没有塌到接近 0，则再考虑 `top1x2` follow-up。
+  - 如果 `top1x1` 仍然出现 collision regression，则优先停止 budget 线，把后续工作集中到更闭环一致的 override gate / training signal。
