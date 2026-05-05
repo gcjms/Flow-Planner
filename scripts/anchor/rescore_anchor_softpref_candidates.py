@@ -10,20 +10,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-def teacher_score(metrics: Dict[str, Any], score_cfg: Dict[str, Any]) -> float:
-    safe = 1.0 - float(metrics["collided"])
-    return (
-        float(score_cfg.get("safety_weight", 5.0)) * safe
-        + float(score_cfg.get("route_weight", 1.0)) * float(metrics["route_score"])
-        + float(score_cfg.get("progress_weight", 1.0)) * float(metrics["progress_score"])
-        + float(score_cfg.get("ttc_weight", 0.1)) * float(metrics["ttc_score"])
-        + float(score_cfg.get("comfort_weight", 0.05)) * float(metrics["comfort_score"])
-        + float(score_cfg.get("collision_weight", 0.05)) * float(metrics["collision_score"])
-    )
+from flow_planner.dpo.anchor_candidate_scorer import (
+    AnchorCandidateScoreWeights,
+    json_ready_anchor_summaries,
+    score_components,
+    summarize_anchor_groups,
+    summarize_scene,
+)
+
+
+def weights_from_score_cfg(score_cfg: Dict[str, Any]) -> AnchorCandidateScoreWeights:
+    defaults = AnchorCandidateScoreWeights().to_dict()
+    values = {
+        key: float(score_cfg.get(key, default_value))
+        for key, default_value in defaults.items()
+    }
+    return AnchorCandidateScoreWeights(**values)
+
+
+def rescore_candidate(candidate: Dict[str, Any], weights: AnchorCandidateScoreWeights) -> float:
+    components = score_components(candidate["metrics"], weights)
+    candidate["score_components"] = components
+    candidate["total_score"] = float(components["final_score"])
+    return float(components["final_score"])
 
 
 def main() -> None:
@@ -52,16 +69,23 @@ def main() -> None:
     for json_path in json_paths:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         score_cfg = payload.get("score_config", {})
+        weights = weights_from_score_cfg(score_cfg)
         for candidate in payload.get("candidates", []):
             old_score = float(candidate.get("total_score", 0.0))
-            new_score = teacher_score(candidate["metrics"], score_cfg)
-            candidate["total_score"] = float(new_score)
+            new_score = rescore_candidate(candidate, weights)
             if abs(new_score - old_score) > 1e-8:
                 changed += 1
+        candidates = payload.get("candidates", [])
+        payload["score_config"] = weights.to_dict()
+        payload["scene_stats"] = summarize_scene(candidates)
+        payload["anchor_group_stats"] = json_ready_anchor_summaries(
+            summarize_anchor_groups(candidates, method="mean")
+        )
         payload["rescore_source_root"] = str(source_root)
         payload["rescore_note"] = (
             "Recomputed total_score from stored metrics after collision_score "
-            "teacher-sign fix; candidate trajectories were reused unchanged."
+            "teacher-sign fix; score_components and scene summaries were "
+            "regenerated; candidate trajectories were reused unchanged."
         )
         (output_scored / json_path.name).write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
