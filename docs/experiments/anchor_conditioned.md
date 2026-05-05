@@ -1427,3 +1427,16 @@ dpo_data/anchor_conditioned/preferences/
 - Decision Rule:
   - 如果 `val20_clean` 上 collision 不差于 `none`，且 anchor 使用率没有塌到接近 0，则再考虑 `top1x2` follow-up。
   - 如果 `top1x1` 仍然出现 collision regression，则优先停止 budget 线，把后续工作集中到更闭环一致的 override gate / training signal。
+
+### 20260505 top1x1 strict_gate smoke running update
+
+- Status: running
+- Smoke output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505`
+- Launch log: `/root/autodl-tmp/anchor_runs/top1x1_strict_gate_smoke_launch_20260505.log`
+- Early health check:
+  - `debug_2` successfully built `2` scenarios and entered official closed-loop simulation.
+  - trace file is growing: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505/candidate_trace.jsonl`
+  - intermediate simulation artifacts are being written under `simulation_log/` and `metrics/*.temp`, so the run is not stuck at startup.
+- Next:
+  - Wait for smoke to finish.
+  - If `debug_2` completes without regression-level startup/runtime failure, immediately launch `val20_clean` with the same `top1x1 + strict_gate` setup and `worker.max_workers=2`.
