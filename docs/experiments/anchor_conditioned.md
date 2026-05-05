@@ -1405,7 +1405,7 @@ dpo_data/anchor_conditioned/preferences/
 
 ## Experiment: 20260505 val20 strict_gate top1x1 official probe
 
-- Status: launched
+- Status: aborted / discarded
 - Goal:
   - 以最低成本测试“baseline/unconditioned + top1x1 anchor candidate + strict gate”是否能避免 `5-2-2` 的 sparse-anchor-distribution-shift 问题。
   - 如果 `top1x1` 仍然对 `anchor_mode=none` 出现 collision regression，则说明问题不主要来自多 anchor / 多 sample budget，而是更基本的 selector-vs-closed-loop misalignment。
@@ -1421,22 +1421,49 @@ dpo_data/anchor_conditioned/preferences/
     - smoke: `debug_2`
     - official probe: `val20_clean`, `worker.max_workers=2`
 - Artifacts:
-  - Planned smoke output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505`
-  - Planned official output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_top1x1_strict_gate_w2_20260505`
-  - Planned trace: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_top1x1_strict_gate_w2_20260505/candidate_trace.jsonl`
-- Decision Rule:
-  - 如果 `val20_clean` 上 collision 不差于 `none`，且 anchor 使用率没有塌到接近 0，则再考虑 `top1x2` follow-up。
-  - 如果 `top1x1` 仍然出现 collision regression，则优先停止 budget 线，把后续工作集中到更闭环一致的 override gate / training signal。
+  - Discarded smoke output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505` (deleted)
+  - Discarded official output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_val20_top1x1_strict_gate_w2_20260505` (deleted)
+  - Discarded script: `/root/autodl-tmp/Flow-Planner-anchor-runtime/scripts_anchor_run_closed_loop_top1x1_strict_gate.sh` (deleted)
+- What happened:
+  - `debug_2` smoke completed `2/2` successfully.
+  - `val20_clean` was started, then manually stopped before completion.
+  - All top1x1-specific temporary outputs and launch logs were removed.
+- Reason:
+  - This probe reused the old selector checkpoint, so its result would still be conditioned on historical training-signal contamination.
+  - It could only answer a narrow budget question, not the main question: whether a clean selector trained after scorer/split/oracle fixes works in official closed-loop.
+- Decision:
+  - Treat this probe as discarded, not as an experiment result.
+  - Do not start more budget probes until the root fixes are applied and a clean selector is retrained.
 
-### 20260505 top1x1 strict_gate smoke running update
+## Code fix: 20260505 clean selector root-fix pass
 
-- Status: running
-- Smoke output: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505`
-- Launch log: `/root/autodl-tmp/anchor_runs/top1x1_strict_gate_smoke_launch_20260505.log`
-- Early health check:
-  - `debug_2` successfully built `2` scenarios and entered official closed-loop simulation.
-  - trace file is growing: `/root/autodl-tmp/anchor_runs/official_planner_anchor_top1x1_strict_gate_smoke_20260505/candidate_trace.jsonl`
-  - intermediate simulation artifacts are being written under `simulation_log/` and `metrics/*.temp`, so the run is not stuck at startup.
-- Next:
-  - Wait for smoke to finish.
-  - If `debug_2` completes without regression-level startup/runtime failure, immediately launch `val20_clean` with the same `top1x1 + strict_gate` setup and `worker.max_workers=2`.
+- Status: implemented / local verification passed
+- Goal:
+  - Remove known training/evaluation contamination before any new selector rescore/retrain run.
+- Changes:
+  - `flow_planner/dpo/anchor_candidate_scorer.py`
+    - Fixed `collision_score` sign in candidate teacher score.
+    - `collision_score` is now treated as a safety-margin score, so larger values increase `final_score`.
+  - `flow_planner/goal/anchor_predictor.py`
+    - Added `train()` override matching `CandidateSelector` / `GoalPredictor`, so a frozen backbone remains in eval mode after recursive `model.train(...)`.
+  - `flow_planner/dpo/eval_multidim_utils.py`
+    - Changed oracle anchor lookup from `ego_future_arr[:T, :3]` to `ego_future_arr[-T:, :3]`, matching the training label horizon semantics.
+  - `flow_planner/dpo/train_anchor_candidate_selector_pairwise.py`
+  - `flow_planner/dpo/train_anchor_candidate_selector_softpref.py`
+  - `flow_planner/dpo/train_anchor_selector_dpo.py`
+  - `flow_planner/dpo/train_anchor_selector_softpref.py`
+    - Replaced record-level random split with scene-grouped split by `scenario_id`.
+    - Stats now include `split_strategy=scene_grouped`, `num_train_scenes`, `num_val_scenes`, and `train_val_scene_overlap`.
+- Verification:
+  - `python -m py_compile` passed for all changed Python files.
+  - grep check found no remaining target occurrences of:
+    - `- weights.collision_weight * collision_score`
+    - `ego_future_arr[:T`
+    - `rng.shuffle(records)` in the touched split helpers
+  - grep check confirmed `train_val_scene_overlap` is written by all four updated selector-training scripts.
+- Decision:
+  - Next valid selector result must be produced by:
+    - rescoring existing candidate cache with the corrected teacher score,
+    - retraining a clean selector with scene-grouped split,
+    - then running official closed-loop validation.
+  - Older selector checkpoints remain useful only as historical baselines, not as clean evidence.

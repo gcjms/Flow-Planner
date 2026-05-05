@@ -567,7 +567,7 @@ def choose_anchor(
                 f"oracle_anchor: ego_agent_future shape {ego_future_arr.shape} "
                 f"incompatible with anchor vocab horizon T={T} (needs (>=T, >=3))"
             )
-        gt_traj = ego_future_arr[:T, :3]
+        gt_traj = ego_future_arr[-T:, :3]
         nearest_idx = int(find_nearest_anchor(gt_traj, anchor_vocab))
         nearest_anchor = anchor_vocab[nearest_idx]   # (T, 3)
         return torch.from_numpy(nearest_anchor).unsqueeze(0).to(device)
@@ -660,7 +660,7 @@ def _get_oracle_topk_anchor_trajs(
             f"incompatible with anchor vocab horizon T={T} (needs (>=T, >=3))"
         )
 
-    gt_traj = ego_future_arr[:T, :3]
+    gt_traj = ego_future_arr[-T:, :3]
     topk_idx = np.asarray(
         find_topk_nearest_anchors(gt_traj, anchor_vocab, top_k=top_k),
         dtype=np.int64,

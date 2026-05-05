@@ -52,9 +52,8 @@ def score_components(
 ) -> Dict[str, float]:
     """Return explicit candidate score components plus ``final_score``.
 
-    ``final_score`` intentionally matches the old ``_teacher_score`` formula in
-    ``generate_anchor_softpref_candidates.py`` so previously recorded experiment
-    behavior stays comparable.
+    ``collision_score`` is a safety-margin score: larger means farther from
+    nearby agents and therefore safer.
     """
 
     collided = _metric(metrics, "collided")
@@ -70,7 +69,7 @@ def score_components(
         + weights.progress_weight * progress_score
         + weights.ttc_weight * ttc_score
         + weights.comfort_weight * comfort_score
-        - weights.collision_weight * collision_score
+        + weights.collision_weight * collision_score
     )
     return {
         "collided": collided,

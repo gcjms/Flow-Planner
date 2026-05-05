@@ -221,11 +221,26 @@ def load_candidate_records(
 def split_records(records: Sequence[CandidateSceneRecord], val_fraction: float, seed: int):
     records = list(records)
     rng = random.Random(seed)
-    rng.shuffle(records)
-    if val_fraction <= 0 or len(records) < 5:
+    scene_ids = sorted({record.scenario_id for record in records})
+    rng.shuffle(scene_ids)
+    if val_fraction <= 0 or len(scene_ids) < 2:
         return records, []
-    val_size = max(1, int(round(len(records) * val_fraction)))
-    return records[val_size:], records[:val_size]
+    val_scene_count = max(1, int(round(len(scene_ids) * val_fraction)))
+    val_scenes = set(scene_ids[:val_scene_count])
+    train_records = [record for record in records if record.scenario_id not in val_scenes]
+    val_records = [record for record in records if record.scenario_id in val_scenes]
+    return train_records, val_records
+
+
+def split_metadata(train_records: Sequence[CandidateSceneRecord], val_records: Sequence[CandidateSceneRecord]) -> Dict[str, object]:
+    train_scenes = {record.scenario_id for record in train_records}
+    val_scenes = {record.scenario_id for record in val_records}
+    return {
+        "split_strategy": "scene_grouped",
+        "num_train_scenes": len(train_scenes),
+        "num_val_scenes": len(val_scenes),
+        "train_val_scene_overlap": len(train_scenes & val_scenes),
+    }
 
 
 def build_loader(
@@ -372,6 +387,7 @@ def main() -> None:
     train_records, val_records = split_records(records, args.val_fraction, args.seed)
     candidate_stats["num_train_records"] = len(train_records)
     candidate_stats["num_val_records"] = len(val_records)
+    candidate_stats.update(split_metadata(train_records, val_records))
     (save_dir / "candidate_stats.json").write_text(
         json.dumps(candidate_stats, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
