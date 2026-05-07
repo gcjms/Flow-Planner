@@ -37,6 +37,7 @@
 - `Innovation_Project_A1A2B1B2_updated.pptx`：单独生成的 4 页创新点更新 PPT，按原模板风格重写 A1/A2/B1/B2，可复制到原申报 PPT 中
 - `ppt1_text_map.txt`：PPT文本提取映射，用于精准替换
 - `docs/experiments/anchor_conditioned.md`：详细实验记录（暂未创建，本地以本文件为主）
+- **2026-05-07**：`docs/CMU_10_799_LECTURE_EXPLANATIONS.md`：CMU 10-799 Diffusion & Flow Matching 课程 lecture 中文解释笔记。已整理 Lecture 0/1/2/4/5/6/7/10；Lecture 9/12/13 因本地 PDF 文本解析失败暂留待补章节。
 
 ## 下一步 TODO
 - [x] 重写 PPT Slide 6-13：从旧的 goal/DPO 技术路线叙事，改为创新项目申报口径（Anchor 引导、Anchor Selector、Candidate Selector、安全评分、迁移验证、2k 内部验证总结）
@@ -47,7 +48,7 @@
 - [ ] 若整体通过，更新实验记录文档（docs/experiments/anchor_conditioned.md）并 commit
 - [ ] 继续 anchor selector 实验验证（candidate-level selector，重点candidate oracle方向）
 
-**更新时间**：2026-04-29 16:24（已新增第26页附录 C-2，解释生成式采样不等于有效离散与 anchor mode scaffold；PPT 当前37页）
+**更新时间**：2026-05-07 21:48（新增 CMU 10-799 lecture 中文解释笔记文档；Lecture 9/12/13 因 PDF 解析失败暂待补。）
 
 ---
 **提醒**：日志更新完成后建议 commit，避免跨机器丢失。**请检查 `Innovation Projects.pptx` 备注区与 `speaker_notes_for_innovation_project.md`，确认无误后一起commit。**
